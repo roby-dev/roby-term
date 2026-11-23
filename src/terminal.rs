@@ -124,9 +124,10 @@ impl TerminalGrid {
         self.alt_screen
     }
 
-    /// Returns true when the running process has activated a TUI protocol (alt-screen or mouse tracking).
+    /// Returns true when the running process has activated a TUI protocol
+    /// (alt-screen, mouse tracking, or Kitty keyboard protocol).
     pub fn is_tui_active(&self) -> bool {
-        self.alt_screen || self.mouse_tracking
+        self.alt_screen || self.mouse_tracking || self.kitty_keyboard_depth > 0
     }
 
     pub fn mouse_tracking_enabled(&self) -> bool {

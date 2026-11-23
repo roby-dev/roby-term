@@ -106,6 +106,53 @@ impl HistoryStore {
         self.suggest_at(query, shell_badge, limit, now_unix_secs())
     }
 
+    /// Multi-token fuzzy history search for `Ctrl+R` modal.
+    /// Empty query returns the most recently used commands; non-empty matches all space-separated tokens.
+    pub fn search_fuzzy(&self, query: &str, limit: usize) -> Vec<Suggestion> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let now = now_unix_secs();
+        let tokens: Vec<String> = query
+            .split_whitespace()
+            .map(|t| t.to_lowercase())
+            .collect();
+
+        let mut matches: Vec<Suggestion> = self
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let lower = entry.command.to_lowercase();
+                if !tokens.iter().all(|tok| lower.contains(tok)) {
+                    return None;
+                }
+                let mut score = if tokens.is_empty() {
+                    entry.last_used as f64
+                } else {
+                    frecency_score(entry.count, entry.last_used, now)
+                };
+                if !tokens.is_empty() && lower.starts_with(&tokens[0]) {
+                    score += 300.0;
+                }
+                Some(Suggestion {
+                    command: entry.command.clone(),
+                    count: entry.count,
+                    shell_badge: entry.shell_badge.clone(),
+                    is_prefix: !tokens.is_empty() && lower.starts_with(&tokens[0]),
+                    score,
+                })
+            })
+            .collect();
+
+        matches.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        matches.truncate(limit);
+        matches
+    }
+
     pub fn suggest_at(
         &self,
         query: &str,
@@ -349,5 +396,11 @@ mod tests {
 
         let ghost = store.ghost_suffix("git com", "PS7");
         assert_eq!(ghost.as_deref(), Some("mit -m \"init\""));
+
+        // Multi-token fuzzy search for Ctrl+R
+        store.record_at("cargo build --release", "PS7", 2_020);
+        let fuzzy = store.search_fuzzy("cargo rel", 5);
+        assert_eq!(fuzzy.len(), 1);
+        assert_eq!(fuzzy[0].command, "cargo build --release");
     }
 }

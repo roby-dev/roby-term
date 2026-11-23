@@ -288,6 +288,22 @@ impl App {
     }
 
     fn hit_test_all(&self, px: u32, py: u32, suggestion_count: usize) -> HitTarget {
+        if self.ui.history_modal.open && !self.ui.settings.open {
+            let p = self.layout.palette_panel();
+            if p.contains(px, py) {
+                if self.layout.palette_close_rect().contains(px, py) {
+                    return HitTarget::HistoryClose;
+                }
+                let count = self.history.search_fuzzy(&self.ui.history_modal.query, 7).len();
+                for i in 0..count {
+                    if self.layout.palette_row_rect(i).contains(px, py) {
+                        return HitTarget::HistoryRow(i);
+                    }
+                }
+                return HitTarget::None;
+            }
+        }
+
         if self.ui.ports.open && !self.ui.settings.open && !self.ui.palette.open {
             let p = self.layout.ports_panel();
             if p.contains(px, py) {
@@ -378,7 +394,7 @@ impl App {
             }
         }
 
-        if !self.ui.settings.open && !self.ui.picker_open {
+        if !self.ui.settings.open && !self.ui.picker_open && self.layout.sidebar.w > 0 {
             if let Some(card) = self.layout.usage_card_rect(self.enabled_plugin_count()) {
                 if card.contains(px, py) {
                     return HitTarget::UsageCardRefresh;
@@ -548,6 +564,8 @@ impl App {
             || self.ui.settings.open
             || self.ui.search.open
             || self.ui.palette.open
+            || self.ui.history_modal.open
+            || self.ui.ports.open
         {
             return (Vec::new(), None);
         }
@@ -627,7 +645,7 @@ impl App {
         if width == 0 || height == 0 {
             return;
         }
-        self.layout = Layout::compute(width, height);
+        self.layout = Layout::compute_with_sidebar(width, height, self.ui.sidebar_visible);
         if let Some(ref mut surface) = self.surface {
             if let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
                 let _ = surface.resize(w, h);
@@ -661,12 +679,55 @@ impl App {
         }
     }
 
+    fn apply_history_selection(&mut self, row_idx: usize, run_immediately: bool) {
+        let cmd_opt = self
+            .history
+            .search_fuzzy(&self.ui.history_modal.query, 7)
+            .get(row_idx)
+            .map(|s| s.command.clone());
+        let Some(cmd) = cmd_opt else {
+            return;
+        };
+        self.ui.history_modal.open = false;
+        self.ui.history_modal.query.clear();
+        self.ui.history_modal.selected = 0;
+        if let Some(sess) = self.sessions.active_mut() {
+            if run_immediately {
+                let badge = sess.shell.badge.clone();
+                sess.submit_command(&cmd, self.user.accent);
+                self.history.record(&cmd, &badge);
+            } else {
+                sess.input.set_text(cmd);
+            }
+        }
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.ui.sidebar_visible = !self.ui.sidebar_visible;
+        if !self.ui.sidebar_visible {
+            self.ui.picker_open = false;
+            self.ui.renaming_session = None;
+        }
+        self.layout = Layout::compute_with_sidebar(
+            self.layout.width,
+            self.layout.height,
+            self.ui.sidebar_visible,
+        );
+        self.resize_sessions_for_current_layout();
+    }
+
     fn handle_mouse_down(&mut self) {
         self.ui.toast = None;
         let (px, py) = self.cursor_pos;
         let (suggestions, _) = self.current_suggestions();
         let hit = self.hit_test_all(px, py, suggestions.len());
         match hit {
+            HitTarget::HistoryClose => {
+                self.ui.history_modal.open = false;
+            }
+            HitTarget::HistoryRow(i) => {
+                self.apply_history_selection(i, false);
+            }
             HitTarget::PortsToggle => {
                 self.ui.picker_open = false;
                 self.ui.settings.open = false;
@@ -979,6 +1040,75 @@ impl App {
         }
     }
 
+    fn handle_history_modal_key(&mut self, event: KeyEvent) {
+        let primary = self.primary_modifier();
+        if primary {
+            if let Key::Character(s) = &event.logical_key {
+                if s.eq_ignore_ascii_case("v") {
+                    if let Some(clip) = paste_text() {
+                        self.ui
+                            .history_modal
+                            .query
+                            .push_str(&clip.replace(['\r', '\n'], " "));
+                        self.ui.history_modal.selected = 0;
+                        self.request_redraw();
+                    }
+                    return;
+                }
+            }
+        }
+
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.ui.history_modal.open = false;
+            }
+            Key::Named(NamedKey::Enter) => {
+                let run = !self.modifiers.shift_key();
+                self.apply_history_selection(self.ui.history_modal.selected, run);
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.apply_history_selection(self.ui.history_modal.selected, false);
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                let count = self.history.search_fuzzy(&self.ui.history_modal.query, 7).len();
+                if count > 0 {
+                    self.ui.history_modal.selected = (self.ui.history_modal.selected + 1) % count;
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                let count = self.history.search_fuzzy(&self.ui.history_modal.query, 7).len();
+                if count > 0 {
+                    self.ui.history_modal.selected = if self.ui.history_modal.selected == 0 {
+                        count - 1
+                    } else {
+                        self.ui.history_modal.selected - 1
+                    };
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.ui.history_modal.query.pop();
+                self.ui.history_modal.selected = 0;
+            }
+            Key::Named(NamedKey::Space) => {
+                self.ui.history_modal.query.push(' ');
+                self.ui.history_modal.selected = 0;
+            }
+            _ => {
+                if !self.modifiers.control_key() && !self.modifiers.alt_key() {
+                    if let Some(text) = &event.text {
+                        for ch in text.chars() {
+                            if !ch.is_control() {
+                                self.ui.history_modal.query.push(ch);
+                                self.ui.history_modal.selected = 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
     fn handle_palette_key(&mut self, event: KeyEvent) {
         let shift = self.modifiers.shift_key();
         let primary = self.primary_modifier();
@@ -1216,6 +1346,22 @@ impl App {
                     self.request_redraw();
                     return;
                 }
+                if s.eq_ignore_ascii_case("b") && !shift && !self.ui.settings.open {
+                    self.toggle_sidebar();
+                    self.request_redraw();
+                    return;
+                }
+                if s.eq_ignore_ascii_case("r") && !shift && !self.ui.settings.open {
+                    self.ui.picker_open = false;
+                    self.ui.palette.open = false;
+                    self.ui.ports.open = false;
+                    self.ui.search.open = false;
+                    self.ui.history_modal.open = !self.ui.history_modal.open;
+                    self.ui.history_modal.query.clear();
+                    self.ui.history_modal.selected = 0;
+                    self.request_redraw();
+                    return;
+                }
                 if s.eq_ignore_ascii_case("k") && !self.ui.settings.open {
                     self.ui.picker_open = false;
                     self.ui.search.open = false;
@@ -1258,6 +1404,10 @@ impl App {
 
         if self.ui.settings.open {
             self.handle_settings_key(event);
+            return;
+        }
+        if self.ui.history_modal.open {
+            self.handle_history_modal_key(event);
             return;
         }
         if self.ui.ports.open {
@@ -1862,6 +2012,7 @@ impl App {
                 ghost_suffix.as_deref(),
                 &self.config,
                 &self.snippets,
+                &self.history,
                 &self.agent_usage,
             );
             let _ = buffer.present();
@@ -1894,7 +2045,8 @@ impl ApplicationHandler<()> for App {
         let size = window.inner_size();
         if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
             let _ = surface.resize(w, h);
-            self.layout = Layout::compute(size.width, size.height);
+            self.layout =
+                Layout::compute_with_sidebar(size.width, size.height, self.ui.sidebar_visible);
             self.resize_sessions_for_current_layout();
         }
 

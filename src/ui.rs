@@ -1,9 +1,10 @@
 use crate::complete::{abbreviate_path, CompletionItem, CompletionKind};
 use crate::config::{format_hex_color, parse_hex_color, UserConfig, PRESET_ACCENTS, THEME_PRESETS};
+use crate::history::HistoryStore;
 use crate::input::{InputBar, TokenKind};
 use crate::plugins::{format_compact_tokens, AgentUsage};
 use crate::ports::ListeningPort;
-use crate::session::{Session, SessionManager};
+use crate::session::{format_duration_compact, Session, SessionManager};
 use crate::shell::ShellProfile;
 use crate::snippets::SnippetStore;
 use crate::terminal::SearchMatch;
@@ -111,6 +112,8 @@ pub enum HitTarget {
     PaletteAddToggle,
     PaletteRow(usize),
     PaletteDelete(usize),
+    HistoryClose,
+    HistoryRow(usize),
     PortsClose,
     PortsRefresh,
     PortOpen(usize),
@@ -156,7 +159,15 @@ pub struct Layout {
 
 impl Layout {
     pub fn compute(width: u32, height: u32) -> Self {
-        let sidebar_w = SIDEBAR_WIDTH.min(width / 2);
+        Self::compute_with_sidebar(width, height, true)
+    }
+
+    pub fn compute_with_sidebar(width: u32, height: u32, sidebar_visible: bool) -> Self {
+        let sidebar_w = if sidebar_visible {
+            SIDEBAR_WIDTH.min(width / 2)
+        } else {
+            0
+        };
         let main_x = sidebar_w;
         let main_w = width.saturating_sub(sidebar_w);
         let header_h = HEADER_HEIGHT.min(height);
@@ -605,26 +616,28 @@ impl Layout {
         if self.split_btn.contains(px, py) {
             return HitTarget::SplitToggle;
         }
-        if self.new_session_btn.contains(px, py) {
-            return HitTarget::NewSessionToggle;
-        }
-        if self.dup_session_btn.contains(px, py) {
-            return HitTarget::DuplicateSession;
-        }
+        if self.sidebar.w > 0 {
+            if self.new_session_btn.contains(px, py) {
+                return HitTarget::NewSessionToggle;
+            }
+            if self.dup_session_btn.contains(px, py) {
+                return HitTarget::DuplicateSession;
+            }
 
-        for i in 0..session_count {
-            let row = self.session_row_rect(i);
-            if row.y + row.h >= self.new_session_btn.y {
-                break;
-            }
-            if self.session_close_rect(i).contains(px, py) {
-                return HitTarget::CloseSession(i);
-            }
-            if self.session_badge_rect(i).contains(px, py) {
-                return HitTarget::CycleSessionColor(i);
-            }
-            if row.contains(px, py) {
-                return HitTarget::SessionRow(i);
+            for i in 0..session_count {
+                let row = self.session_row_rect(i);
+                if row.y + row.h >= self.new_session_btn.y {
+                    break;
+                }
+                if self.session_close_rect(i).contains(px, py) {
+                    return HitTarget::CloseSession(i);
+                }
+                if self.session_badge_rect(i).contains(px, py) {
+                    return HitTarget::CycleSessionColor(i);
+                }
+                if row.contains(px, py) {
+                    return HitTarget::SessionRow(i);
+                }
             }
         }
 
@@ -980,7 +993,24 @@ impl Default for PortsUiState {
     }
 }
 
+pub struct HistoryModalUiState {
+    pub open: bool,
+    pub query: String,
+    pub selected: usize,
+}
+
+impl Default for HistoryModalUiState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            query: String::new(),
+            selected: 0,
+        }
+    }
+}
+
 pub struct UiState {
+    pub sidebar_visible: bool,
     pub picker_open: bool,
     pub picker_selected: usize,
     pub hovered: HitTarget,
@@ -995,6 +1025,7 @@ pub struct UiState {
     pub suggestion_navigated: bool,
     pub search: SearchUiState,
     pub palette: PaletteUiState,
+    pub history_modal: HistoryModalUiState,
     pub ports: PortsUiState,
     pub settings: SettingsUiState,
 }
@@ -1002,6 +1033,7 @@ pub struct UiState {
 impl UiState {
     pub fn new(cfg: &UserConfig, active_accent: Rgb) -> Self {
         Self {
+            sidebar_visible: true,
             picker_open: false,
             picker_selected: 0,
             hovered: HitTarget::None,
@@ -1016,6 +1048,7 @@ impl UiState {
             suggestion_navigated: false,
             search: SearchUiState::default(),
             palette: PaletteUiState::default(),
+            history_modal: HistoryModalUiState::default(),
             ports: PortsUiState::default(),
             settings: SettingsUiState::from_config(cfg, active_accent),
         }
@@ -1047,11 +1080,14 @@ pub fn render_app(
     ghost_suffix: Option<&str>,
     cfg: &UserConfig,
     snippets: &SnippetStore,
+    history: &HistoryStore,
     usage: &AgentUsage,
 ) {
     let mut canvas = Canvas::new(pixels, layout.width, layout.height);
     canvas.clear(theme.bg_terminal);
 
+    // 1..7 Sidebar (skipped when collapsed via Ctrl+B)
+    if layout.sidebar.w > 0 {
     // 1. Sidebar background + divider
     canvas.fill_rect(layout.sidebar, theme.bg_sidebar);
     canvas.fill_rect(
@@ -1358,6 +1394,7 @@ pub fn render_app(
             );
         }
     }
+    } // end if layout.sidebar.w > 0
 
     // 8. Top header bar
     canvas.fill_rect(layout.header, theme.bg_header);
@@ -1847,11 +1884,16 @@ pub fn render_app(
     }
 
     // 14. Local Listening Ports modal (Ctrl+Shift+O)
-    if ui.ports.open && !ui.settings.open && !ui.palette.open {
+    if ui.ports.open && !ui.settings.open && !ui.palette.open && !ui.history_modal.open {
         render_ports_panel(&mut canvas, layout, font, theme, user, ui);
     }
 
-    // 15. Settings (Preferences) modal overlay
+    // 15. Fuzzy History Search modal (Ctrl+R)
+    if ui.history_modal.open && !ui.settings.open {
+        render_history_modal(&mut canvas, layout, font, theme, user, ui, history);
+    }
+
+    // 16. Settings (Preferences) modal overlay
     if ui.settings.open {
         render_settings_panel(&mut canvas, layout, font, theme, user, ui, cfg);
     }
@@ -1989,14 +2031,15 @@ fn render_session_pane(
             }
         }
 
-        // Warp-style [Copy] and [Re-run] action pills on the focused pane's block start row
+        // Warp-style duration badge + [Copy] and [Re-run] action pills on the focused pane's block start row
         if is_focused
             && !sess.grid.is_alt_screen()
             && !ui.search.open
             && !ui.settings.open
             && !ui.palette.open
+            && !ui.ports.open
         {
-            if let Some((b_idx, _)) = sess
+            if let Some((b_idx, block)) = sess
                 .blocks
                 .iter()
                 .enumerate()
@@ -2004,6 +2047,37 @@ fn render_session_pane(
             {
                 let (copy_r, rerun_r) = layout.block_action_rects_in(vp, row_idx, ch);
                 if copy_r.y + copy_r.h <= vp.y + vp.h {
+                    // Command execution timer badge to the left of [Copy]
+                    let (dur_text, dur_color) = match block.duration {
+                        Some(d) => {
+                            let c = if d.as_secs() >= 30 {
+                                theme.syntax.flag
+                            } else if d.as_secs() >= 2 {
+                                theme.syntax.path
+                            } else {
+                                theme.fg_muted
+                            };
+                            (format_duration_compact(d), c)
+                        }
+                        None => (
+                            format!("{}...", format_duration_compact(block.started_at.elapsed())),
+                            user.accent,
+                        ),
+                    };
+                    let dur_w = font.measure_text(&dur_text, FONT_SIZE_SMALL);
+                    let dur_x = copy_r.x.saturating_sub(dur_w + 10);
+                    if dur_x > vp.x + 80 {
+                        font.draw_text(
+                            canvas,
+                            dur_x as i32,
+                            (copy_r.y + 2) as i32,
+                            FONT_SIZE_SMALL,
+                            dur_color,
+                            &dur_text,
+                            (copy_r.x - 4) as i32,
+                        );
+                    }
+
                     let copy_bg = if ui.hovered == HitTarget::BlockCopy(b_idx) {
                         theme.bg_sidebar_active
                     } else {
@@ -2754,6 +2828,121 @@ fn render_ports_panel(
             theme.danger,
             "Kill",
             (kill_r.x + kill_r.w - 2) as i32,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_history_modal(
+    canvas: &mut Canvas<'_>,
+    layout: &Layout,
+    font: &mut FontRenderer,
+    theme: &Theme,
+    user: &UserIdentity,
+    ui: &UiState,
+    history: &HistoryStore,
+) {
+    let p = layout.palette_panel();
+    let max_x = (p.x + p.w - 14) as i32;
+
+    canvas.fill_rect(p, theme.bg_header);
+    canvas.stroke_rect(p, user.accent);
+    canvas.fill_rect(Rect::new(p.x, p.y, p.w, 3), user.accent);
+
+    font.draw_text(
+        canvas,
+        (p.x + 16) as i32,
+        (p.y + 12) as i32,
+        14.5,
+        theme.fg_primary,
+        "History Search (Ctrl+R)",
+        (p.x + p.w - 44) as i32,
+    );
+
+    let close_r = layout.palette_close_rect();
+    font.draw_text(
+        canvas,
+        (close_r.x + 6) as i32,
+        (close_r.y + 3) as i32,
+        FONT_SIZE_UI,
+        if ui.hovered == HitTarget::HistoryClose {
+            theme.danger
+        } else {
+            theme.fg_muted
+        },
+        "x",
+        (close_r.x + close_r.w) as i32,
+    );
+
+    let input_r = Rect::new(p.x + 14, p.y + 42, p.w.saturating_sub(28), 30);
+    canvas.fill_rect(input_r, theme.bg_input);
+    canvas.stroke_rect(input_r, user.accent);
+    let display = if ui.history_modal.query.is_empty() {
+        "Filter history... (Enter run | Tab edit | Esc close)".to_string()
+    } else {
+        format!("{}|", ui.history_modal.query)
+    };
+    font.draw_text(
+        canvas,
+        (input_r.x + 10) as i32,
+        (input_r.y + 7) as i32,
+        FONT_SIZE_UI,
+        if ui.history_modal.query.is_empty() {
+            theme.fg_muted
+        } else {
+            theme.fg_primary
+        },
+        &display,
+        (input_r.x + input_r.w - 8) as i32,
+    );
+
+    let hits = history.search_fuzzy(&ui.history_modal.query, 7);
+    for (row_idx, item) in hits.iter().enumerate() {
+        let r = layout.palette_row_rect(row_idx);
+        if r.y + r.h > p.y + p.h - 10 {
+            break;
+        }
+        let is_sel = row_idx == ui.history_modal.selected;
+        let is_hov = ui.hovered == HitTarget::HistoryRow(row_idx);
+        if is_sel {
+            canvas.fill_rect(r, theme.bg_sidebar_active);
+            canvas.fill_rect(Rect::new(r.x, r.y, 3, r.h), user.accent);
+        } else if is_hov {
+            canvas.fill_rect(r, theme.bg_sidebar_hover);
+        }
+
+        let meta = format!("{} {}x", item.shell_badge, item.count);
+        let meta_w = font.measure_text(&meta, FONT_SIZE_SMALL);
+        let meta_x = (r.x + r.w).saturating_sub(meta_w + 8) as i32;
+
+        font.draw_text(
+            canvas,
+            (r.x + 10) as i32,
+            (r.y + 6) as i32,
+            FONT_SIZE_UI,
+            if is_sel { theme.fg_primary } else { theme.fg_muted.lerp(theme.fg_primary, 150) },
+            &item.command,
+            meta_x - 8,
+        );
+        font.draw_text(
+            canvas,
+            meta_x,
+            (r.y + 6) as i32,
+            FONT_SIZE_SMALL,
+            theme.fg_muted,
+            &meta,
+            (r.x + r.w - 4) as i32,
+        );
+    }
+    if hits.is_empty() {
+        font.draw_text(
+            canvas,
+            (p.x + 20) as i32,
+            (p.y + 94) as i32,
+            FONT_SIZE_UI,
+            theme.fg_muted,
+            "No matching commands in local history.",
+            max_x,
         );
     }
 }
