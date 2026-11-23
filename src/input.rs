@@ -157,12 +157,14 @@ fn classify_word(word: &str) -> TokenKind {
     TokenKind::Argument
 }
 
-/// Warp-style command input bar with cursor editing, history, and passthrough toggle.
+/// Command input bar with cursor editing, Shift/Ctrl+A text selection, history, and passthrough toggle.
 #[derive(Debug, Clone)]
 pub struct InputBar {
     buffer: String,
     /// Byte offset in `buffer` (always on a UTF-8 char boundary).
     cursor: usize,
+    /// Optional byte offset where a Shift/Ctrl+A selection started.
+    selection_anchor: Option<usize>,
     history: VecDeque<String>,
     history_index: Option<usize>,
     draft_before_history: String,
@@ -181,6 +183,7 @@ impl InputBar {
         Self {
             buffer: String::new(),
             cursor: 0,
+            selection_anchor: None,
             history: VecDeque::with_capacity(64),
             history_index: None,
             draft_before_history: String::new(),
@@ -190,6 +193,76 @@ impl InputBar {
 
     pub fn text(&self) -> &str {
         &self.buffer
+    }
+
+    pub fn is_cursor_at_end(&self) -> bool {
+        self.cursor == self.buffer.len() && self.selected_range().is_none()
+    }
+
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        self.buffer = text.into();
+        self.cursor = self.buffer.len();
+        self.selection_anchor = None;
+        self.history_index = None;
+    }
+
+    pub fn selected_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        if anchor == self.cursor {
+            None
+        } else if anchor < self.cursor {
+            Some((anchor, self.cursor))
+        } else {
+            Some((self.cursor, anchor))
+        }
+    }
+
+    pub fn selected_char_range(&self) -> Option<(usize, usize)> {
+        let (a, b) = self.selected_range()?;
+        let ca = self.buffer[..a].chars().count();
+        let cb = self.buffer[..b].chars().count();
+        Some((ca, cb))
+    }
+
+    pub fn selected_text(&self) -> Option<&str> {
+        let (a, b) = self.selected_range()?;
+        Some(&self.buffer[a..b])
+    }
+
+    pub fn select_all(&mut self) {
+        if !self.buffer.is_empty() {
+            self.selection_anchor = Some(0);
+            self.cursor = self.buffer.len();
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    pub fn delete_selection(&mut self) -> bool {
+        if let Some((a, b)) = self.selected_range() {
+            self.buffer.drain(a..b);
+            self.cursor = a;
+            self.selection_anchor = None;
+            self.history_index = None;
+            true
+        } else {
+            self.selection_anchor = None;
+            false
+        }
+    }
+
+    pub fn seed_history(&mut self, items: Vec<String>) {
+        for item in items {
+            let trimmed = item.trim();
+            if !trimmed.is_empty() && self.history.back().map(|s| s.as_str()) != Some(trimmed) {
+                if self.history.len() >= MAX_HISTORY {
+                    self.history.pop_front();
+                }
+                self.history.push_back(trimmed.to_string());
+            }
+        }
     }
 
     /// Cursor position in UTF-8 characters (for rendering).
@@ -202,18 +275,23 @@ impl InputBar {
     }
 
     pub fn insert_str(&mut self, s: &str) {
+        self.delete_selection();
         self.buffer.insert_str(self.cursor, s);
         self.cursor += s.len();
         self.history_index = None;
     }
 
     pub fn insert_char(&mut self, ch: char) {
+        self.delete_selection();
         self.buffer.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
         self.history_index = None;
     }
 
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -224,6 +302,9 @@ impl InputBar {
     }
 
     pub fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor >= self.buffer.len() {
             return;
         }
@@ -233,28 +314,85 @@ impl InputBar {
     }
 
     pub fn move_left(&mut self) {
-        if self.cursor > 0 {
-            self.cursor = self.prev_char_boundary();
+        self.move_left_with_select(false);
+    }
+
+    pub fn move_left_with_select(&mut self, select: bool) {
+        if select {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(self.cursor);
+            }
+            if self.cursor > 0 {
+                self.cursor = self.prev_char_boundary();
+            }
+        } else if let Some((a, _)) = self.selected_range() {
+            self.cursor = a;
+            self.selection_anchor = None;
+        } else {
+            self.selection_anchor = None;
+            if self.cursor > 0 {
+                self.cursor = self.prev_char_boundary();
+            }
         }
     }
 
     pub fn move_right(&mut self) {
-        if self.cursor < self.buffer.len() {
-            self.cursor = self.next_char_boundary();
+        self.move_right_with_select(false);
+    }
+
+    pub fn move_right_with_select(&mut self, select: bool) {
+        if select {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(self.cursor);
+            }
+            if self.cursor < self.buffer.len() {
+                self.cursor = self.next_char_boundary();
+            }
+        } else if let Some((_, b)) = self.selected_range() {
+            self.cursor = b;
+            self.selection_anchor = None;
+        } else {
+            self.selection_anchor = None;
+            if self.cursor < self.buffer.len() {
+                self.cursor = self.next_char_boundary();
+            }
         }
     }
 
     pub fn move_home(&mut self) {
+        self.move_home_with_select(false);
+    }
+
+    pub fn move_home_with_select(&mut self, select: bool) {
+        if select {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(self.cursor);
+            }
+        } else {
+            self.selection_anchor = None;
+        }
         self.cursor = 0;
     }
 
     pub fn move_end(&mut self) {
+        self.move_end_with_select(false);
+    }
+
+    pub fn move_end_with_select(&mut self, select: bool) {
+        if select {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(self.cursor);
+            }
+        } else {
+            self.selection_anchor = None;
+        }
         self.cursor = self.buffer.len();
     }
 
     pub fn clear(&mut self) {
         self.buffer.clear();
         self.cursor = 0;
+        self.selection_anchor = None;
         self.history_index = None;
     }
 
@@ -262,6 +400,7 @@ impl InputBar {
     pub fn submit(&mut self) -> String {
         let cmd = std::mem::take(&mut self.buffer);
         self.cursor = 0;
+        self.selection_anchor = None;
         self.history_index = None;
         self.draft_before_history.clear();
 
@@ -378,5 +517,32 @@ mod tests {
         bar.move_left();
         bar.backspace();
         assert_eq!(bar.text(), "drat");
+    }
+
+    #[test]
+    fn shift_home_end_and_ctrl_a_select_and_replace_text() {
+        let mut bar = InputBar::new();
+        bar.set_text("PowerShell 7 #1");
+
+        // Shift+Home selects whole line from cursor at end, Backspace clears it
+        bar.move_home_with_select(true);
+        assert_eq!(bar.selected_text(), Some("PowerShell 7 #1"));
+        bar.backspace();
+        assert_eq!(bar.text(), "");
+
+        // Type new name, Shift+Left selects tail, typing replaces only selection
+        bar.insert_str("Backend API");
+        bar.move_left_with_select(true);
+        bar.move_left_with_select(true);
+        bar.move_left_with_select(true);
+        assert_eq!(bar.selected_text(), Some("API"));
+        bar.insert_str("Core");
+        assert_eq!(bar.text(), "Backend Core");
+
+        // Ctrl+A selects all and typing overwrites
+        bar.select_all();
+        assert_eq!(bar.selected_text(), Some("Backend Core"));
+        bar.insert_str("DB");
+        assert_eq!(bar.text(), "DB");
     }
 }
