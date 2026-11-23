@@ -12,18 +12,34 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 pub type WakeupFn = Arc<dyn Fn() + Send + Sync>;
 
 const MAX_BLOCKS_PER_SESSION: usize = 200;
 
-/// Warp-style logical block grouping a submitted command with its terminal output line range.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Warp-style logical block grouping a submitted command with its terminal output line range & duration.
+#[derive(Debug, Clone)]
 pub struct CommandBlock {
     pub id: usize,
     pub command: String,
     pub start_abs_line: usize,
     pub end_abs_line: Option<usize>,
+    pub started_at: Instant,
+    pub duration: Option<Duration>,
+}
+
+/// Formats command execution duration compactly (`42ms`, `1.4s`, `2m 05s`).
+pub fn format_duration_compact(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if d.as_secs() < 60 {
+        format!("{:.1}s", d.as_secs_f64())
+    } else {
+        let secs = d.as_secs();
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    }
 }
 
 /// A single terminal session backed by an OS PTY (ConPTY on Windows, POSIX PTY on macOS/Linux).
@@ -201,6 +217,21 @@ impl Session {
         if was_alt && !self.grid.is_alt_screen() {
             self.input.passthrough = false;
         }
+        // Finalize active block's elapsed duration once the shell prompt reappears
+        if changed && !self.grid.is_alt_screen() {
+            if let Some(last) = self.blocks.last_mut() {
+                if last.duration.is_none() && last.started_at.elapsed() >= Duration::from_millis(80) {
+                    let (cur_r, _) = self.grid.cursor();
+                    if let Some(row) = self.grid.visible_row(cur_r, 0) {
+                        let line: String = row.iter().map(|c| c.ch).collect();
+                        let trimmed = line.trim_end();
+                        if trimmed.ends_with('>') || trimmed.ends_with('$') || trimmed.ends_with('#') || trimmed.ends_with('%') {
+                            last.duration = Some(last.started_at.elapsed());
+                        }
+                    }
+                }
+            }
+        }
         changed
     }
 
@@ -221,6 +252,9 @@ impl Session {
             if prev.end_abs_line.is_none() {
                 prev.end_abs_line = Some(cur_abs.saturating_sub(1).max(prev.start_abs_line));
             }
+            if prev.duration.is_none() {
+                prev.duration = Some(prev.started_at.elapsed());
+            }
         }
         let trimmed = cmd.trim();
         if !trimmed.is_empty() {
@@ -234,6 +268,8 @@ impl Session {
                 command: trimmed.to_string(),
                 start_abs_line: cur_abs,
                 end_abs_line: None,
+                started_at: Instant::now(),
+                duration: None,
             });
         }
 
@@ -244,6 +280,7 @@ impl Session {
             let end_abs = self.grid.current_abs_line();
             if let Some(last) = self.blocks.last_mut() {
                 last.end_abs_line = Some(end_abs);
+                last.duration = Some(last.started_at.elapsed());
             }
             return;
         }
@@ -320,7 +357,19 @@ pub fn is_interactive_command(raw_cmd: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    // Check the final command in chained invocations (e.g. `cd app && agy` or `cd app; agy`)
+    let last_segment = trimmed
+        .rsplit("&&")
+        .next()
+        .unwrap_or(trimmed)
+        .rsplit(';')
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .trim_start_matches('&')
+        .trim();
+
+    let parts: Vec<&str> = last_segment.split_whitespace().collect();
     let Some(&first) = parts.first() else {
         return false;
     };
@@ -335,18 +384,22 @@ pub fn is_interactive_command(raw_cmd: &str) -> bool {
     }
 
     let bin = first
+        .trim_matches(['"', '\''])
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(first)
         .trim_end_matches(".exe")
         .trim_end_matches(".cmd")
         .trim_end_matches(".bat")
+        .trim_end_matches(".ps1")
         .to_ascii_lowercase();
 
     // Always-interactive AI agents, TUIs, editors, and remote shells
     if matches!(
         bin.as_str(),
         "agy"
+            | "agy-cli"
+            | "antigravity"
             | "claude"
             | "codex"
             | "opencode"
@@ -763,6 +816,8 @@ mod tests {
     #[test]
     fn detects_interactive_agents_tuis_and_bare_repls() {
         assert!(is_interactive_command("agy"));
+        assert!(is_interactive_command("cd app && agy"));
+        assert!(is_interactive_command("agy.ps1"));
         assert!(is_interactive_command("claude"));
         assert!(is_interactive_command("nvim src/main.rs"));
         assert!(is_interactive_command("python"));
@@ -771,5 +826,9 @@ mod tests {
         assert!(!is_interactive_command("agy --version"));
         assert!(!is_interactive_command("python script.py"));
         assert!(!is_interactive_command("git status -sb"));
+
+        assert_eq!(format_duration_compact(Duration::from_millis(42)), "42ms");
+        assert_eq!(format_duration_compact(Duration::from_millis(1450)), "1.4s");
+        assert_eq!(format_duration_compact(Duration::from_secs(125)), "2m 05s");
     }
 }

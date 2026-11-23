@@ -22,6 +22,8 @@ Ultra-low-RAM, cross-platform (Windows & macOS) Rust terminal emulator with a cu
 - **Command Palette & Local Snippets (`Ctrl+K`)**: filter, save (`name = command`), delete, insert (`Enter`), or run (`Shift+Enter`) reusable command workflows stored locally in `snippets.tsv`.
 - **Split Panes (`Ctrl+Shift+D`)**: run two terminal sessions side-by-side in the same window; click either pane to focus.
 - **Session Rename & Activity Badges**: double-click any session in the sidebar (or press `F2`) to rename it inline, with a green dot for unread background output and a red dot when a process exits.
+- **Collapsible Sidebar (`Ctrl+B`)**: hide or show the sidebar anytime to reclaim full terminal width for Split Panes and CLI agents.
+- **Fuzzy History Search (`Ctrl+R`)**: interactive multi-token search over your persisted local command history (`Enter` to run immediately, `Tab` to edit).
 - **Local Listening Ports Panel (`Ctrl+Shift+O`)**: click **Ports** in the header to view local TCP ports in `LISTENING` state (process + PID), open `http://localhost:<port>` in your browser, or kill a stuck process in 1 click.
 - **1-Click Theme Presets in Settings**: switch between *Roby Violet*, *Tokyo Night*, *Catppuccin*, *Nord*, and *Gruvbox* (or customize any `#HEX` color).
 - **Drag & Drop Files & Folders**: drop any file or folder onto the window to insert its path (or pre-fill `cd "..."` for folders).
@@ -31,7 +33,7 @@ Ultra-low-RAM, cross-platform (Windows & macOS) Rust terminal emulator with a cu
 - **Built-In Colorized `ls` / `ll` / `la`**: renders folders first (in your accent color), files color-coded by type (`COD`, `CFG`, `EXE`, `DOC`, `BIN`), human-readable sizes, and clickable entries identically on Windows (PowerShell/CMD/Git Bash) and macOS (Zsh/Bash/Fish). Pass `--raw` or pipe (`ls | ...`) to invoke the shell's native command.
 - **Quick Zoom & Custom App Icon**: zoom font size on the fly with `Ctrl++` / `Ctrl+-` / `Ctrl+0`, with a custom embedded app icon (and GUI-only Windows subsystem in release builds).
 - **Native Copy/Paste & Mouse Selection**: drag-select text in the terminal and press `Ctrl+C` (`Cmd+C`) to copy, or `Ctrl+V` (`Cmd+V`) to paste into the input bar, search bar, or settings fields (zero external clipboard crates).
-- **Warp-Style Command Blocks**: visually separates each executed command with an accent gutter and inline **`Copy`** / **`Re-run`** buttons.
+- **Warp-Style Command Blocks & Execution Timer**: visually separates each executed command with an accent gutter, elapsed duration badge (`42ms`, `11.4s`, `2m 05s`), and inline **`Copy`** / **`Re-run`** buttons.
 - **Scrollback Search (`Ctrl+F`)**: case-insensitive search across scrollback and viewport with match counter and jump navigation (`Enter` / `Shift+Enter`).
 - **Clickable Paths & URLs**: hover and click any existing file/directory path (e.g., `D:\wauth`, `src/main.rs:42`) to open it in Explorer/Finder, or any `http://` / `https://` URL to open it in your browser.
 - **Automatic TUI Passthrough**: detects alternate-screen apps (`vim`, `htop`, etc.) and forwards keystrokes directly to the PTY (also toggleable manually via `Ctrl+Shift+P` or clicking the header pill).
