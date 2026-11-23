@@ -41,6 +41,7 @@ pub struct Session {
     pub scroll_offset: usize,
     pub has_unread_output: bool,
     pub alive: bool,
+    last_was_builtin: bool,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -168,6 +169,7 @@ impl Session {
             scroll_offset: 0,
             has_unread_output: false,
             alive: true,
+            last_was_builtin: false,
             master: pair.master,
             writer,
             child,
@@ -238,11 +240,22 @@ impl Session {
         // Fast cross-platform native `ls` / `ll` / `la` rendered directly into the terminal grid
         if let Some(output) = try_run_builtin(cmd, &self.cwd, accent) {
             self.grid.feed(output.as_bytes());
+            self.last_was_builtin = true;
             let end_abs = self.grid.current_abs_line();
             if let Some(last) = self.blocks.last_mut() {
                 last.end_abs_line = Some(end_abs);
             }
             return;
+        }
+
+        // Preserve local built-in output in scrollback before handing the screen back to ConPTY/PTY
+        // so the shell's internal cursor never overwrites the `ls` listing.
+        if self.last_was_builtin {
+            self.grid.commit_screen_to_scrollback();
+            self.last_was_builtin = false;
+            if let Some(last) = self.blocks.last_mut() {
+                last.start_abs_line = self.grid.current_abs_line();
+            }
         }
 
         if let Some(next_cwd) = maybe_update_cwd(&self.cwd, cmd) {

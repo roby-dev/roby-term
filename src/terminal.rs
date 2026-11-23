@@ -150,6 +150,30 @@ impl TerminalGrid {
         self.scrollback.len()
     }
 
+    /// Commits all non-empty rows from the active screen into scrollback and clears the screen.
+    /// Prevents Windows ConPTY cursor-addressing from overwriting local built-in output (e.g. `ls`).
+    pub fn commit_screen_to_scrollback(&mut self) {
+        if self.alt_screen {
+            return;
+        }
+        let last_non_empty = self
+            .cells
+            .iter()
+            .rposition(|row| row.iter().any(|c| c.ch != ' ' && c.ch != '\0'));
+        if let Some(last_idx) = last_non_empty {
+            let blank = self.blank_row();
+            for r in 0..=last_idx {
+                let row = std::mem::replace(&mut self.cells[r], blank.clone());
+                self.push_scrollback(row);
+            }
+            for r in (last_idx + 1)..self.rows {
+                self.cells[r] = blank.clone();
+            }
+        }
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+    }
+
     /// Monotonic absolute line index of the current cursor row.
     pub fn current_abs_line(&self) -> usize {
         self.evicted_lines + self.scrollback.len() + self.cursor_row
@@ -1227,5 +1251,10 @@ mod tests {
         assert_eq!(row_text(&g2, 1), "line2");
         assert_eq!(row_text(&g2, 3), "line4");
         assert_eq!(row_text(&g2, 4), "FOOTER");
+
+        // commit_screen_to_scrollback preserves built-in output intact and clears screen for PTY
+        g2.commit_screen_to_scrollback();
+        assert_eq!(g2.scrollback_len(), 5);
+        assert_eq!(row_text(&g2, 0), "");
     }
 }

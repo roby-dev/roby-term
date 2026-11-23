@@ -1628,6 +1628,7 @@ impl App {
         };
 
         if sess.effective_passthrough() {
+            sess.scroll_offset = 0;
             self.ui.clear_selection();
             if ctrl {
                 if let Key::Character(s) = &event.logical_key {
