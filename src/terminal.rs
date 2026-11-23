@@ -52,6 +52,7 @@ pub struct TerminalGrid {
     cur_inverse: bool,
     alt_screen: bool,
     mouse_tracking: bool,
+    last_printed_char: char,
     saved_main_cells: Option<Vec<Vec<Cell>>>,
     parser: Parser,
 }
@@ -91,6 +92,7 @@ impl TerminalGrid {
             cur_inverse: false,
             alt_screen: false,
             mouse_tracking: false,
+            last_printed_char: ' ',
             saved_main_cells: None,
             parser: Parser::new(),
         }
@@ -460,6 +462,7 @@ impl TerminalGrid {
 
 impl Perform for TerminalGrid {
     fn print(&mut self, c: char) {
+        self.last_printed_char = c;
         if self.cursor_col >= self.cols {
             self.cursor_col = 0;
             self.newline();
@@ -478,6 +481,26 @@ impl Perform for TerminalGrid {
             }
         }
         self.cursor_col += 1;
+    }
+
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        match byte {
+            b'7' => self.saved_cursor = (self.cursor_row, self.cursor_col),
+            b'8' => {
+                self.cursor_row = self.saved_cursor.0.min(self.rows - 1);
+                self.cursor_col = self.saved_cursor.1.min(self.cols - 1);
+            }
+            b'M' => {
+                // Reverse Index (RI)
+                if self.cursor_row > 0 {
+                    self.cursor_row -= 1;
+                } else {
+                    self.cells.pop();
+                    self.cells.insert(0, self.blank_row());
+                }
+            }
+            _ => {}
+        }
     }
 
     fn execute(&mut self, byte: u8) {
@@ -537,15 +560,107 @@ impl Perform for TerminalGrid {
             'B' => self.cursor_row = (self.cursor_row + param(0, 1)).min(self.rows - 1),
             'C' => self.cursor_col = (self.cursor_col + param(0, 1)).min(self.cols - 1),
             'D' => self.cursor_col = self.cursor_col.saturating_sub(param(0, 1)),
-            'G' => self.cursor_col = param(0, 1).saturating_sub(1).min(self.cols - 1),
+            'E' => {
+                // CNL — Cursor Next Line
+                self.cursor_row = (self.cursor_row + param(0, 1)).min(self.rows - 1);
+                self.cursor_col = 0;
+            }
+            'F' => {
+                // CPL — Cursor Previous Line
+                self.cursor_row = self.cursor_row.saturating_sub(param(0, 1));
+                self.cursor_col = 0;
+            }
+            'G' | '`' => self.cursor_col = param(0, 1).saturating_sub(1).min(self.cols - 1),
+            'd' => {
+                // VPA — Vertical Position Absolute
+                self.cursor_row = param(0, 1).saturating_sub(1).min(self.rows - 1);
+            }
             'H' | 'f' => {
                 let r = param(0, 1).saturating_sub(1).min(self.rows - 1);
                 let c = param(1, 1).saturating_sub(1).min(self.cols - 1);
                 self.cursor_row = r;
                 self.cursor_col = c;
             }
+            'X' => {
+                // ECH — Erase Characters (used heavily by ConPTY & TUI menus to clear gaps)
+                let count = param(0, 1);
+                let blank = Cell::blank(self.default_fg, self.cur_bg);
+                if let Some(row) = self.cells.get_mut(self.cursor_row) {
+                    let end = (self.cursor_col + count).min(self.cols);
+                    for c in self.cursor_col..end {
+                        row[c] = blank;
+                    }
+                }
+            }
+            'P' => {
+                // DCH — Delete Characters
+                let count = param(0, 1);
+                let blank = Cell::blank(self.default_fg, self.cur_bg);
+                if let Some(row) = self.cells.get_mut(self.cursor_row) {
+                    let col = self.cursor_col.min(self.cols);
+                    let del = count.min(self.cols.saturating_sub(col));
+                    if del > 0 {
+                        row.drain(col..col + del);
+                        row.resize(self.cols, blank);
+                    }
+                }
+            }
+            '@' => {
+                // ICH — Insert Characters
+                let count = param(0, 1);
+                let blank = Cell::blank(self.default_fg, self.cur_bg);
+                if let Some(row) = self.cells.get_mut(self.cursor_row) {
+                    let col = self.cursor_col.min(self.cols);
+                    let ins = count.min(self.cols.saturating_sub(col));
+                    for _ in 0..ins {
+                        row.pop();
+                        row.insert(col, blank);
+                    }
+                }
+            }
+            'L' => {
+                // IL — Insert Lines
+                let count = param(0, 1).min(self.rows.saturating_sub(self.cursor_row));
+                for _ in 0..count {
+                    self.cells.pop();
+                    self.cells.insert(self.cursor_row, self.blank_row());
+                }
+            }
+            'M' => {
+                // DL — Delete Lines
+                let count = param(0, 1).min(self.rows.saturating_sub(self.cursor_row));
+                for _ in 0..count {
+                    self.cells.remove(self.cursor_row);
+                    self.cells.push(self.blank_row());
+                }
+            }
+            'S' => {
+                // SU — Scroll Up
+                let count = param(0, 1).min(self.rows);
+                for _ in 0..count {
+                    let top = self.cells.remove(0);
+                    self.push_scrollback(top);
+                    self.cells.push(self.blank_row());
+                }
+            }
+            'T' => {
+                // SD — Scroll Down
+                let count = param(0, 1).min(self.rows);
+                for _ in 0..count {
+                    self.cells.pop();
+                    self.cells.insert(0, self.blank_row());
+                }
+            }
+            'b' => {
+                // REP — Repeat preceding graphic character
+                let count = param(0, 1).min(self.cols);
+                let ch = self.last_printed_char;
+                for _ in 0..count {
+                    self.print(ch);
+                }
+            }
             'J' => {
-                let blank = Cell::blank(self.default_fg, self.default_bg);
+                let blank = Cell::blank(self.default_fg, self.cur_bg);
                 match raw_param(0) {
                     0 => {
                         if let Some(row) = self.cells.get_mut(self.cursor_row) {
@@ -576,7 +691,7 @@ impl Perform for TerminalGrid {
                 }
             }
             'K' => {
-                let blank = Cell::blank(self.default_fg, self.default_bg);
+                let blank = Cell::blank(self.default_fg, self.cur_bg);
                 if let Some(row) = self.cells.get_mut(self.cursor_row) {
                     match raw_param(0) {
                         0 => {
@@ -957,5 +1072,29 @@ mod tests {
 
         let sel = grid.extract_selection((0, 0), (1, 4), 0);
         assert_eq!(sel, "alpha beta\ngamma");
+    }
+
+    #[test]
+    fn handles_ech_dch_ich_il_dl_and_rep_for_clean_tui_redraws() {
+        let fg = Rgb::new(255, 255, 255);
+        let bg = Rgb::new(0, 0, 0);
+        let mut grid = TerminalGrid::new(40, 5, fg, bg);
+
+        // Simulate old line overwritten by TUI menu using CSI <n> X (ECH) + EL (\x1b[K)
+        grid.feed(b"old stale text that should disappear");
+        grid.feed(b"\r/usage\x1b[14X\x1b[21GView quota\x1b[K");
+        assert_eq!(row_text(&grid, 0), "/usage              View quota");
+
+        // DCH (`P`) deletes characters and shifts left
+        grid.feed(b"\x1b[2;1Habcdef\x1b[2;3H\x1b[2P");
+        assert_eq!(row_text(&grid, 1), "abef");
+
+        // ICH (`@`) inserts blanks and shifts right
+        grid.feed(b"\x1b[2;3H\x1b[2@");
+        assert_eq!(row_text(&grid, 1), "ab  ef");
+
+        // REP (`b`) repeats last printed character
+        grid.feed(b"\x1b[3;1H-\x1b[4b");
+        assert_eq!(row_text(&grid, 2), "-----");
     }
 }

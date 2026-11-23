@@ -325,6 +325,22 @@ fn resolve_search_dir(dir_prefix: &str, cwd: &Path) -> PathBuf {
     }
 }
 
+/// Strips Windows verbatim path prefixes (`\\?\D:\...` -> `D:\...`, `\\?\UNC\...` -> `\\...`)
+/// so PowerShell and CMD receive normal drive paths instead of `FileSystem::\\?\...`.
+pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let s = path.to_string_lossy();
+        if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 /// Updates tracked session `cwd` when the user executes `cd <dir>`, `cd..`, `Set-Location`, etc.
 pub fn maybe_update_cwd(current_cwd: &Path, submitted_cmd: &str) -> Option<PathBuf> {
     let trimmed = submitted_cmd.trim();
@@ -368,7 +384,10 @@ pub fn maybe_update_cwd(current_cwd: &Path, submitted_cmd: &str) -> Option<PathB
             current_cwd.join(p)
         }
     };
-    fs::canonicalize(&candidate).ok().filter(|p| p.is_dir())
+    fs::canonicalize(&candidate)
+        .ok()
+        .filter(|p| p.is_dir())
+        .map(strip_verbatim_prefix)
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -478,10 +497,11 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
 
         let updated = maybe_update_cwd(&dir, "cd nested").expect("should resolve nested dir");
-        assert_eq!(updated, fs::canonicalize(&sub).unwrap());
+        assert_eq!(updated, strip_verbatim_prefix(fs::canonicalize(&sub).unwrap()));
+        assert!(!updated.to_string_lossy().starts_with(r"\\?\"));
 
         let back = maybe_update_cwd(&updated, "cd..").expect("should support cd.. without space");
-        assert_eq!(back, fs::canonicalize(&dir).unwrap());
+        assert_eq!(back, strip_verbatim_prefix(fs::canonicalize(&dir).unwrap()));
 
         let _ = fs::remove_dir_all(&dir);
     }
