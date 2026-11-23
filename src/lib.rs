@@ -4,6 +4,7 @@ pub mod complete;
 pub mod config;
 pub mod history;
 pub mod input;
+pub mod plugins;
 pub mod session;
 pub mod shell;
 pub mod snippets;
