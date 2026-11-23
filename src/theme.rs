@@ -1,3 +1,4 @@
+use crate::config::UserConfig;
 use crate::input::TokenKind;
 use crate::shell::ShellKind;
 
@@ -86,6 +87,17 @@ impl UserIdentity {
             badge_bg,
         }
     }
+
+    pub fn with_accent_override(&self, accent_override: Option<Rgb>) -> Self {
+        let accent = accent_override.unwrap_or_else(|| user_accent_color(&self.username));
+        let badge_bg = accent.lerp(Rgb::new(18, 20, 28), 195);
+        Self {
+            username: self.username.clone(),
+            hostname: self.hostname.clone(),
+            accent,
+            badge_bg,
+        }
+    }
 }
 
 /// Curated high-contrast accent palette for per-user terminal differentiation.
@@ -156,23 +168,27 @@ pub struct SyntaxPalette {
 
 impl Theme {
     pub fn for_user(user: &UserIdentity) -> Self {
-        let base_bg = Rgb::new(17, 19, 26);
-        let sidebar_bg = Rgb::new(13, 15, 21).lerp(user.accent, 8);
+        Self::for_user_with_config(user, &UserConfig::default())
+    }
+
+    pub fn for_user_with_config(user: &UserIdentity, cfg: &UserConfig) -> Self {
+        let base_bg = cfg.bg_terminal;
+        let sidebar_bg = base_bg.lerp(Rgb::new(6, 7, 11), 65).lerp(user.accent, 10);
         Self {
             bg_terminal: base_bg,
             bg_sidebar: sidebar_bg,
-            bg_sidebar_hover: Rgb::new(28, 32, 44),
-            bg_sidebar_active: Rgb::new(30, 35, 50).lerp(user.accent, 22),
-            bg_header: Rgb::new(20, 23, 32),
-            bg_input: Rgb::new(22, 25, 35),
-            border: Rgb::new(44, 49, 66),
+            bg_sidebar_hover: base_bg.lerp(Rgb::new(45, 50, 68), 90),
+            bg_sidebar_active: base_bg.lerp(user.accent, 34),
+            bg_header: base_bg.lerp(Rgb::new(30, 34, 48), 55),
+            bg_input: base_bg.lerp(Rgb::new(32, 36, 52), 70),
+            border: base_bg.lerp(Rgb::new(90, 98, 128), 85),
             fg_primary: Rgb::new(228, 233, 245),
             fg_muted: Rgb::new(134, 144, 168),
             user_accent: user.accent,
             danger: Rgb::new(243, 139, 168),
             syntax: SyntaxPalette {
-                command: Rgb::new(137, 220, 235),       // Bright cyan
-                flag: Rgb::new(250, 179, 135),          // Warm orange for --flags / -f
+                command: cfg.syntax_command,
+                flag: cfg.syntax_flag,
                 string_literal: Rgb::new(166, 227, 161), // Green for "..."
                 path: Rgb::new(249, 226, 175),          // Gold for paths
                 env_var: Rgb::new(203, 166, 247),       // Purple for $VAR / %VAR%
