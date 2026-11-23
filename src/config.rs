@@ -56,6 +56,9 @@ pub struct UserConfig {
     pub syntax_flag: Rgb,
     pub font_name: Option<String>,
     pub font_size: f32,
+    pub plugin_agy: bool,
+    pub plugin_claude: bool,
+    pub plugin_codex: bool,
 }
 
 impl Default for UserConfig {
@@ -68,6 +71,9 @@ impl Default for UserConfig {
             syntax_flag: DEFAULT_SYNTAX_FLAG,
             font_name: None,
             font_size: DEFAULT_FONT_SIZE,
+            plugin_agy: false,
+            plugin_claude: false,
+            plugin_codex: false,
         }
     }
 }
@@ -133,6 +139,9 @@ impl UserConfig {
                         cfg.font_size = sz.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
                     }
                 }
+                "plugin_agy" => cfg.plugin_agy = val.eq_ignore_ascii_case("true"),
+                "plugin_claude" => cfg.plugin_claude = val.eq_ignore_ascii_case("true"),
+                "plugin_codex" => cfg.plugin_codex = val.eq_ignore_ascii_case("true"),
                 _ => {}
             }
         }
@@ -165,13 +174,16 @@ fn save_to_path(cfg: &UserConfig, path: &Path) -> std::io::Result<()> {
         .unwrap_or_else(|| "auto".to_string());
     let font_str = cfg.font_name.as_deref().unwrap_or("auto");
     let body = format!(
-        "# my-warp user preferences\naccent={}\nbg_terminal={}\nsyntax_command={}\nsyntax_flag={}\nfont_name={}\nfont_size={:.1}\n",
+        "# Roby-Term user preferences\naccent={}\nbg_terminal={}\nsyntax_command={}\nsyntax_flag={}\nfont_name={}\nfont_size={:.1}\nplugin_agy={}\nplugin_claude={}\nplugin_codex={}\n",
         accent_str,
         format_hex_color(cfg.bg_terminal),
         format_hex_color(cfg.syntax_command),
         format_hex_color(cfg.syntax_flag),
         font_str,
         cfg.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
+        cfg.plugin_agy,
+        cfg.plugin_claude,
+        cfg.plugin_codex,
     );
     fs::write(path, body)
 }

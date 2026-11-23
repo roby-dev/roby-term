@@ -10,6 +10,7 @@ use my_warp::config::{
 };
 use my_warp::history::HistoryStore;
 use my_warp::input::InputBar;
+use my_warp::plugins::{collect_today_usage, AgentUsage};
 use my_warp::session::SessionManager;
 use my_warp::shell::{default_shell, discover_shells, ShellProfile};
 use my_warp::snippets::SnippetStore;
@@ -23,7 +24,9 @@ use my_warp::workspace::{default_workspace_dir, load_workspace, save_workspace};
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -50,6 +53,9 @@ struct App {
     history: HistoryStore,
     snippets: SnippetStore,
     cmd_index: PathCommandIndex,
+    agent_usage: AgentUsage,
+    usage_rx: Option<Receiver<AgentUsage>>,
+    last_usage_refresh: Instant,
     ui: UiState,
     layout: Layout,
     modifiers: ModifiersState,
@@ -102,7 +108,7 @@ impl App {
 
         let ui = UiState::new(&config, user.accent);
 
-        Ok(Self {
+        let mut app = Self {
             proxy,
             window: None,
             _context: None,
@@ -118,13 +124,65 @@ impl App {
             history,
             snippets,
             cmd_index,
+            agent_usage: AgentUsage::default(),
+            usage_rx: None,
+            last_usage_refresh: Instant::now(),
             ui,
             layout,
             modifiers: ModifiersState::empty(),
             cursor_pos: (0, 0),
             hovered_link_target: None,
             last_session_click: None,
-        })
+        };
+        app.refresh_plugins_async();
+        Ok(app)
+    }
+
+    fn enabled_plugin_count(&self) -> usize {
+        (self.config.plugin_agy as usize)
+            + (self.config.plugin_claude as usize)
+            + (self.config.plugin_codex as usize)
+    }
+
+    fn refresh_plugins_async(&mut self) {
+        let (a, c, x) = (
+            self.config.plugin_agy,
+            self.config.plugin_claude,
+            self.config.plugin_codex,
+        );
+        self.last_usage_refresh = Instant::now();
+        if !a && !c && !x {
+            self.agent_usage = AgentUsage::default();
+            self.usage_rx = None;
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let wake = self.proxy.clone();
+        self.usage_rx = Some(rx);
+        let _ = thread::Builder::new()
+            .name("plugin-usage".into())
+            .spawn(move || {
+                let usage = collect_today_usage(a, c, x);
+                let _ = tx.send(usage);
+                let _ = wake.send_event(());
+            });
+    }
+
+    fn poll_plugin_usage(&mut self) -> bool {
+        if let Some(ref rx) = self.usage_rx {
+            if let Ok(usage) = rx.try_recv() {
+                self.agent_usage = usage;
+                self.usage_rx = None;
+                return true;
+            }
+        }
+        if self.enabled_plugin_count() > 0
+            && self.usage_rx.is_none()
+            && self.last_usage_refresh.elapsed() >= Duration::from_secs(30)
+        {
+            self.refresh_plugins_async();
+        }
+        false
     }
 
     fn active_pane_rect(&self) -> Rect {
@@ -239,6 +297,14 @@ impl App {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        if !self.ui.settings.open && !self.ui.picker_open {
+            if let Some(card) = self.layout.usage_card_rect(self.enabled_plugin_count()) {
+                if card.contains(px, py) {
+                    return HitTarget::UsageCardRefresh;
                 }
             }
         }
@@ -613,9 +679,29 @@ impl App {
             HitTarget::SettingsFontNext => self.cycle_font(1),
             HitTarget::SettingsSizeDown => self.adjust_font_size(-1.0),
             HitTarget::SettingsSizeUp => self.adjust_font_size(1.0),
+            HitTarget::SettingsPluginAgy => {
+                self.config.plugin_agy = !self.config.plugin_agy;
+                let _ = self.config.save();
+                self.refresh_plugins_async();
+            }
+            HitTarget::SettingsPluginClaude => {
+                self.config.plugin_claude = !self.config.plugin_claude;
+                let _ = self.config.save();
+                self.refresh_plugins_async();
+            }
+            HitTarget::SettingsPluginCodex => {
+                self.config.plugin_codex = !self.config.plugin_codex;
+                let _ = self.config.save();
+                self.refresh_plugins_async();
+            }
+            HitTarget::UsageCardRefresh => {
+                self.refresh_plugins_async();
+                self.ui.toast = Some("Refreshing 24h agent token usage...".to_string());
+            }
             HitTarget::SettingsReset => {
                 self.config.reset_to_defaults();
                 self.apply_config_live(true);
+                self.refresh_plugins_async();
                 self.ui
                     .settings
                     .sync_from_config(&self.config, self.user.accent);
@@ -1301,6 +1387,7 @@ impl App {
                     if !suggestions.is_empty() {
                         self.ui.suggestion_selected =
                             (self.ui.suggestion_selected + 1) % suggestions.len();
+                        self.ui.suggestion_navigated = true;
                         self.request_redraw();
                         return;
                     }
@@ -1313,6 +1400,7 @@ impl App {
                         } else {
                             self.ui.suggestion_selected - 1
                         };
+                        self.ui.suggestion_navigated = true;
                         self.request_redraw();
                         return;
                     }
@@ -1363,11 +1451,22 @@ impl App {
 
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => {
+                // If the user navigated the completion popup with Up/Down, Enter selects AND runs it directly!
+                if self.ui.suggestion_navigated && !suggestions.is_empty() {
+                    let sel_idx = self
+                        .ui
+                        .suggestion_selected
+                        .min(suggestions.len().saturating_sub(1));
+                    if let Some(sug) = suggestions.get(sel_idx) {
+                        sess.input.set_text(sug.replacement.clone());
+                    }
+                }
                 let cmd = sess.input.submit();
                 let badge = sess.shell.badge.clone();
                 sess.submit_command(&cmd, self.user.accent);
                 self.history.record(&cmd, &badge);
                 self.ui.suggestion_selected = 0;
+                self.ui.suggestion_navigated = false;
                 self.ui.clear_selection();
             }
             Key::Named(NamedKey::Tab) => {
@@ -1379,11 +1478,15 @@ impl App {
                     .cloned()
                     .collect();
 
-                if path_items.len() > 1 && self.ui.suggestion_selected == 0 {
+                if path_items.len() > 1
+                    && !self.ui.suggestion_navigated
+                    && self.ui.suggestion_selected == 0
+                {
                     if let Some(lcp) = longest_common_prefix(&path_items) {
                         if lcp.len() > sess.input.text().len() {
                             sess.input.set_text(lcp);
                             self.ui.suggestion_selected = 0;
+                            self.ui.suggestion_navigated = false;
                             self.request_redraw();
                             return;
                         }
@@ -1400,13 +1503,16 @@ impl App {
                         let next = (sel_idx + 1) % suggestions.len();
                         sess.input.set_text(suggestions[next].replacement.clone());
                         self.ui.suggestion_selected = next;
+                        self.ui.suggestion_navigated = true;
                     } else {
                         sess.input.set_text(target.clone());
                         self.ui.suggestion_selected = 0;
+                        self.ui.suggestion_navigated = false;
                     }
                 } else if let Some(ghost) = ghost_suffix {
                     sess.input.insert_str(&ghost);
                     self.ui.suggestion_selected = 0;
+                    self.ui.suggestion_navigated = false;
                 }
             }
             Key::Named(NamedKey::ArrowRight) => {
@@ -1414,6 +1520,7 @@ impl App {
                     if let Some(ghost) = ghost_suffix {
                         sess.input.insert_str(&ghost);
                         self.ui.suggestion_selected = 0;
+                        self.ui.suggestion_navigated = false;
                     }
                 } else {
                     sess.input.move_right_with_select(shift);
@@ -1422,31 +1529,52 @@ impl App {
             Key::Named(NamedKey::Backspace) => {
                 sess.input.backspace();
                 self.ui.suggestion_selected = 0;
+                self.ui.suggestion_navigated = false;
             }
             Key::Named(NamedKey::Delete) => {
                 sess.input.delete();
                 self.ui.suggestion_selected = 0;
+                self.ui.suggestion_navigated = false;
             }
             Key::Named(NamedKey::ArrowLeft) => sess.input.move_left_with_select(shift),
             Key::Named(NamedKey::Home) => sess.input.move_home_with_select(shift),
             Key::Named(NamedKey::End) => sess.input.move_end_with_select(shift),
             Key::Named(NamedKey::ArrowUp) => {
-                sess.input.history_prev();
-                self.ui.suggestion_selected = 0;
+                if !suggestions.is_empty() {
+                    self.ui.suggestion_selected = if self.ui.suggestion_selected == 0 {
+                        suggestions.len() - 1
+                    } else {
+                        self.ui.suggestion_selected - 1
+                    };
+                    self.ui.suggestion_navigated = true;
+                } else {
+                    sess.input.history_prev();
+                    self.ui.suggestion_selected = 0;
+                    self.ui.suggestion_navigated = false;
+                }
             }
             Key::Named(NamedKey::ArrowDown) => {
-                sess.input.history_next();
-                self.ui.suggestion_selected = 0;
+                if !suggestions.is_empty() {
+                    self.ui.suggestion_selected =
+                        (self.ui.suggestion_selected + 1) % suggestions.len();
+                    self.ui.suggestion_navigated = true;
+                } else {
+                    sess.input.history_next();
+                    self.ui.suggestion_selected = 0;
+                    self.ui.suggestion_navigated = false;
+                }
             }
             Key::Named(NamedKey::Escape) => {
                 self.ui.picker_open = false;
                 self.ui.suggestion_selected = 0;
+                self.ui.suggestion_navigated = false;
                 self.ui.clear_selection();
                 sess.input.clear();
             }
             Key::Named(NamedKey::Space) => {
                 sess.input.insert_char(' ');
                 self.ui.suggestion_selected = 0;
+                self.ui.suggestion_navigated = false;
             }
             _ => {
                 if !ctrl && !self.modifiers.alt_key() && !self.modifiers.super_key() {
@@ -1455,6 +1583,7 @@ impl App {
                             if !ch.is_control() {
                                 sess.input.insert_char(ch);
                                 self.ui.suggestion_selected = 0;
+                                self.ui.suggestion_navigated = false;
                             }
                         }
                     }
@@ -1466,6 +1595,7 @@ impl App {
 
     fn redraw(&mut self) {
         self.sessions.poll_all();
+        self.poll_plugin_usage();
         let (suggestions, ghost_suffix) = self.current_suggestions();
         if !suggestions.is_empty() && self.ui.suggestion_selected >= suggestions.len() {
             self.ui.suggestion_selected = 0;
@@ -1487,6 +1617,7 @@ impl App {
                 ghost_suffix.as_deref(),
                 &self.config,
                 &self.snippets,
+                &self.agent_usage,
             );
             let _ = buffer.present();
         }
@@ -1530,8 +1661,10 @@ impl ApplicationHandler<()> for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
-        if self.sessions.poll_all() {
-            if self.ui.search.open {
+        let sess_changed = self.sessions.poll_all();
+        let plugin_changed = self.poll_plugin_usage();
+        if sess_changed || plugin_changed {
+            if sess_changed && self.ui.search.open {
                 self.refresh_search();
             }
             self.request_redraw();

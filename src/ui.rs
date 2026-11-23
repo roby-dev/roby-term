@@ -1,6 +1,7 @@
 use crate::complete::{abbreviate_path, CompletionItem, CompletionKind};
 use crate::config::{format_hex_color, parse_hex_color, UserConfig, PRESET_ACCENTS};
 use crate::input::{InputBar, TokenKind};
+use crate::plugins::{format_compact_tokens, AgentUsage};
 use crate::session::{Session, SessionManager};
 use crate::shell::ShellProfile;
 use crate::snippets::SnippetStore;
@@ -115,7 +116,11 @@ pub enum HitTarget {
     SettingsFontNext,
     SettingsSizeDown,
     SettingsSizeUp,
+    SettingsPluginAgy,
+    SettingsPluginClaude,
+    SettingsPluginCodex,
     SettingsReset,
+    UsageCardRefresh,
     TerminalViewport,
     InputBar,
     None,
@@ -255,7 +260,7 @@ impl Layout {
 
     pub fn settings_panel(&self) -> Rect {
         let w = self.viewport.w.saturating_sub(40).min(520);
-        let h = self.height.saturating_sub(80).min(388);
+        let h = self.height.saturating_sub(64).min(452);
         let x = self.viewport.x + self.viewport.w.saturating_sub(w) / 2;
         let y = self.header.h + self.viewport.h.saturating_sub(h) / 2;
         Rect::new(x, y, w, h)
@@ -310,6 +315,27 @@ impl Layout {
     pub fn settings_reset_rect(&self) -> Rect {
         let p = self.settings_panel();
         Rect::new(p.x + 20, p.y + p.h.saturating_sub(38), 132, 26)
+    }
+
+    /// Returns `(agy, claude, codex)` checkbox rects inside the Settings modal.
+    pub fn settings_plugin_rects(&self) -> (Rect, Rect, Rect) {
+        let p = self.settings_panel();
+        let y = p.y + 370;
+        let w = 148;
+        let gap = 12;
+        let r0 = Rect::new(p.x + 20, y, w, 28);
+        let r1 = Rect::new(r0.x + w + gap, y, w, 28);
+        let r2 = Rect::new(r1.x + w + gap, y, w, 28);
+        (r0, r1, r2)
+    }
+
+    pub fn usage_card_rect(&self, enabled_count: usize) -> Option<Rect> {
+        if enabled_count == 0 {
+            return None;
+        }
+        let h = 24 + (enabled_count as u32) * 18;
+        let y = self.new_session_btn.y.saturating_sub(h + 8);
+        Some(Rect::new(12, y, self.sidebar.w.saturating_sub(24), h))
     }
 
     pub fn search_bar_rect(&self) -> Rect {
@@ -447,6 +473,16 @@ impl Layout {
                 }
                 if self.settings_size_up_rect().contains(px, py) {
                     return HitTarget::SettingsSizeUp;
+                }
+                let (p_agy, p_claude, p_codex) = self.settings_plugin_rects();
+                if p_agy.contains(px, py) {
+                    return HitTarget::SettingsPluginAgy;
+                }
+                if p_claude.contains(px, py) {
+                    return HitTarget::SettingsPluginClaude;
+                }
+                if p_codex.contains(px, py) {
+                    return HitTarget::SettingsPluginCodex;
                 }
                 if self.settings_reset_rect().contains(px, py) {
                     return HitTarget::SettingsReset;
@@ -852,6 +888,7 @@ pub struct UiState {
     pub toast: Option<String>,
     pub renaming_session: Option<(usize, InputBar)>,
     pub suggestion_selected: usize,
+    pub suggestion_navigated: bool,
     pub search: SearchUiState,
     pub palette: PaletteUiState,
     pub settings: SettingsUiState,
@@ -870,6 +907,7 @@ impl UiState {
             toast: None,
             renaming_session: None,
             suggestion_selected: 0,
+            suggestion_navigated: false,
             search: SearchUiState::default(),
             palette: PaletteUiState::default(),
             settings: SettingsUiState::from_config(cfg, active_accent),
@@ -902,6 +940,7 @@ pub fn render_app(
     ghost_suffix: Option<&str>,
     cfg: &UserConfig,
     snippets: &SnippetStore,
+    usage: &AgentUsage,
 ) {
     let mut canvas = Canvas::new(pixels, layout.width, layout.height);
     canvas.clear(theme.bg_terminal);
@@ -1087,6 +1126,63 @@ pub fn render_app(
                 close_color,
                 "x",
                 (close_r.x + close_r.w) as i32,
+            );
+        }
+    }
+
+    // 4.5 Optional Agent Token Usage card in sidebar (shown only when enabled in Settings)
+    let enabled_rows: Vec<(&str, Rgb, u64)> = [
+        usage.agy.map(|t| ("agy", user.accent, t.total())),
+        usage
+            .claude
+            .map(|t| ("claude", theme.syntax.flag, t.total())),
+        usage
+            .codex
+            .map(|t| ("codex", theme.syntax.string_literal, t.total())),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    if let Some(card) = layout.usage_card_rect(enabled_rows.len()) {
+        let card_bg = if ui.hovered == HitTarget::UsageCardRefresh {
+            theme.bg_sidebar_active
+        } else {
+            theme.bg_header
+        };
+        canvas.fill_rect(card, card_bg);
+        canvas.stroke_rect(card, theme.border);
+        font.draw_text(
+            &mut canvas,
+            (card.x + 8) as i32,
+            (card.y + 4) as i32,
+            FONT_SIZE_SMALL,
+            theme.fg_muted,
+            "TOKENS (24h)",
+            (card.x + card.w - 6) as i32,
+        );
+        for (i, (label, color, total)) in enabled_rows.iter().enumerate() {
+            let ry = card.y + 20 + (i as u32) * 18;
+            canvas.fill_rect(Rect::new(card.x + 8, ry + 5, 5, 5), *color);
+            font.draw_text(
+                &mut canvas,
+                (card.x + 18) as i32,
+                ry as i32,
+                FONT_SIZE_SMALL,
+                theme.fg_primary,
+                label,
+                (card.x + card.w - 64) as i32,
+            );
+            let val = format_compact_tokens(*total);
+            let vw = font.measure_text(&val, FONT_SIZE_SMALL);
+            font.draw_text(
+                &mut canvas,
+                (card.x + card.w).saturating_sub(vw + 8) as i32,
+                ry as i32,
+                FONT_SIZE_SMALL,
+                *color,
+                &val,
+                (card.x + card.w - 4) as i32,
             );
         }
     }
@@ -2213,6 +2309,53 @@ fn render_settings_panel(
         "+",
         (up_r.x + up_r.w) as i32,
     );
+
+    // Agent Token Plugins (24h) opt-in toggles
+    canvas.fill_rect(
+        Rect::new(p.x + 20, p.y + 344, p.w.saturating_sub(40), 1),
+        theme.border,
+    );
+    font.draw_text(
+        canvas,
+        (p.x + 20) as i32,
+        (p.y + 352) as i32,
+        FONT_SIZE_SMALL,
+        theme.fg_muted,
+        "CLI AGENT TOKEN PLUGINS (24h local logs)",
+        max_x,
+    );
+    let (r_agy, r_claude, r_codex) = layout.settings_plugin_rects();
+    let plugin_boxes = [
+        (r_agy, cfg.plugin_agy, "Antigravity (agy)", HitTarget::SettingsPluginAgy),
+        (r_claude, cfg.plugin_claude, "Claude Code", HitTarget::SettingsPluginClaude),
+        (r_codex, cfg.plugin_codex, "Codex CLI", HitTarget::SettingsPluginCodex),
+    ];
+    for (r, enabled, label, target) in plugin_boxes {
+        if r.x + r.w > p.x + p.w - 10 {
+            continue;
+        }
+        canvas.fill_rect(
+            r,
+            if enabled {
+                theme.bg_sidebar_active
+            } else if ui.hovered == target {
+                theme.bg_sidebar_hover
+            } else {
+                theme.bg_input
+            },
+        );
+        canvas.stroke_rect(r, if enabled { user.accent } else { theme.border });
+        let prefix = if enabled { "[x] " } else { "[ ] " };
+        font.draw_text(
+            canvas,
+            (r.x + 8) as i32,
+            (r.y + 7) as i32,
+            FONT_SIZE_SMALL,
+            if enabled { user.accent } else { theme.fg_primary },
+            &format!("{prefix}{label}"),
+            (r.x + r.w - 4) as i32,
+        );
+    }
 
     // Footer: Reset button + status note
     let reset_r = layout.settings_reset_rect();
