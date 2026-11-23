@@ -1,5 +1,7 @@
 use crate::theme::{ansi_256_color, Rgb};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use vte::{Params, Parser, Perform};
 
 /// Maximum scrollback lines kept in RAM per session (ring buffer).
@@ -38,6 +40,8 @@ pub struct TerminalGrid {
     cells: Vec<Vec<Cell>>,
     scrollback: VecDeque<Vec<Cell>>,
     max_scrollback: usize,
+    /// Total lines evicted from the front of `scrollback` (keeps absolute line IDs monotonic).
+    evicted_lines: usize,
     cursor_row: usize,
     cursor_col: usize,
     saved_cursor: (usize, usize),
@@ -47,6 +51,7 @@ pub struct TerminalGrid {
     cur_underline: bool,
     cur_inverse: bool,
     alt_screen: bool,
+    mouse_tracking: bool,
     saved_main_cells: Option<Vec<Vec<Cell>>>,
     parser: Parser,
 }
@@ -75,6 +80,7 @@ impl TerminalGrid {
             cells,
             scrollback: VecDeque::with_capacity(max_scrollback.min(256)),
             max_scrollback,
+            evicted_lines: 0,
             cursor_row: 0,
             cursor_col: 0,
             saved_cursor: (0, 0),
@@ -84,6 +90,7 @@ impl TerminalGrid {
             cur_underline: false,
             cur_inverse: false,
             alt_screen: false,
+            mouse_tracking: false,
             saved_main_cells: None,
             parser: Parser::new(),
         }
@@ -105,8 +112,185 @@ impl TerminalGrid {
         self.alt_screen
     }
 
+    /// Returns true when the running process has activated a TUI protocol (alt-screen or mouse tracking).
+    pub fn is_tui_active(&self) -> bool {
+        self.alt_screen || self.mouse_tracking
+    }
+
     pub fn scrollback_len(&self) -> usize {
         self.scrollback.len()
+    }
+
+    /// Monotonic absolute line index of the current cursor row.
+    pub fn current_abs_line(&self) -> usize {
+        self.evicted_lines + self.scrollback.len() + self.cursor_row
+    }
+
+    /// Monotonic absolute line index corresponding to `screen_row` at `scroll_offset`.
+    pub fn screen_row_to_abs_line(&self, screen_row: usize, scroll_offset: usize) -> usize {
+        if self.alt_screen {
+            return screen_row;
+        }
+        let clamped = scroll_offset.min(self.scrollback.len());
+        self.evicted_lines + self.scrollback.len().saturating_sub(clamped) + screen_row
+    }
+
+    /// Returns the row slice for a monotonic `abs_line`, if still in scrollback or screen.
+    pub fn row_at_abs_line(&self, abs_line: usize) -> Option<&[Cell]> {
+        if abs_line < self.evicted_lines {
+            return None;
+        }
+        let rel = abs_line - self.evicted_lines;
+        if rel < self.scrollback.len() {
+            self.scrollback.get(rel).map(|r| r.as_slice())
+        } else {
+            self.cells.get(rel - self.scrollback.len()).map(|r| r.as_slice())
+        }
+    }
+
+    /// Computes a `scroll_offset` that brings `abs_line` cleanly into view.
+    pub fn scroll_offset_for_abs_line(&self, abs_line: usize) -> usize {
+        if self.alt_screen {
+            return 0;
+        }
+        let total_sb = self.scrollback.len();
+        let rel = abs_line.saturating_sub(self.evicted_lines);
+        let desired_top = rel.saturating_sub(self.rows / 3);
+        total_sb.saturating_sub(desired_top).min(total_sb)
+    }
+
+    /// Extracts text from a mouse drag selection `(row, col)` in screen coordinates.
+    pub fn extract_selection(
+        &self,
+        a: (usize, usize),
+        b: (usize, usize),
+        scroll_offset: usize,
+    ) -> String {
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let mut lines = Vec::new();
+        for r in start.0..=end.0 {
+            let Some(cells) = self.visible_row(r, scroll_offset) else {
+                continue;
+            };
+            let c0 = if r == start.0 { start.1.min(cells.len()) } else { 0 };
+            let c1 = if r == end.0 {
+                (end.1 + 1).min(cells.len())
+            } else {
+                cells.len()
+            };
+            if c0 <= c1 {
+                let s: String = cells[c0..c1].iter().map(|c| c.ch).collect();
+                lines.push(s.trim_end().to_string());
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// Extracts trimmed text across an inclusive range of monotonic absolute lines (for Warp blocks).
+    pub fn extract_abs_range(&self, start_abs: usize, end_abs: usize) -> String {
+        let mut lines = Vec::new();
+        for abs in start_abs..=end_abs {
+            if let Some(cells) = self.row_at_abs_line(abs) {
+                let s: String = cells.iter().map(|c| c.ch).collect();
+                lines.push(s.trim_end().to_string());
+            }
+        }
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
+    /// Dumps the full scrollback + visible screen as plain text for local session persistence.
+    pub fn dump_transcript(&self) -> String {
+        let mut lines = Vec::with_capacity(self.scrollback.len() + self.cells.len());
+        for row in &self.scrollback {
+            let s: String = row.iter().map(|c| c.ch).collect();
+            lines.push(s.trim_end().to_string());
+        }
+        for row in &self.cells {
+            let s: String = row.iter().map(|c| c.ch).collect();
+            lines.push(s.trim_end().to_string());
+        }
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
+    /// Searches scrollback + active screen case-insensitively for `query`.
+    pub fn search_matches(&self, query: &str) -> Vec<SearchMatch> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let q_lower: Vec<char> = q.to_lowercase().chars().collect();
+        let q_len = q_lower.len();
+        let mut matches = Vec::new();
+
+        let total_lines = self.scrollback.len() + self.cells.len();
+        for rel in 0..total_lines {
+            let row = if rel < self.scrollback.len() {
+                &self.scrollback[rel]
+            } else {
+                &self.cells[rel - self.scrollback.len()]
+            };
+            if row.len() < q_len {
+                continue;
+            }
+            let row_chars: Vec<char> = row
+                .iter()
+                .map(|c| c.ch.to_lowercase().next().unwrap_or(c.ch))
+                .collect();
+            let mut col = 0;
+            while col + q_len <= row_chars.len() {
+                if row_chars[col..col + q_len] == q_lower[..] {
+                    matches.push(SearchMatch {
+                        abs_line: self.evicted_lines + rel,
+                        col_start: col,
+                        col_end: col + q_len,
+                    });
+                    col += q_len;
+                } else {
+                    col += 1;
+                }
+            }
+        }
+        matches
+    }
+
+    /// Updates default terminal colors live (e.g. from Settings) and refreshes default-colored cells.
+    pub fn set_default_colors(&mut self, fg: Rgb, bg: Rgb) {
+        let old_fg = self.default_fg;
+        let old_bg = self.default_bg;
+        self.default_fg = fg;
+        self.default_bg = bg;
+        if self.cur_fg == old_fg {
+            self.cur_fg = fg;
+        }
+        if self.cur_bg == old_bg {
+            self.cur_bg = bg;
+        }
+        for row in &mut self.cells {
+            for cell in row {
+                if cell.fg == old_fg {
+                    cell.fg = fg;
+                }
+                if cell.bg == old_bg {
+                    cell.bg = bg;
+                }
+            }
+        }
+        for row in &mut self.scrollback {
+            for cell in row {
+                if cell.fg == old_fg {
+                    cell.fg = fg;
+                }
+                if cell.bg == old_bg {
+                    cell.bg = bg;
+                }
+            }
+        }
     }
 
     /// Feeds raw PTY output bytes through the VT parser into the grid.
@@ -170,6 +354,7 @@ impl TerminalGrid {
         }
         if self.scrollback.len() >= self.max_scrollback {
             self.scrollback.pop_front();
+            self.evicted_lines += 1;
         }
         self.scrollback.push_back(row);
     }
@@ -327,11 +512,19 @@ impl Perform for TerminalGrid {
 
         let is_private = intermediates.contains(&b'?');
         if is_private {
-            let mode = raw_param(0);
-            if mode == 1049 || mode == 47 || mode == 1047 {
-                match action {
-                    'h' => self.enter_alt_screen(),
-                    'l' => self.leave_alt_screen(),
+            for sub in params.iter() {
+                let mode = sub.first().copied().unwrap_or(0) as usize;
+                match mode {
+                    1049 | 47 | 1047 => match action {
+                        'h' => self.enter_alt_screen(),
+                        'l' => self.leave_alt_screen(),
+                        _ => {}
+                    },
+                    1000 | 1002 | 1003 | 1006 => match action {
+                        'h' => self.mouse_tracking = true,
+                        'l' => self.mouse_tracking = false,
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
@@ -411,6 +604,254 @@ impl Perform for TerminalGrid {
     }
 }
 
+/// A case-insensitive search match inside the terminal scrollback or screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub abs_line: usize,
+    pub col_start: usize,
+    pub col_end: usize,
+}
+
+/// Clickable link target detected in terminal output (local path or HTTP/HTTPS URL).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTarget {
+    Path { resolved: PathBuf, is_file: bool },
+    Url(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedLink {
+    pub col_start: usize,
+    pub col_end: usize,
+    pub target: LinkTarget,
+}
+
+/// Detects either an HTTP/HTTPS URL or an existing filesystem path under `col`.
+pub fn detect_link_at_col(row: &[Cell], col: usize, cwd: &Path) -> Option<DetectedLink> {
+    if col >= row.len() {
+        return None;
+    }
+    let is_delim = |c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | '<' | '>' | '|' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+    };
+    if is_delim(row[col].ch) {
+        return None;
+    }
+
+    let mut start = col;
+    while start > 0 && !is_delim(row[start - 1].ch) {
+        start -= 1;
+    }
+    let mut end = col + 1;
+    while end < row.len() && !is_delim(row[end].ch) {
+        end += 1;
+    }
+
+    let raw: String = row[start..end].iter().map(|c| c.ch).collect();
+    let trimmed = raw.trim_end_matches([',', ';', '.']);
+
+    // 1. Check HTTP / HTTPS URL first
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        if trimmed.len() > 8 {
+            let effective_len = trimmed.chars().count();
+            return Some(DetectedLink {
+                col_start: start,
+                col_end: (start + effective_len).min(end),
+                target: LinkTarget::Url(trimmed.to_string()),
+            });
+        }
+    }
+
+    // 2. Fall back to existing filesystem path
+    detect_path_at_col(row, col, cwd).map(|p| DetectedLink {
+        col_start: p.col_start,
+        col_end: p.col_end,
+        target: LinkTarget::Path {
+            resolved: p.resolved,
+            is_file: p.is_file,
+        },
+    })
+}
+
+/// Opens a detected link: Explorer/Finder for paths, default browser for URLs.
+pub fn open_link(target: &LinkTarget) {
+    match target {
+        LinkTarget::Path { resolved, .. } => open_in_file_explorer(resolved),
+        LinkTarget::Url(url) => open_url_in_browser(url),
+    }
+}
+
+pub fn open_url_in_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open").arg(url).spawn();
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let _ = Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+/// A clickable filesystem path detected on a terminal row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedPath {
+    pub col_start: usize,
+    pub col_end: usize,
+    pub resolved: PathBuf,
+    pub is_file: bool,
+}
+
+/// Detects an existing file or directory path under `col` on a terminal row.
+pub fn detect_path_at_col(row: &[Cell], col: usize, cwd: &Path) -> Option<DetectedPath> {
+    if col >= row.len() {
+        return None;
+    }
+    let is_delim = |c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '|' | '(' | ')' | '[' | ']' | '{' | '}')
+    };
+    if is_delim(row[col].ch) {
+        return None;
+    }
+
+    let mut start = col;
+    while start > 0 && !is_delim(row[start - 1].ch) {
+        start -= 1;
+    }
+    let mut end = col + 1;
+    while end < row.len() && !is_delim(row[end].ch) {
+        end += 1;
+    }
+
+    let raw: String = row[start..end].iter().map(|c| c.ch).collect();
+    let trimmed_end = raw.trim_end_matches([',', ';', '.']);
+    let mut candidate_str = trimmed_end;
+
+    // Strip optional `:line` or `:line:col` suffix (e.g. `src/main.rs:42:10`)
+    if let Some((path_part, rest)) = strip_line_col_suffix(candidate_str) {
+        if !rest.is_empty() {
+            candidate_str = path_part;
+        }
+    }
+
+    if !looks_like_fs_path(candidate_str) && !looks_like_local_filename(candidate_str) {
+        return None;
+    }
+
+    let resolved = resolve_candidate_path(candidate_str, cwd)?;
+    if !resolved.exists() {
+        return None;
+    }
+
+    let effective_len = candidate_str.chars().count();
+    Some(DetectedPath {
+        col_start: start,
+        col_end: (start + effective_len).min(end),
+        is_file: resolved.is_file(),
+        resolved,
+    })
+}
+
+fn looks_like_fs_path(s: &str) -> bool {
+    if s.len() < 2 {
+        return false;
+    }
+    let b = s.as_bytes();
+    // Windows drive path: C:\..., D:\wauth, D:/foo
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
+        return true;
+    }
+    // Relative / home / Unix paths
+    s.starts_with("./")
+        || s.starts_with("../")
+        || s.starts_with(".\\")
+        || s.starts_with("..\\")
+        || s.starts_with("~/")
+        || s.starts_with("~\\")
+        || s.starts_with('/')
+        || s.contains('\\')
+        || s.contains('/')
+}
+
+fn looks_like_local_filename(s: &str) -> bool {
+    s.len() >= 3
+        && s.contains('.')
+        && !s.starts_with('.')
+        && !s.ends_with('.')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn strip_line_col_suffix(s: &str) -> Option<(&str, &str)> {
+    // Avoid stripping Windows drive colon `D:\...`
+    let min_colon_idx = if s.len() >= 2 && s.as_bytes()[1] == b':' { 2 } else { 0 };
+    let rest_slice = &s[min_colon_idx..];
+    let rel_colon = rest_slice.find(':')?;
+    let idx = min_colon_idx + rel_colon;
+    let suffix = &s[idx + 1..];
+    if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+        Some((&s[..idx], suffix))
+    } else {
+        None
+    }
+}
+
+fn resolve_candidate_path(candidate: &str, cwd: &Path) -> Option<PathBuf> {
+    if let Some(rest) = candidate
+        .strip_prefix("~/")
+        .or_else(|| candidate.strip_prefix("~\\"))
+    {
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)?;
+        return Some(home.join(rest));
+    }
+    let p = PathBuf::from(candidate);
+    if p.is_absolute() {
+        Some(p)
+    } else {
+        Some(cwd.join(p))
+    }
+}
+
+/// Opens a directory in Windows Explorer / macOS Finder, or reveals a file inside its folder.
+pub fn open_in_file_explorer(path: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        if path.is_file() {
+            let _ = Command::new("explorer.exe")
+                .arg(format!("/select,{}", path.display()))
+                .spawn();
+        } else {
+            let _ = Command::new("explorer.exe").arg(path).spawn();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if path.is_file() {
+            let _ = Command::new("open").arg("-R").arg(path).spawn();
+        } else {
+            let _ = Command::new("open").arg(path).spawn();
+        }
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let target = if path.is_file() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        let _ = Command::new("xdg-open").arg(target).spawn();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,6 +897,65 @@ mod tests {
         assert_eq!(row_text(&grid, 0), "vim");
         grid.feed(b"\x1b[?1049l");
         assert!(!grid.is_alt_screen());
+        assert!(!grid.is_tui_active());
         assert_eq!(row_text(&grid, 0), "main");
+
+        // Inline TUI mouse tracking (e.g. modern CLI agents)
+        grid.feed(b"\x1b[?1000h\x1b[?1006h");
+        assert!(grid.is_tui_active());
+        grid.feed(b"\x1b[?1000l\x1b[?1006l");
+        assert!(!grid.is_tui_active());
+    }
+
+    #[test]
+    fn detects_existing_clickable_path_in_terminal_row() {
+        let dir = std::env::temp_dir().join("my_warp_path_detect_test");
+        let file = dir.join("hello.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, "hi").unwrap();
+
+        let fg = Rgb::new(255, 255, 255);
+        let bg = Rgb::new(0, 0, 0);
+        let mut grid = TerminalGrid::new(120, 4, fg, bg);
+        let line = format!("Opened {} successfully", dir.display());
+        grid.feed(line.as_bytes());
+
+        let row = grid.visible_row(0, 0).unwrap();
+        let detected = detect_path_at_col(row, 8, &dir).expect("should detect dir path");
+        assert_eq!(detected.resolved, dir);
+        assert!(!detected.is_file);
+        assert!(detect_path_at_col(row, 0, &dir).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_clickable_http_and_https_urls() {
+        let fg = Rgb::new(255, 255, 255);
+        let bg = Rgb::new(0, 0, 0);
+        let mut grid = TerminalGrid::new(100, 4, fg, bg);
+        grid.feed(b"Server listening at http://localhost:3000/api, ready!");
+        let row = grid.visible_row(0, 0).unwrap();
+        let link = detect_link_at_col(row, 25, Path::new(".")).expect("should detect URL");
+        assert_eq!(
+            link.target,
+            LinkTarget::Url("http://localhost:3000/api".to_string())
+        );
+    }
+
+    #[test]
+    fn searches_scrollback_and_extracts_selection() {
+        let fg = Rgb::new(255, 255, 255);
+        let bg = Rgb::new(0, 0, 0);
+        let mut grid = TerminalGrid::new(40, 4, fg, bg);
+        grid.feed(b"alpha beta\r\ngamma BETA\r\ndelta");
+        let hits = grid.search_matches("beta");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].col_start, 6);
+        assert_eq!(hits[1].col_start, 6);
+
+        let sel = grid.extract_selection((0, 0), (1, 4), 0);
+        assert_eq!(sel, "alpha beta\ngamma");
     }
 }
