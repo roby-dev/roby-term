@@ -52,6 +52,11 @@ pub struct TerminalGrid {
     cur_inverse: bool,
     alt_screen: bool,
     mouse_tracking: bool,
+    sgr_mouse: bool,
+    bracketed_paste: bool,
+    kitty_keyboard_depth: u8,
+    scroll_top: usize,
+    scroll_bottom: usize,
     last_printed_char: char,
     saved_main_cells: Option<Vec<Vec<Cell>>>,
     parser: Parser,
@@ -92,6 +97,11 @@ impl TerminalGrid {
             cur_inverse: false,
             alt_screen: false,
             mouse_tracking: false,
+            sgr_mouse: false,
+            bracketed_paste: false,
+            kitty_keyboard_depth: 0,
+            scroll_top: 0,
+            scroll_bottom: rows - 1,
             last_printed_char: ' ',
             saved_main_cells: None,
             parser: Parser::new(),
@@ -117,6 +127,23 @@ impl TerminalGrid {
     /// Returns true when the running process has activated a TUI protocol (alt-screen or mouse tracking).
     pub fn is_tui_active(&self) -> bool {
         self.alt_screen || self.mouse_tracking
+    }
+
+    pub fn mouse_tracking_enabled(&self) -> bool {
+        self.mouse_tracking
+    }
+
+    pub fn sgr_mouse_enabled(&self) -> bool {
+        self.sgr_mouse
+    }
+
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    /// Returns true when the running app enabled the Kitty keyboard protocol (`CSI > flags u`).
+    pub fn kitty_keyboard_enabled(&self) -> bool {
+        self.kitty_keyboard_depth > 0
     }
 
     pub fn scrollback_len(&self) -> usize {
@@ -327,6 +354,8 @@ impl TerminalGrid {
         }
         self.cols = new_cols;
         self.rows = new_rows;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows - 1;
         self.cursor_row = self.cursor_row.min(self.rows - 1);
         self.cursor_col = self.cursor_col.min(self.cols - 1);
     }
@@ -361,13 +390,41 @@ impl TerminalGrid {
         self.scrollback.push_back(row);
     }
 
+    fn scroll_region_up(&mut self, count: usize) {
+        let top = self.scroll_top.min(self.rows - 1);
+        let bottom = self.scroll_bottom.min(self.rows - 1);
+        if top >= bottom {
+            return;
+        }
+        let n = count.min(bottom - top + 1);
+        for _ in 0..n {
+            let removed = self.cells.remove(top);
+            if top == 0 {
+                self.push_scrollback(removed);
+            }
+            self.cells.insert(bottom, self.blank_row());
+        }
+    }
+
+    fn scroll_region_down(&mut self, count: usize) {
+        let top = self.scroll_top.min(self.rows - 1);
+        let bottom = self.scroll_bottom.min(self.rows - 1);
+        if top >= bottom {
+            return;
+        }
+        let n = count.min(bottom - top + 1);
+        for _ in 0..n {
+            self.cells.remove(bottom);
+            self.cells.insert(top, self.blank_row());
+        }
+    }
+
     fn newline(&mut self) {
-        if self.cursor_row + 1 < self.rows {
+        let bottom = self.scroll_bottom.min(self.rows - 1);
+        if self.cursor_row == bottom {
+            self.scroll_region_up(1);
+        } else if self.cursor_row + 1 < self.rows {
             self.cursor_row += 1;
-        } else {
-            let top = self.cells.remove(0);
-            self.push_scrollback(top);
-            self.cells.push(self.blank_row());
         }
     }
 
@@ -444,6 +501,8 @@ impl TerminalGrid {
             self.saved_cursor = (self.cursor_row, self.cursor_col);
             self.cursor_row = 0;
             self.cursor_col = 0;
+            self.scroll_top = 0;
+            self.scroll_bottom = self.rows - 1;
             self.alt_screen = true;
         }
     }
@@ -455,6 +514,8 @@ impl TerminalGrid {
             }
             self.cursor_row = self.saved_cursor.0.min(self.rows - 1);
             self.cursor_col = self.saved_cursor.1.min(self.cols - 1);
+            self.scroll_top = 0;
+            self.scroll_bottom = self.rows - 1;
             self.alt_screen = false;
         }
     }
@@ -491,12 +552,12 @@ impl Perform for TerminalGrid {
                 self.cursor_col = self.saved_cursor.1.min(self.cols - 1);
             }
             b'M' => {
-                // Reverse Index (RI)
-                if self.cursor_row > 0 {
+                // Reverse Index (RI) respecting DECSTBM scroll region
+                let top = self.scroll_top.min(self.rows - 1);
+                if self.cursor_row == top {
+                    self.scroll_region_down(1);
+                } else if self.cursor_row > 0 {
                     self.cursor_row -= 1;
-                } else {
-                    self.cells.pop();
-                    self.cells.insert(0, self.blank_row());
                 }
             }
             _ => {}
@@ -543,14 +604,41 @@ impl Perform for TerminalGrid {
                         'l' => self.leave_alt_screen(),
                         _ => {}
                     },
-                    1000 | 1002 | 1003 | 1006 => match action {
+                    1000 | 1002 | 1003 => match action {
                         'h' => self.mouse_tracking = true,
                         'l' => self.mouse_tracking = false,
+                        _ => {}
+                    },
+                    1006 => match action {
+                        'h' => {
+                            self.sgr_mouse = true;
+                            self.mouse_tracking = true;
+                        }
+                        'l' => self.sgr_mouse = false,
+                        _ => {}
+                    },
+                    2004 => match action {
+                        'h' => self.bracketed_paste = true,
+                        'l' => self.bracketed_paste = false,
                         _ => {}
                     },
                     _ => {}
                 }
             }
+            return;
+        }
+
+        // Kitty keyboard protocol push/pop (`CSI > flags u` / `CSI < count u`)
+        if action == 'u' && intermediates.contains(&b'>') {
+            self.kitty_keyboard_depth = self.kitty_keyboard_depth.saturating_add(1);
+            return;
+        }
+        if action == 'u' && intermediates.contains(&b'<') {
+            let pop = param(0, 1).min(u8::MAX as usize) as u8;
+            self.kitty_keyboard_depth = self.kitty_keyboard_depth.saturating_sub(pop);
+            return;
+        }
+        if !intermediates.is_empty() {
             return;
         }
 
@@ -619,37 +707,48 @@ impl Perform for TerminalGrid {
                 }
             }
             'L' => {
-                // IL — Insert Lines
-                let count = param(0, 1).min(self.rows.saturating_sub(self.cursor_row));
-                for _ in 0..count {
-                    self.cells.pop();
-                    self.cells.insert(self.cursor_row, self.blank_row());
+                // IL — Insert Lines within scroll region
+                let bottom = self.scroll_bottom.min(self.rows - 1);
+                if self.cursor_row >= self.scroll_top && self.cursor_row <= bottom {
+                    let count = param(0, 1).min(bottom - self.cursor_row + 1);
+                    for _ in 0..count {
+                        self.cells.remove(bottom);
+                        self.cells.insert(self.cursor_row, self.blank_row());
+                    }
                 }
             }
             'M' => {
-                // DL — Delete Lines
-                let count = param(0, 1).min(self.rows.saturating_sub(self.cursor_row));
-                for _ in 0..count {
-                    self.cells.remove(self.cursor_row);
-                    self.cells.push(self.blank_row());
+                // DL — Delete Lines within scroll region
+                let bottom = self.scroll_bottom.min(self.rows - 1);
+                if self.cursor_row >= self.scroll_top && self.cursor_row <= bottom {
+                    let count = param(0, 1).min(bottom - self.cursor_row + 1);
+                    for _ in 0..count {
+                        self.cells.remove(self.cursor_row);
+                        self.cells.insert(bottom, self.blank_row());
+                    }
                 }
             }
             'S' => {
-                // SU — Scroll Up
-                let count = param(0, 1).min(self.rows);
-                for _ in 0..count {
-                    let top = self.cells.remove(0);
-                    self.push_scrollback(top);
-                    self.cells.push(self.blank_row());
-                }
+                // SU — Scroll Up within scroll region
+                self.scroll_region_up(param(0, 1));
             }
             'T' => {
-                // SD — Scroll Down
-                let count = param(0, 1).min(self.rows);
-                for _ in 0..count {
-                    self.cells.pop();
-                    self.cells.insert(0, self.blank_row());
+                // SD — Scroll Down within scroll region
+                self.scroll_region_down(param(0, 1));
+            }
+            'r' => {
+                // DECSTBM — Set Top and Bottom Margins (scroll region)
+                let top = param(0, 1).saturating_sub(1).min(self.rows - 1);
+                let bottom = param(1, self.rows).saturating_sub(1).min(self.rows - 1);
+                if top < bottom {
+                    self.scroll_top = top;
+                    self.scroll_bottom = bottom;
+                } else {
+                    self.scroll_top = 0;
+                    self.scroll_bottom = self.rows - 1;
                 }
+                self.cursor_row = 0;
+                self.cursor_col = 0;
             }
             'b' => {
                 // REP — Repeat preceding graphic character
@@ -750,7 +849,7 @@ pub fn detect_link_at_col(row: &[Cell], col: usize, cwd: &Path) -> Option<Detect
         c.is_whitespace()
             || matches!(
                 c,
-                '"' | '\'' | '<' | '>' | '|' | '(' | ')' | '[' | ']' | '{' | '}'
+                '"' | '\'' | '`' | '<' | '>' | '|' | '(' | ')' | '[' | ']' | '{' | '}' | '│' | '┃'
             )
     };
     if is_delim(row[col].ch) {
@@ -830,7 +929,11 @@ pub fn detect_path_at_col(row: &[Cell], col: usize, cwd: &Path) -> Option<Detect
         return None;
     }
     let is_delim = |c: char| {
-        c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '|' | '(' | ')' | '[' | ']' | '{' | '}')
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | '`' | '<' | '>' | '|' | '(' | ')' | '[' | ']' | '{' | '}' | '│' | '┃'
+            )
     };
     if is_delim(row[col].ch) {
         return None;
@@ -1096,5 +1199,28 @@ mod tests {
         // REP (`b`) repeats last printed character
         grid.feed(b"\x1b[3;1H-\x1b[4b");
         assert_eq!(row_text(&grid, 2), "-----");
+
+        // Kitty keyboard protocol push/pop (`CSI > 1 u` / `CSI < 1 u`)
+        assert!(!grid.kitty_keyboard_enabled());
+        grid.feed(b"\x1b[>1u");
+        assert!(grid.kitty_keyboard_enabled());
+        grid.feed(b"\x1b[<1u");
+        assert!(!grid.kitty_keyboard_enabled());
+
+        // Bracketed paste (`?2004h` / `?2004l`)
+        assert!(!grid.bracketed_paste_enabled());
+        grid.feed(b"\x1b[?2004h");
+        assert!(grid.bracketed_paste_enabled());
+        grid.feed(b"\x1b[?2004l");
+        assert!(!grid.bracketed_paste_enabled());
+
+        // DECSTBM scroll region (`CSI 2;4 r`) preserves pinned header & footer rows
+        let mut g2 = TerminalGrid::new(20, 5, fg, bg);
+        g2.feed(b"HEADER\r\nline1\r\nline2\r\nline3\r\nFOOTER");
+        g2.feed(b"\x1b[2;4r\x1b[4;1H\r\nline4");
+        assert_eq!(row_text(&g2, 0), "HEADER");
+        assert_eq!(row_text(&g2, 1), "line2");
+        assert_eq!(row_text(&g2, 3), "line4");
+        assert_eq!(row_text(&g2, 4), "FOOTER");
     }
 }

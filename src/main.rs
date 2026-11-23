@@ -815,10 +815,21 @@ impl App {
             return;
         }
         self.ui.selecting = false;
-        if !self.ui.has_non_empty_selection() {
-            self.ui.clear_selection();
-            if let Some(ref target) = self.hovered_link_target {
-                open_link(target);
+        if let (Some(a), Some(b)) = (self.ui.selection_start, self.ui.selection_end) {
+            if a != b {
+                // Auto-copy drag selection to clipboard so copying inside Claude Code / agy
+                // never risks sending Ctrl+C (SIGINT) to the running agent.
+                if let Some(sess) = self.sessions.active() {
+                    let text = sess.grid.extract_selection(a, b, sess.scroll_offset);
+                    if copy_text(&text) {
+                        self.ui.toast = Some("Copied selection to clipboard!".to_string());
+                    }
+                }
+            } else {
+                self.ui.clear_selection();
+                if let Some(ref target) = self.hovered_link_target {
+                    open_link(target);
+                }
             }
         }
         self.request_redraw();
@@ -1113,6 +1124,39 @@ impl App {
             self.handle_search_key(event);
             return;
         }
+        if self.ui.picker_open {
+            let count = self.shells.len();
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.ui.picker_open = false;
+                }
+                Key::Named(NamedKey::ArrowDown) if count > 0 => {
+                    self.ui.picker_selected = (self.ui.picker_selected + 1) % count;
+                }
+                Key::Named(NamedKey::ArrowUp) if count > 0 => {
+                    self.ui.picker_selected = if self.ui.picker_selected == 0 {
+                        count - 1
+                    } else {
+                        self.ui.picker_selected - 1
+                    };
+                }
+                Key::Named(NamedKey::Enter) if count > 0 => {
+                    let idx = self.ui.picker_selected.min(count - 1);
+                    self.ui.picker_open = false;
+                    if let Some(sh) = self.shells.get(idx).cloned() {
+                        if self.sessions.spawn_session(sh).is_ok() {
+                            if let Some(sess) = self.sessions.active_mut() {
+                                sess.input.seed_history(self.history.recent_commands(200));
+                            }
+                            self.save_workspace_state();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            self.request_redraw();
+            return;
+        }
 
         // Inline session rename mode (double-click or F2) with full Shift+Home/End/Arrows & Ctrl+A
         if let Some((idx, mut draft)) = self.ui.renaming_session.take() {
@@ -1266,7 +1310,13 @@ impl App {
                     if let Some(clip) = paste_text() {
                         if let Some(sess) = self.sessions.active_mut() {
                             if sess.effective_passthrough() {
-                                sess.write_bytes(clip.as_bytes());
+                                if sess.grid.bracketed_paste_enabled() {
+                                    sess.write_bytes(b"\x1b[200~");
+                                    sess.write_bytes(clip.as_bytes());
+                                    sess.write_bytes(b"\x1b[201~");
+                                } else {
+                                    sess.write_bytes(clip.as_bytes());
+                                }
                             } else {
                                 let single_line = clip.replace("\r\n", " ").replace('\n', " ");
                                 sess.input.insert_str(&single_line);
@@ -1327,6 +1377,7 @@ impl App {
                 }
                 Key::Character(s) if s.eq_ignore_ascii_case("t") => {
                     self.ui.picker_open = !self.ui.picker_open;
+                    self.ui.picker_selected = 0;
                     self.request_redraw();
                     return;
                 }
@@ -1415,6 +1466,7 @@ impl App {
         };
 
         if sess.effective_passthrough() {
+            self.ui.clear_selection();
             if ctrl {
                 if let Key::Character(s) = &event.logical_key {
                     if let Some(ch) = s.chars().next() {
@@ -1427,10 +1479,37 @@ impl App {
                     }
                 }
             }
+            let alt = self.modifiers.alt_key();
             match &event.logical_key {
-                Key::Named(NamedKey::Enter) => sess.write_bytes(b"\r"),
+                Key::Named(NamedKey::Enter) => {
+                    if shift {
+                        // Shift+Enter inserts a newline in Claude Code, agy, Codex & modern TUIs
+                        if sess.grid.kitty_keyboard_enabled() {
+                            sess.write_bytes(b"\x1b[13;2u");
+                        } else {
+                            sess.write_bytes(b"\x1b\r");
+                        }
+                    } else if alt {
+                        sess.write_bytes(b"\x1b\r");
+                    } else if ctrl {
+                        if sess.grid.kitty_keyboard_enabled() {
+                            sess.write_bytes(b"\x1b[13;5u");
+                        } else {
+                            sess.write_bytes(b"\n");
+                        }
+                    } else {
+                        sess.write_bytes(b"\r");
+                    }
+                }
                 Key::Named(NamedKey::Backspace) => sess.write_bytes(&[0x7f]),
-                Key::Named(NamedKey::Tab) => sess.write_bytes(b"\t"),
+                Key::Named(NamedKey::Tab) => {
+                    if shift {
+                        // BackTab / Shift+Tab (used by Claude Code, agy & TUIs to switch modes)
+                        sess.write_bytes(b"\x1b[Z");
+                    } else {
+                        sess.write_bytes(b"\t");
+                    }
+                }
                 Key::Named(NamedKey::Escape) => sess.write_bytes(&[0x1b]),
                 Key::Named(NamedKey::ArrowUp) => sess.write_bytes(b"\x1b[A"),
                 Key::Named(NamedKey::ArrowDown) => sess.write_bytes(b"\x1b[B"),
@@ -1438,6 +1517,8 @@ impl App {
                 Key::Named(NamedKey::ArrowLeft) => sess.write_bytes(b"\x1b[D"),
                 Key::Named(NamedKey::Home) => sess.write_bytes(b"\x1b[H"),
                 Key::Named(NamedKey::End) => sess.write_bytes(b"\x1b[F"),
+                Key::Named(NamedKey::PageUp) => sess.write_bytes(b"\x1b[5~"),
+                Key::Named(NamedKey::PageDown) => sess.write_bytes(b"\x1b[6~"),
                 Key::Named(NamedKey::Delete) => sess.write_bytes(b"\x1b[3~"),
                 _ => {
                     if let Some(text) = &event.text {
@@ -1721,10 +1802,47 @@ impl ApplicationHandler<()> for App {
                     MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i32,
                     MouseScrollDelta::PixelDelta(pos) => (pos.y / 16.0).round() as i32,
                 };
+                if lines == 0 {
+                    return;
+                }
+                self.ui.clear_selection();
+                let active_vp = self.active_pane_rect();
+                let (cell_row, cell_col) = Layout::pixel_to_cell_in(
+                    active_vp,
+                    self.cursor_pos.0,
+                    self.cursor_pos.1,
+                    self.font.cell_w,
+                    self.font.cell_h,
+                )
+                .map(|(r, c)| (r + 1, c + 1))
+                .unwrap_or((1, 1));
+
                 if let Some(sess) = self.sessions.active_mut() {
-                    if lines > 0 {
+                    if sess.grid.mouse_tracking_enabled() {
+                        // Forward mouse wheel events to TUI/agents (Claude Code, agy, vim, lazygit)
+                        let ticks = lines.unsigned_abs().clamp(1, 5);
+                        let btn = if lines > 0 { 64 } else { 65 };
+                        for _ in 0..ticks {
+                            if sess.grid.sgr_mouse_enabled() {
+                                let seq = format!("\x1b[<{btn};{cell_col};{cell_row}M");
+                                sess.write_bytes(seq.as_bytes());
+                            } else {
+                                let cb = (btn as u8).saturating_add(32);
+                                let cx = (cell_col.min(223) as u8).saturating_add(32);
+                                let cy = (cell_row.min(223) as u8).saturating_add(32);
+                                sess.write_bytes(&[0x1b, b'[', b'M', cb, cx, cy]);
+                            }
+                        }
+                    } else if sess.grid.is_alt_screen() {
+                        // Alternate scroll mode for alt-screen apps without mouse tracking (less, man)
+                        let ticks = lines.unsigned_abs().clamp(1, 5);
+                        let seq: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
+                        for _ in 0..ticks {
+                            sess.write_bytes(seq);
+                        }
+                    } else if lines > 0 {
                         sess.scroll_up(lines as usize);
-                    } else if lines < 0 {
+                    } else {
                         sess.scroll_down((-lines) as usize);
                     }
                     self.request_redraw();
