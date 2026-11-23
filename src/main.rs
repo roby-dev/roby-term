@@ -2,19 +2,21 @@
 
 use my_warp::clipboard::{copy_text, paste_text};
 use my_warp::complete::{
-    complete_input, is_completing_path, longest_common_prefix, CompletionItem, CompletionKind,
-    PathCommandIndex,
+    complete_input, is_completing_path, longest_common_prefix, strip_verbatim_prefix,
+    CompletionItem, CompletionKind, PathCommandIndex,
 };
 use my_warp::config::{
     parse_hex_color, UserConfig, DEFAULT_FONT_SIZE, MAX_FONT_SIZE, MIN_FONT_SIZE, PRESET_ACCENTS,
+    THEME_PRESETS,
 };
 use my_warp::history::HistoryStore;
 use my_warp::input::InputBar;
 use my_warp::plugins::{collect_today_usage, AgentUsage};
+use my_warp::ports::{kill_process, list_listening_ports, ListeningPort};
 use my_warp::session::SessionManager;
 use my_warp::shell::{default_shell, discover_shells, ShellProfile};
 use my_warp::snippets::SnippetStore;
-use my_warp::terminal::{detect_link_at_col, open_link, LinkTarget};
+use my_warp::terminal::{detect_link_at_col, open_link, open_url_in_browser, LinkTarget};
 use my_warp::theme::{Theme, UserIdentity};
 use my_warp::ui::{
     build_app_icon_rgba, discover_system_mono_fonts, render_app, FontRenderer, HitTarget, Layout,
@@ -55,6 +57,7 @@ struct App {
     cmd_index: PathCommandIndex,
     agent_usage: AgentUsage,
     usage_rx: Option<Receiver<AgentUsage>>,
+    ports_rx: Option<Receiver<Vec<ListeningPort>>>,
     last_usage_refresh: Instant,
     ui: UiState,
     layout: Layout,
@@ -126,6 +129,7 @@ impl App {
             cmd_index,
             agent_usage: AgentUsage::default(),
             usage_rx: None,
+            ports_rx: None,
             last_usage_refresh: Instant::now(),
             ui,
             layout,
@@ -185,6 +189,56 @@ impl App {
         false
     }
 
+    fn refresh_ports_async(&mut self) {
+        self.ui.ports.loading = true;
+        let (tx, rx) = mpsc::channel();
+        let wake = self.proxy.clone();
+        self.ports_rx = Some(rx);
+        let _ = thread::Builder::new()
+            .name("ports-scan".into())
+            .spawn(move || {
+                let list = list_listening_ports();
+                let _ = tx.send(list);
+                let _ = wake.send_event(());
+            });
+    }
+
+    fn poll_ports(&mut self) -> bool {
+        if let Some(ref rx) = self.ports_rx {
+            if let Ok(list) = rx.try_recv() {
+                self.ui.ports.ports = list;
+                self.ui.ports.loading = false;
+                self.ports_rx = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn handle_dropped_file(&mut self, raw_path: std::path::PathBuf) {
+        let path = strip_verbatim_prefix(raw_path);
+        let raw_str = path.to_string_lossy().to_string();
+        let formatted = if raw_str.contains(' ') {
+            format!("\"{raw_str}\"")
+        } else {
+            raw_str
+        };
+        if let Some(sess) = self.sessions.active_mut() {
+            if sess.effective_passthrough() {
+                sess.write_bytes(formatted.as_bytes());
+            } else if sess.input.text().trim().is_empty() && path.is_dir() {
+                sess.input.set_text(format!("cd {formatted}"));
+                self.ui.toast = Some("Dropped folder — press Enter to cd!".to_string());
+            } else {
+                sess.input.insert_str(&format!("{formatted} "));
+                self.ui.toast = Some("Inserted dropped path!".to_string());
+            }
+            self.ui.suggestion_selected = 0;
+            self.ui.suggestion_navigated = false;
+        }
+        self.request_redraw();
+    }
+
     fn active_pane_rect(&self) -> Rect {
         if let Some((left_idx, right_idx)) = self.sessions.split_panes() {
             let (left_vp, right_vp) = self.layout.split_viewports();
@@ -234,6 +288,29 @@ impl App {
     }
 
     fn hit_test_all(&self, px: u32, py: u32, suggestion_count: usize) -> HitTarget {
+        if self.ui.ports.open && !self.ui.settings.open && !self.ui.palette.open {
+            let p = self.layout.ports_panel();
+            if p.contains(px, py) {
+                if self.layout.ports_close_rect().contains(px, py) {
+                    return HitTarget::PortsClose;
+                }
+                if self.layout.ports_refresh_rect().contains(px, py) {
+                    return HitTarget::PortsRefresh;
+                }
+                let count = self.ui.ports.ports.len().min(8);
+                for i in 0..count {
+                    let (open_r, kill_r) = self.layout.ports_action_rects(i);
+                    if open_r.contains(px, py) {
+                        return HitTarget::PortOpen(i);
+                    }
+                    if kill_r.contains(px, py) {
+                        return HitTarget::PortKill(i);
+                    }
+                }
+                return HitTarget::None;
+            }
+        }
+
         if self.ui.palette.open && !self.ui.settings.open {
             let p = self.layout.palette_panel();
             if p.contains(px, py) {
@@ -590,6 +667,62 @@ impl App {
         let (suggestions, _) = self.current_suggestions();
         let hit = self.hit_test_all(px, py, suggestions.len());
         match hit {
+            HitTarget::PortsToggle => {
+                self.ui.picker_open = false;
+                self.ui.settings.open = false;
+                self.ui.palette.open = false;
+                self.ui.search.open = false;
+                self.ui.ports.open = !self.ui.ports.open;
+                if self.ui.ports.open {
+                    self.refresh_ports_async();
+                }
+            }
+            HitTarget::PortsClose => {
+                self.ui.ports.open = false;
+            }
+            HitTarget::PortsRefresh => {
+                self.refresh_ports_async();
+            }
+            HitTarget::PortOpen(i) => {
+                if let Some(lp) = self.ui.ports.ports.get(i) {
+                    let url = format!("http://localhost:{}", lp.port);
+                    open_url_in_browser(&url);
+                    self.ui.toast = Some(format!("Opened {url}"));
+                }
+            }
+            HitTarget::PortKill(i) => {
+                if let Some(lp) = self.ui.ports.ports.get(i).cloned() {
+                    if kill_process(lp.pid) {
+                        self.ui.toast = Some(format!("Killed {} (PID {})", lp.process, lp.pid));
+                    } else {
+                        self.ui.toast = Some(format!("Failed to kill PID {}", lp.pid));
+                    }
+                    self.refresh_ports_async();
+                }
+            }
+            HitTarget::DuplicateSession => {
+                self.ui.picker_open = false;
+                let recent = self.history.recent_commands(200);
+                if self.sessions.duplicate_active(&recent).is_ok() {
+                    self.ui.toast = Some("Duplicated session in same folder!".to_string());
+                    self.save_workspace_state();
+                }
+            }
+            HitTarget::CycleSessionColor(idx) => {
+                if self.sessions.cycle_session_color(idx) {
+                    self.save_workspace_state();
+                }
+            }
+            HitTarget::SettingsThemePreset(idx) => {
+                if let Some(preset) = THEME_PRESETS.get(idx) {
+                    self.config.apply_preset(preset);
+                    self.apply_config_live(false);
+                    self.ui
+                        .settings
+                        .sync_from_config(&self.config, self.user.accent);
+                    self.ui.toast = Some(format!("Applied theme: {}", preset.name));
+                }
+            }
             HitTarget::SplitToggle => {
                 self.ui.picker_open = false;
                 self.toggle_split();
@@ -1104,6 +1237,17 @@ impl App {
                     self.request_redraw();
                     return;
                 }
+                if shift && s.eq_ignore_ascii_case("o") && !self.ui.settings.open {
+                    self.ui.picker_open = false;
+                    self.ui.palette.open = false;
+                    self.ui.search.open = false;
+                    self.ui.ports.open = !self.ui.ports.open;
+                    if self.ui.ports.open {
+                        self.refresh_ports_async();
+                    }
+                    self.request_redraw();
+                    return;
+                }
                 if shift && s.eq_ignore_ascii_case("d") && !self.ui.settings.open {
                     self.toggle_split();
                     self.request_redraw();
@@ -1114,6 +1258,13 @@ impl App {
 
         if self.ui.settings.open {
             self.handle_settings_key(event);
+            return;
+        }
+        if self.ui.ports.open {
+            if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+                self.ui.ports.open = false;
+                self.request_redraw();
+            }
             return;
         }
         if self.ui.palette.open {
@@ -1310,7 +1461,8 @@ impl App {
                     if let Some(clip) = paste_text() {
                         if let Some(sess) = self.sessions.active_mut() {
                             if sess.effective_passthrough() {
-                                if sess.grid.bracketed_paste_enabled() {
+                                let is_multiline = clip.contains('\n') || clip.contains('\r');
+                                if is_multiline && sess.grid.bracketed_paste_enabled() {
                                     sess.write_bytes(b"\x1b[200~");
                                     sess.write_bytes(clip.as_bytes());
                                     sess.write_bytes(b"\x1b[201~");
@@ -1371,6 +1523,16 @@ impl App {
                     }
                     if let Some(sess) = self.sessions.active_mut() {
                         sess.write_bytes(&[0x03]);
+                    }
+                    self.request_redraw();
+                    return;
+                }
+                Key::Character(s) if shift && s.eq_ignore_ascii_case("t") => {
+                    self.ui.picker_open = false;
+                    let recent = self.history.recent_commands(200);
+                    if self.sessions.duplicate_active(&recent).is_ok() {
+                        self.ui.toast = Some("Duplicated session in same folder!".to_string());
+                        self.save_workspace_state();
                     }
                     self.request_redraw();
                     return;
@@ -1677,6 +1839,7 @@ impl App {
     fn redraw(&mut self) {
         self.sessions.poll_all();
         self.poll_plugin_usage();
+        self.poll_ports();
         let (suggestions, ghost_suffix) = self.current_suggestions();
         if !suggestions.is_empty() && self.ui.suggestion_selected >= suggestions.len() {
             self.ui.suggestion_selected = 0;
@@ -1744,7 +1907,8 @@ impl ApplicationHandler<()> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
         let sess_changed = self.sessions.poll_all();
         let plugin_changed = self.poll_plugin_usage();
-        if sess_changed || plugin_changed {
+        let ports_changed = self.poll_ports();
+        if sess_changed || plugin_changed || ports_changed {
             if sess_changed && self.ui.search.open {
                 self.refresh_search();
             }
@@ -1849,6 +2013,7 @@ impl ApplicationHandler<()> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(event),
+            WindowEvent::DroppedFile(path) => self.handle_dropped_file(path),
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }

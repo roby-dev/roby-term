@@ -1,4 +1,6 @@
 use crate::complete::strip_verbatim_prefix;
+use crate::config::{format_hex_color, parse_hex_color};
+use crate::theme::Rgb;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +12,7 @@ pub struct SavedSession {
     pub shell_program: String,
     pub cwd: PathBuf,
     pub transcript: String,
+    pub custom_accent: Option<Rgb>,
 }
 
 /// Complete persisted workspace snapshot (open sessions, active index, split panes).
@@ -79,13 +82,18 @@ pub fn save_workspace(dir: &Path, snapshot: &WorkspaceSnapshot) -> std::io::Resu
     for (idx, sess) in snapshot.sessions.iter().enumerate() {
         let transcript_file = format!("session_{idx}.txt");
         fs::write(dir.join(&transcript_file), &sess.transcript)?;
+        let accent_str = sess
+            .custom_accent
+            .map(format_hex_color)
+            .unwrap_or_default();
         state.push_str(&format!(
-            "session\t{}\t{}\t{}\t{}\t{}\n",
+            "session\t{}\t{}\t{}\t{}\t{}\t{}\n",
             sess.id,
             sanitize(&sess.title),
             sanitize(&sess.shell_program),
             sanitize(&sess.cwd.to_string_lossy()),
-            transcript_file
+            transcript_file,
+            accent_str,
         ));
     }
 
@@ -121,19 +129,21 @@ pub fn load_workspace(dir: &Path) -> Option<WorkspaceSnapshot> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("session\t") {
-            let parts: Vec<&str> = rest.splitn(5, '\t').collect();
-            if parts.len() == 5 {
+            let parts: Vec<&str> = rest.splitn(6, '\t').collect();
+            if parts.len() >= 5 {
                 let id = parts[0].parse::<usize>().unwrap_or(sessions.len() + 1);
                 let title = parts[1].to_string();
                 let shell_program = parts[2].to_string();
                 let cwd = strip_verbatim_prefix(PathBuf::from(parts[3]));
                 let transcript = fs::read_to_string(dir.join(parts[4])).unwrap_or_default();
+                let custom_accent = parts.get(5).and_then(|s| parse_hex_color(s));
                 sessions.push(SavedSession {
                     id,
                     title,
                     shell_program,
                     cwd,
                     transcript,
+                    custom_accent,
                 });
             }
         }
@@ -184,6 +194,7 @@ mod tests {
                     shell_program: "pwsh.exe".into(),
                     cwd: PathBuf::from(r"D:\FUENTES\api"),
                     transcript: "cargo run\nListening on :8080".into(),
+                    custom_accent: Some(Rgb::new(0xA8, 0x8B, 0xD6)),
                 },
                 SavedSession {
                     id: 2,
@@ -191,6 +202,7 @@ mod tests {
                     shell_program: "powershell.exe".into(),
                     cwd: PathBuf::from(r"D:\FUENTES\web"),
                     transcript: "npm run dev\nhttp://localhost:3000".into(),
+                    custom_accent: None,
                 },
                 SavedSession {
                     id: 3,
@@ -198,6 +210,7 @@ mod tests {
                     shell_program: "cmd.exe".into(),
                     cwd: PathBuf::from(r"D:\FUENTES\my-warp"),
                     transcript: "git status -sb\n## feat/my-warp-terminal".into(),
+                    custom_accent: None,
                 },
                 SavedSession {
                     id: 4,
@@ -205,6 +218,7 @@ mod tests {
                     shell_program: "pwsh.exe".into(),
                     cwd: PathBuf::from(r"D:\FUENTES\db"),
                     transcript: "docker ps".into(),
+                    custom_accent: None,
                 },
             ],
         };

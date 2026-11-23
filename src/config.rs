@@ -10,6 +10,54 @@ pub const DEFAULT_BG_TERMINAL: Rgb = Rgb::new(17, 19, 26);
 pub const DEFAULT_SYNTAX_COMMAND: Rgb = Rgb::new(137, 220, 235);
 pub const DEFAULT_SYNTAX_FLAG: Rgb = Rgb::new(250, 179, 135);
 
+/// Full curated color theme preset selectable in 1 click from Settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemePreset {
+    pub name: &'static str,
+    pub accent: Rgb,
+    pub bg_terminal: Rgb,
+    pub syntax_command: Rgb,
+    pub syntax_flag: Rgb,
+}
+
+pub const THEME_PRESETS: &[ThemePreset] = &[
+    ThemePreset {
+        name: "Roby Violet",
+        accent: Rgb::new(0xA8, 0x8B, 0xD6),
+        bg_terminal: Rgb::new(17, 19, 26),
+        syntax_command: Rgb::new(137, 220, 235),
+        syntax_flag: Rgb::new(250, 179, 135),
+    },
+    ThemePreset {
+        name: "Tokyo Night",
+        accent: Rgb::new(0x7A, 0xA2, 0xF7),
+        bg_terminal: Rgb::new(26, 27, 38),
+        syntax_command: Rgb::new(125, 207, 255),
+        syntax_flag: Rgb::new(255, 158, 100),
+    },
+    ThemePreset {
+        name: "Catppuccin",
+        accent: Rgb::new(0xCB, 0xA6, 0xF7),
+        bg_terminal: Rgb::new(30, 30, 46),
+        syntax_command: Rgb::new(137, 220, 235),
+        syntax_flag: Rgb::new(249, 226, 175),
+    },
+    ThemePreset {
+        name: "Nord",
+        accent: Rgb::new(0x88, 0xC0, 0xD0),
+        bg_terminal: Rgb::new(46, 52, 64),
+        syntax_command: Rgb::new(143, 188, 187),
+        syntax_flag: Rgb::new(208, 135, 112),
+    },
+    ThemePreset {
+        name: "Gruvbox",
+        accent: Rgb::new(0xFA, 0xBD, 0x2F),
+        bg_terminal: Rgb::new(29, 32, 33),
+        syntax_command: Rgb::new(142, 192, 124),
+        syntax_flag: Rgb::new(254, 128, 25),
+    },
+];
+
 /// Curated accent swatches shown in the Settings panel (includes #A88BD6).
 pub const PRESET_ACCENTS: &[(&str, Rgb)] = &[
     ("Violet", Rgb::new(0xA8, 0x8B, 0xD6)),
@@ -146,6 +194,13 @@ impl UserConfig {
             }
         }
         cfg
+    }
+
+    pub fn apply_preset(&mut self, preset: &ThemePreset) {
+        self.accent = Some(preset.accent);
+        self.bg_terminal = preset.bg_terminal;
+        self.syntax_command = preset.syntax_command;
+        self.syntax_flag = preset.syntax_flag;
     }
 
     pub fn reset_to_defaults(&mut self) {

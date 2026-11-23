@@ -1,5 +1,6 @@
 use crate::builtin::try_run_builtin;
 use crate::complete::{detect_git_branch, maybe_update_cwd, strip_verbatim_prefix};
+use crate::config::PRESET_ACCENTS;
 use crate::input::InputBar;
 use crate::shell::{default_shell, ShellProfile};
 use crate::terminal::TerminalGrid;
@@ -30,6 +31,7 @@ pub struct Session {
     pub id: usize,
     pub title: String,
     pub shell: ShellProfile,
+    pub custom_accent: Option<Rgb>,
     pub cwd: PathBuf,
     pub git_branch: Option<String>,
     pub grid: TerminalGrid,
@@ -156,6 +158,7 @@ impl Session {
             id,
             title,
             shell,
+            custom_accent: None,
             cwd,
             git_branch,
             grid,
@@ -174,6 +177,7 @@ impl Session {
 
     /// Drains all pending PTY bytes into the terminal grid. Returns `true` if anything changed.
     pub fn poll_output(&mut self) -> bool {
+        let was_alt = self.grid.is_alt_screen();
         let mut changed = false;
         loop {
             match self.rx.try_recv() {
@@ -190,6 +194,10 @@ impl Session {
                     break;
                 }
             }
+        }
+        // When a TUI/agent exits alternate screen back to the normal shell, restore Roby Input automatically.
+        if was_alt && !self.grid.is_alt_screen() {
+            self.input.passthrough = false;
         }
         changed
     }
@@ -281,6 +289,10 @@ impl Session {
 
     pub fn scroll_down(&mut self, lines: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    pub fn display_accent(&self) -> Rgb {
+        self.custom_accent.unwrap_or(self.shell.accent)
     }
 
     pub fn effective_passthrough(&self) -> bool {
@@ -511,6 +523,51 @@ impl SessionManager {
         }
     }
 
+    /// Cycles a session's custom accent color through `PRESET_ACCENTS` (and back to shell default).
+    pub fn cycle_session_color(&mut self, idx: usize) -> bool {
+        let Some(sess) = self.sessions.get_mut(idx) else {
+            return false;
+        };
+        sess.custom_accent = match sess.custom_accent {
+            None => PRESET_ACCENTS.first().map(|(_, c)| *c),
+            Some(cur) => {
+                let pos = PRESET_ACCENTS.iter().position(|(_, c)| *c == cur);
+                match pos {
+                    Some(i) if i + 1 < PRESET_ACCENTS.len() => Some(PRESET_ACCENTS[i + 1].1),
+                    _ => None,
+                }
+            }
+        };
+        true
+    }
+
+    /// Duplicates the active session in the exact same `cwd` and `shell`.
+    pub fn duplicate_active(&mut self, recent_history: &[String]) -> Result<usize, String> {
+        let (shell, cwd, custom_accent) = match self.active() {
+            Some(s) => (s.shell.clone(), s.cwd.clone(), s.custom_accent),
+            None => return Err("no active session to duplicate".to_string()),
+        };
+        let id = self.next_id;
+        let mut session = Session::spawn_with_state(
+            id,
+            shell,
+            self.cols,
+            self.rows,
+            self.default_fg,
+            self.default_bg,
+            self.wakeup.clone(),
+            Some(cwd),
+            None,
+            None,
+        )?;
+        session.custom_accent = custom_accent;
+        session.input.seed_history(recent_history.to_vec());
+        self.next_id += 1;
+        self.sessions.push(session);
+        self.active = self.sessions.len() - 1;
+        Ok(self.active)
+    }
+
     pub fn select_next(&mut self) -> bool {
         if self.sessions.len() <= 1 {
             return false;
@@ -584,6 +641,7 @@ impl SessionManager {
                     shell_program: s.shell.program.clone(),
                     cwd: s.cwd.clone(),
                     transcript: s.grid.dump_transcript(),
+                    custom_accent: s.custom_accent,
                 })
                 .collect(),
         }
@@ -617,6 +675,7 @@ impl SessionManager {
                 Some(saved.title.clone()),
                 Some(&saved.transcript),
             ) {
+                session.custom_accent = saved.custom_accent;
                 session.input.seed_history(recent_history.to_vec());
                 self.next_id = id + 1;
                 self.sessions.push(session);

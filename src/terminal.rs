@@ -517,6 +517,11 @@ impl TerminalGrid {
             self.scroll_top = 0;
             self.scroll_bottom = self.rows - 1;
             self.alt_screen = false;
+            // Clear stale TUI protocol flags when returning to the normal shell
+            self.mouse_tracking = false;
+            self.sgr_mouse = false;
+            self.bracketed_paste = false;
+            self.kitty_keyboard_depth = 0;
         }
     }
 }

@@ -1,7 +1,8 @@
 use crate::complete::{abbreviate_path, CompletionItem, CompletionKind};
-use crate::config::{format_hex_color, parse_hex_color, UserConfig, PRESET_ACCENTS};
+use crate::config::{format_hex_color, parse_hex_color, UserConfig, PRESET_ACCENTS, THEME_PRESETS};
 use crate::input::{InputBar, TokenKind};
 use crate::plugins::{format_compact_tokens, AgentUsage};
+use crate::ports::ListeningPort;
 use crate::session::{Session, SessionManager};
 use crate::shell::ShellProfile;
 use crate::snippets::SnippetStore;
@@ -94,11 +95,14 @@ pub enum SettingsField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
     SessionRow(usize),
+    CycleSessionColor(usize),
     CloseSession(usize),
     SettingsToggle,
     SnippetsToggle,
+    PortsToggle,
     SplitToggle,
     NewSessionToggle,
+    DuplicateSession,
     PickShell(usize),
     SuggestionRow(usize),
     TogglePassthrough,
@@ -107,9 +111,14 @@ pub enum HitTarget {
     PaletteAddToggle,
     PaletteRow(usize),
     PaletteDelete(usize),
+    PortsClose,
+    PortsRefresh,
+    PortOpen(usize),
+    PortKill(usize),
     BlockCopy(usize),
     BlockRerun(usize),
     SettingsClose,
+    SettingsThemePreset(usize),
     SettingsSwatch(usize),
     SettingsField(SettingsField),
     SettingsFontPrev,
@@ -135,8 +144,10 @@ pub struct Layout {
     pub sessions_top: u32,
     pub settings_btn: Rect,
     pub snippets_btn: Rect,
+    pub ports_btn: Rect,
     pub split_btn: Rect,
     pub new_session_btn: Rect,
+    pub dup_session_btn: Rect,
     pub header: Rect,
     pub passthrough_pill: Rect,
     pub viewport: Rect,
@@ -155,36 +166,51 @@ impl Layout {
         let user_card = Rect::new(10, 10, sidebar_w.saturating_sub(20), 46);
         let sessions_top = user_card.y + user_card.h + 24;
         let new_btn_h = 34;
+        let dup_w = 46;
+        let new_y = height.saturating_sub(new_btn_h + 12);
         let new_session_btn = Rect::new(
             12,
-            height.saturating_sub(new_btn_h + 12),
-            sidebar_w.saturating_sub(24),
+            new_y,
+            sidebar_w.saturating_sub(24 + dup_w + 6),
+            new_btn_h,
+        );
+        let dup_session_btn = Rect::new(
+            new_session_btn.x + new_session_btn.w + 6,
+            new_y,
+            dup_w,
             new_btn_h,
         );
 
         let btn_h = header_h.saturating_sub(14);
-        let settings_w = 74;
+        let settings_w = 70;
         let settings_btn = Rect::new(
             main_x + main_w.saturating_sub(settings_w + 10),
             7,
             settings_w,
             btn_h,
         );
-        let snippets_w = 76;
+        let snippets_w = 72;
         let snippets_btn = Rect::new(
             settings_btn.x.saturating_sub(snippets_w + 6),
             7,
             snippets_w,
             btn_h,
         );
-        let split_w = 54;
+        let ports_w = 54;
+        let ports_btn = Rect::new(
+            snippets_btn.x.saturating_sub(ports_w + 6),
+            7,
+            ports_w,
+            btn_h,
+        );
+        let split_w = 48;
         let split_btn = Rect::new(
-            snippets_btn.x.saturating_sub(split_w + 6),
+            ports_btn.x.saturating_sub(split_w + 6),
             7,
             split_w,
             btn_h,
         );
-        let pill_w = 112;
+        let pill_w = 104;
         let passthrough_pill = Rect::new(
             split_btn.x.saturating_sub(pill_w + 6),
             7,
@@ -200,8 +226,10 @@ impl Layout {
             sessions_top,
             settings_btn,
             snippets_btn,
+            ports_btn,
             split_btn,
             new_session_btn,
+            dup_session_btn,
             header: Rect::new(main_x, 0, main_w, header_h),
             passthrough_pill,
             viewport: Rect::new(main_x, header_h, main_w, viewport_h),
@@ -212,6 +240,11 @@ impl Layout {
     pub fn session_row_rect(&self, index: usize) -> Rect {
         let y = self.sessions_top + (index as u32) * (SESSION_ROW_HEIGHT + 4);
         Rect::new(10, y, self.sidebar.w.saturating_sub(20), SESSION_ROW_HEIGHT)
+    }
+
+    pub fn session_badge_rect(&self, index: usize) -> Rect {
+        let row = self.session_row_rect(index);
+        Rect::new(row.x + 9, row.y + 8, 36, 20)
     }
 
     pub fn session_close_rect(&self, index: usize) -> Rect {
@@ -260,7 +293,7 @@ impl Layout {
 
     pub fn settings_panel(&self) -> Rect {
         let w = self.viewport.w.saturating_sub(40).min(520);
-        let h = self.height.saturating_sub(64).min(452);
+        let h = self.height.saturating_sub(48).min(496);
         let x = self.viewport.x + self.viewport.w.saturating_sub(w) / 2;
         let y = self.header.h + self.viewport.h.saturating_sub(h) / 2;
         Rect::new(x, y, w, h)
@@ -271,12 +304,20 @@ impl Layout {
         Rect::new(p.x + p.w.saturating_sub(34), p.y + 10, 24, 24)
     }
 
+    pub fn settings_theme_preset_rect(&self, idx: usize) -> Rect {
+        let p = self.settings_panel();
+        let w = 90;
+        let gap = 7;
+        let x = p.x + 20 + (idx as u32) * (w + gap);
+        Rect::new(x, p.y + 62, w, 24)
+    }
+
     pub fn settings_swatch_rect(&self, idx: usize) -> Rect {
         let p = self.settings_panel();
         let sw = 38;
         let gap = 8;
         let x = p.x + 20 + (idx as u32) * (sw + gap);
-        Rect::new(x, p.y + 72, sw, 24)
+        Rect::new(x, p.y + 114, sw, 24)
     }
 
     pub fn settings_field_rect(&self, field: SettingsField) -> Rect {
@@ -284,49 +325,81 @@ impl Layout {
         let field_x = p.x + 168;
         let field_w = 132;
         let y = match field {
-            SettingsField::AccentHex => p.y + 108,
-            SettingsField::BgHex => p.y + 150,
-            SettingsField::CmdHex => p.y + 186,
-            SettingsField::FlagHex => p.y + 222,
+            SettingsField::AccentHex => p.y + 150,
+            SettingsField::BgHex => p.y + 190,
+            SettingsField::CmdHex => p.y + 226,
+            SettingsField::FlagHex => p.y + 262,
         };
         Rect::new(field_x, y, field_w, 28)
     }
 
     pub fn settings_font_prev_rect(&self) -> Rect {
         let p = self.settings_panel();
-        Rect::new(p.x + 168, p.y + 272, 28, 28)
+        Rect::new(p.x + 168, p.y + 312, 28, 28)
     }
 
     pub fn settings_font_next_rect(&self) -> Rect {
         let p = self.settings_panel();
-        Rect::new(p.x + p.w.saturating_sub(48), p.y + 272, 28, 28)
+        Rect::new(p.x + p.w.saturating_sub(48), p.y + 312, 28, 28)
     }
 
     pub fn settings_size_down_rect(&self) -> Rect {
         let p = self.settings_panel();
-        Rect::new(p.x + 168, p.y + 308, 30, 28)
+        Rect::new(p.x + 168, p.y + 348, 30, 28)
     }
 
     pub fn settings_size_up_rect(&self) -> Rect {
         let p = self.settings_panel();
-        Rect::new(p.x + 266, p.y + 308, 30, 28)
+        Rect::new(p.x + 266, p.y + 348, 30, 28)
     }
 
     pub fn settings_reset_rect(&self) -> Rect {
         let p = self.settings_panel();
-        Rect::new(p.x + 20, p.y + p.h.saturating_sub(38), 132, 26)
+        Rect::new(p.x + 20, p.y + p.h.saturating_sub(36), 132, 26)
     }
 
     /// Returns `(agy, claude, codex)` checkbox rects inside the Settings modal.
     pub fn settings_plugin_rects(&self) -> (Rect, Rect, Rect) {
         let p = self.settings_panel();
-        let y = p.y + 370;
+        let y = p.y + 412;
         let w = 148;
         let gap = 12;
         let r0 = Rect::new(p.x + 20, y, w, 28);
         let r1 = Rect::new(r0.x + w + gap, y, w, 28);
         let r2 = Rect::new(r1.x + w + gap, y, w, 28);
         (r0, r1, r2)
+    }
+
+    pub fn ports_panel(&self) -> Rect {
+        let w = self.viewport.w.saturating_sub(40).min(560);
+        let h = self.height.saturating_sub(80).min(360);
+        let x = self.viewport.x + self.viewport.w.saturating_sub(w) / 2;
+        let y = self.header.h + 28;
+        Rect::new(x, y, w, h)
+    }
+
+    pub fn ports_close_rect(&self) -> Rect {
+        let p = self.ports_panel();
+        Rect::new(p.x + p.w.saturating_sub(32), p.y + 10, 22, 22)
+    }
+
+    pub fn ports_refresh_rect(&self) -> Rect {
+        let p = self.ports_panel();
+        Rect::new(p.x + p.w.saturating_sub(112), p.y + 10, 72, 22)
+    }
+
+    pub fn ports_row_rect(&self, idx: usize) -> Rect {
+        let p = self.ports_panel();
+        Rect::new(p.x + 14, p.y + 48 + (idx as u32) * 34, p.w.saturating_sub(28), 30)
+    }
+
+    pub fn ports_action_rects(&self, idx: usize) -> (Rect, Rect) {
+        let r = self.ports_row_rect(idx);
+        let kill_w = 46;
+        let open_w = 50;
+        let kill_r = Rect::new(r.x + r.w.saturating_sub(kill_w + 4), r.y + 4, kill_w, 22);
+        let open_r = Rect::new(kill_r.x.saturating_sub(open_w + 6), r.y + 4, open_w, 22);
+        (open_r, kill_r)
     }
 
     pub fn usage_card_rect(&self, enabled_count: usize) -> Option<Rect> {
@@ -447,6 +520,11 @@ impl Layout {
                 if self.settings_close_rect().contains(px, py) {
                     return HitTarget::SettingsClose;
                 }
+                for i in 0..THEME_PRESETS.len() {
+                    if self.settings_theme_preset_rect(i).contains(px, py) {
+                        return HitTarget::SettingsThemePreset(i);
+                    }
+                }
                 for i in 0..PRESET_ACCENTS.len() {
                     if self.settings_swatch_rect(i).contains(px, py) {
                         return HitTarget::SettingsSwatch(i);
@@ -521,11 +599,17 @@ impl Layout {
         if self.snippets_btn.contains(px, py) {
             return HitTarget::SnippetsToggle;
         }
+        if self.ports_btn.contains(px, py) {
+            return HitTarget::PortsToggle;
+        }
         if self.split_btn.contains(px, py) {
             return HitTarget::SplitToggle;
         }
         if self.new_session_btn.contains(px, py) {
             return HitTarget::NewSessionToggle;
+        }
+        if self.dup_session_btn.contains(px, py) {
+            return HitTarget::DuplicateSession;
         }
 
         for i in 0..session_count {
@@ -535,6 +619,9 @@ impl Layout {
             }
             if self.session_close_rect(i).contains(px, py) {
                 return HitTarget::CloseSession(i);
+            }
+            if self.session_badge_rect(i).contains(px, py) {
+                return HitTarget::CycleSessionColor(i);
             }
             if row.contains(px, py) {
                 return HitTarget::SessionRow(i);
@@ -877,6 +964,22 @@ impl Default for PaletteUiState {
     }
 }
 
+pub struct PortsUiState {
+    pub open: bool,
+    pub loading: bool,
+    pub ports: Vec<ListeningPort>,
+}
+
+impl Default for PortsUiState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            loading: false,
+            ports: Vec::new(),
+        }
+    }
+}
+
 pub struct UiState {
     pub picker_open: bool,
     pub picker_selected: usize,
@@ -892,6 +995,7 @@ pub struct UiState {
     pub suggestion_navigated: bool,
     pub search: SearchUiState,
     pub palette: PaletteUiState,
+    pub ports: PortsUiState,
     pub settings: SettingsUiState,
 }
 
@@ -912,6 +1016,7 @@ impl UiState {
             suggestion_navigated: false,
             search: SearchUiState::default(),
             palette: PaletteUiState::default(),
+            ports: PortsUiState::default(),
             settings: SettingsUiState::from_config(cfg, active_accent),
         }
     }
@@ -1008,20 +1113,24 @@ pub fn render_app(
         } else {
             theme.bg_sidebar
         };
+        let sess_accent = sess.display_accent();
         canvas.fill_rect(row, bg);
         if is_active {
-            canvas.fill_rect(Rect::new(row.x, row.y, 3, row.h), sess.shell.accent);
+            canvas.fill_rect(Rect::new(row.x, row.y, 3, row.h), sess_accent);
         }
 
-        // Shell badge pill
-        let badge_rect = Rect::new(row.x + 9, row.y + 8, 36, 20);
-        canvas.fill_rect(badge_rect, sess.shell.accent.lerp(theme.bg_sidebar, 190));
+        // Shell badge pill (click to cycle per-session color)
+        let badge_rect = layout.session_badge_rect(idx);
+        canvas.fill_rect(badge_rect, sess_accent.lerp(theme.bg_sidebar, 190));
+        if ui.hovered == HitTarget::CycleSessionColor(idx) {
+            canvas.stroke_rect(badge_rect, sess_accent);
+        }
         font.draw_text(
             &mut canvas,
             (badge_rect.x + 4) as i32,
             (badge_rect.y + 4) as i32,
             FONT_SIZE_SMALL,
-            sess.shell.accent,
+            sess_accent,
             &sess.shell.badge,
             (badge_rect.x + badge_rect.w) as i32,
         );
@@ -1189,7 +1298,7 @@ pub fn render_app(
         }
     }
 
-    // 5. "+ New Session" button
+    // 5. "+ New" and "Dup" buttons at bottom of sidebar
     let new_btn_bg = if ui.picker_open || ui.hovered == HitTarget::NewSessionToggle {
         user.accent.lerp(theme.bg_sidebar, 175)
     } else {
@@ -1199,12 +1308,29 @@ pub fn render_app(
     canvas.stroke_rect(layout.new_session_btn, user.accent.lerp(theme.border, 130));
     font.draw_text(
         &mut canvas,
-        (layout.new_session_btn.x + 14) as i32,
+        (layout.new_session_btn.x + 10) as i32,
         (layout.new_session_btn.y + 9) as i32,
         FONT_SIZE_UI,
         theme.fg_primary,
         if ui.picker_open { "v Select Shell" } else { "+ New Session" },
-        (layout.new_session_btn.x + layout.new_session_btn.w - 8) as i32,
+        (layout.new_session_btn.x + layout.new_session_btn.w - 4) as i32,
+    );
+
+    let dup_bg = if ui.hovered == HitTarget::DuplicateSession {
+        user.accent.lerp(theme.bg_sidebar, 175)
+    } else {
+        theme.bg_sidebar_hover
+    };
+    canvas.fill_rect(layout.dup_session_btn, dup_bg);
+    canvas.stroke_rect(layout.dup_session_btn, theme.border);
+    font.draw_text(
+        &mut canvas,
+        (layout.dup_session_btn.x + 10) as i32,
+        (layout.dup_session_btn.y + 9) as i32,
+        FONT_SIZE_SMALL,
+        theme.fg_primary,
+        "Dup",
+        (layout.dup_session_btn.x + layout.dup_session_btn.w - 4) as i32,
     );
 
     // 7. Shell picker popup (when open)
@@ -1245,7 +1371,7 @@ pub fn render_app(
         theme.border,
     );
 
-    // Top-right header action buttons: [Split] [Snippets] [Settings]
+    // Top-right header action buttons: [Split] [Ports] [Snippets] [Settings]
     let split_active = sessions.is_split();
     let split_bg = if split_active || ui.hovered == HitTarget::SplitToggle {
         theme.bg_sidebar_active
@@ -1259,12 +1385,32 @@ pub fn render_app(
     );
     font.draw_text(
         &mut canvas,
-        (layout.split_btn.x + 10) as i32,
+        (layout.split_btn.x + 8) as i32,
         (layout.split_btn.y + 5) as i32,
         FONT_SIZE_SMALL,
         if split_active { user.accent } else { theme.fg_primary },
         "Split",
         (layout.split_btn.x + layout.split_btn.w - 4) as i32,
+    );
+
+    let ports_bg = if ui.ports.open || ui.hovered == HitTarget::PortsToggle {
+        theme.bg_sidebar_active
+    } else {
+        theme.bg_sidebar_hover
+    };
+    canvas.fill_rect(layout.ports_btn, ports_bg);
+    canvas.stroke_rect(
+        layout.ports_btn,
+        if ui.ports.open { user.accent } else { theme.border },
+    );
+    font.draw_text(
+        &mut canvas,
+        (layout.ports_btn.x + 8) as i32,
+        (layout.ports_btn.y + 5) as i32,
+        FONT_SIZE_SMALL,
+        if ui.ports.open { user.accent } else { theme.fg_primary },
+        "Ports",
+        (layout.ports_btn.x + layout.ports_btn.w - 4) as i32,
     );
 
     let snip_bg = if ui.palette.open || ui.hovered == HitTarget::SnippetsToggle {
@@ -1700,7 +1846,12 @@ pub fn render_app(
         render_palette_panel(&mut canvas, layout, font, theme, user, ui, snippets);
     }
 
-    // 14. Settings (Preferences) modal overlay
+    // 14. Local Listening Ports modal (Ctrl+Shift+O)
+    if ui.ports.open && !ui.settings.open && !ui.palette.open {
+        render_ports_panel(&mut canvas, layout, font, theme, user, ui);
+    }
+
+    // 15. Settings (Preferences) modal overlay
     if ui.settings.open {
         render_settings_panel(&mut canvas, layout, font, theme, user, ui, cfg);
     }
@@ -2112,11 +2263,51 @@ fn render_settings_panel(
         (close_r.x + close_r.w) as i32,
     );
 
+    // 1-click Full Theme Presets row
+    font.draw_text(
+        canvas,
+        (p.x + 20) as i32,
+        (p.y + 44) as i32,
+        FONT_SIZE_SMALL,
+        theme.fg_muted,
+        "THEME PRESETS (1-click full palette)",
+        max_x,
+    );
+    for (i, preset) in THEME_PRESETS.iter().enumerate() {
+        let r = layout.settings_theme_preset_rect(i);
+        if r.x + r.w > p.x + p.w - 10 {
+            break;
+        }
+        let is_active_preset = cfg.bg_terminal == preset.bg_terminal && user.accent == preset.accent;
+        canvas.fill_rect(
+            r,
+            if is_active_preset || ui.hovered == HitTarget::SettingsThemePreset(i) {
+                theme.bg_sidebar_active
+            } else {
+                theme.bg_input
+            },
+        );
+        canvas.stroke_rect(
+            r,
+            if is_active_preset { preset.accent } else { theme.border },
+        );
+        canvas.fill_rect(Rect::new(r.x + 5, r.y + 7, 6, 10), preset.accent);
+        font.draw_text(
+            canvas,
+            (r.x + 15) as i32,
+            (r.y + 5) as i32,
+            FONT_SIZE_SMALL,
+            theme.fg_primary,
+            preset.name,
+            (r.x + r.w - 3) as i32,
+        );
+    }
+
     // Swatches label
     font.draw_text(
         canvas,
         (p.x + 20) as i32,
-        (p.y + 50) as i32,
+        (p.y + 96) as i32,
         FONT_SIZE_SMALL,
         theme.fg_muted,
         "ACCENT PRESETS (click or type any #HEX below)",
@@ -2190,7 +2381,7 @@ fn render_settings_panel(
 
     // Divider before typography
     canvas.fill_rect(
-        Rect::new(p.x + 20, p.y + 260, p.w.saturating_sub(40), 1),
+        Rect::new(p.x + 20, p.y + 300, p.w.saturating_sub(40), 1),
         theme.border,
     );
 
@@ -2324,13 +2515,13 @@ fn render_settings_panel(
 
     // Agent Token Plugins (24h) opt-in toggles
     canvas.fill_rect(
-        Rect::new(p.x + 20, p.y + 344, p.w.saturating_sub(40), 1),
+        Rect::new(p.x + 20, p.y + 386, p.w.saturating_sub(40), 1),
         theme.border,
     );
     font.draw_text(
         canvas,
         (p.x + 20) as i32,
-        (p.y + 352) as i32,
+        (p.y + 394) as i32,
         FONT_SIZE_SMALL,
         theme.fg_muted,
         "CLI AGENT TOKEN PLUGINS (24h local logs)",
@@ -2401,6 +2592,172 @@ fn render_settings_panel(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_ports_panel(
+    canvas: &mut Canvas<'_>,
+    layout: &Layout,
+    font: &mut FontRenderer,
+    theme: &Theme,
+    user: &UserIdentity,
+    ui: &UiState,
+) {
+    let p = layout.ports_panel();
+    let max_x = (p.x + p.w - 14) as i32;
+
+    canvas.fill_rect(p, theme.bg_header);
+    canvas.stroke_rect(p, user.accent);
+    canvas.fill_rect(Rect::new(p.x, p.y, p.w, 3), user.accent);
+
+    font.draw_text(
+        canvas,
+        (p.x + 16) as i32,
+        (p.y + 12) as i32,
+        14.5,
+        theme.fg_primary,
+        "Local Listening Ports (Ctrl+Shift+O)",
+        (p.x + p.w - 120) as i32,
+    );
+
+    let ref_r = layout.ports_refresh_rect();
+    canvas.fill_rect(
+        ref_r,
+        if ui.hovered == HitTarget::PortsRefresh {
+            theme.bg_sidebar_active
+        } else {
+            theme.bg_input
+        },
+    );
+    canvas.stroke_rect(ref_r, theme.border);
+    font.draw_text(
+        canvas,
+        (ref_r.x + 10) as i32,
+        (ref_r.y + 4) as i32,
+        FONT_SIZE_SMALL,
+        theme.fg_primary,
+        "Refresh",
+        (ref_r.x + ref_r.w - 4) as i32,
+    );
+
+    let close_r = layout.ports_close_rect();
+    font.draw_text(
+        canvas,
+        (close_r.x + 6) as i32,
+        (close_r.y + 3) as i32,
+        FONT_SIZE_UI,
+        if ui.hovered == HitTarget::PortsClose {
+            theme.danger
+        } else {
+            theme.fg_muted
+        },
+        "x",
+        (close_r.x + close_r.w) as i32,
+    );
+
+    if ui.ports.loading && ui.ports.ports.is_empty() {
+        font.draw_text(
+            canvas,
+            (p.x + 18) as i32,
+            (p.y + 60) as i32,
+            FONT_SIZE_UI,
+            theme.fg_muted,
+            "Scanning local listening TCP ports...",
+            max_x,
+        );
+        return;
+    }
+
+    if ui.ports.ports.is_empty() {
+        font.draw_text(
+            canvas,
+            (p.x + 18) as i32,
+            (p.y + 60) as i32,
+            FONT_SIZE_UI,
+            theme.fg_muted,
+            "No listening TCP ports found.",
+            max_x,
+        );
+        return;
+    }
+
+    for (i, lp) in ui.ports.ports.iter().take(8).enumerate() {
+        let r = layout.ports_row_rect(i);
+        if r.y + r.h > p.y + p.h - 10 {
+            break;
+        }
+        canvas.fill_rect(r, theme.bg_input);
+        canvas.stroke_rect(r, theme.border);
+
+        let (open_r, kill_r) = layout.ports_action_rects(i);
+        let port_str = format!(":{}", lp.port);
+        let after_port = font.draw_text(
+            canvas,
+            (r.x + 10) as i32,
+            (r.y + 7) as i32,
+            FONT_SIZE_UI,
+            theme.syntax.command,
+            &port_str,
+            (r.x + 90) as i32,
+        );
+        let proc_x = (after_port + 12).max((r.x + 76) as i32);
+        font.draw_text(
+            canvas,
+            proc_x,
+            (r.y + 7) as i32,
+            FONT_SIZE_UI,
+            theme.fg_primary,
+            &lp.process,
+            (open_r.x.saturating_sub(80)) as i32,
+        );
+        font.draw_text(
+            canvas,
+            (open_r.x.saturating_sub(74)) as i32,
+            (r.y + 8) as i32,
+            FONT_SIZE_SMALL,
+            theme.fg_muted,
+            &format!("PID {}", lp.pid),
+            (open_r.x.saturating_sub(4)) as i32,
+        );
+
+        canvas.fill_rect(
+            open_r,
+            if ui.hovered == HitTarget::PortOpen(i) {
+                theme.bg_sidebar_active
+            } else {
+                theme.bg_header
+            },
+        );
+        canvas.stroke_rect(open_r, user.accent.lerp(theme.border, 120));
+        font.draw_text(
+            canvas,
+            (open_r.x + 8) as i32,
+            (open_r.y + 4) as i32,
+            FONT_SIZE_SMALL,
+            user.accent,
+            "Open",
+            (open_r.x + open_r.w - 2) as i32,
+        );
+
+        canvas.fill_rect(
+            kill_r,
+            if ui.hovered == HitTarget::PortKill(i) {
+                theme.danger.lerp(theme.bg_header, 160)
+            } else {
+                theme.bg_header
+            },
+        );
+        canvas.stroke_rect(kill_r, theme.danger.lerp(theme.border, 120));
+        font.draw_text(
+            canvas,
+            (kill_r.x + 10) as i32,
+            (kill_r.y + 4) as i32,
+            FONT_SIZE_SMALL,
+            theme.danger,
+            "Kill",
+            (kill_r.x + kill_r.w - 2) as i32,
+        );
+    }
+}
+
 /// Procedurally generates a crisp 32x32 RGBA app icon (`>_` inside a rounded dark frame).
 /// Zero image-decoding dependencies; used for both window taskbar icon and `.exe` resource.
 pub fn build_app_icon_rgba(accent: Rgb) -> Vec<u8> {
@@ -2465,6 +2822,10 @@ mod tests {
         let row0 = layout.session_row_rect(0);
         assert_eq!(
             layout.hit_test(row0.x + 20, row0.y + 10, 2, 3, false, 0, false),
+            HitTarget::CycleSessionColor(0)
+        );
+        assert_eq!(
+            layout.hit_test(row0.x + 80, row0.y + 10, 2, 3, false, 0, false),
             HitTarget::SessionRow(0)
         );
 
