@@ -27,3 +27,6 @@ Desktop.ini
 # Local environment & secrets
 .env
 .env.*
+
+# Local agent workflow notes
+/odd/

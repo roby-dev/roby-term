@@ -341,11 +341,21 @@ pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     path
 }
 
-/// Updates tracked session `cwd` when the user executes `cd <dir>`, `cd..`, `Set-Location`, etc.
+/// Updates tracked session `cwd` when the user executes `cd <dir>`, `cd..`, `D:`, `Set-Location`, etc.
 pub fn maybe_update_cwd(current_cwd: &Path, submitted_cmd: &str) -> Option<PathBuf> {
     let trimmed = submitted_cmd.trim();
     if trimmed.is_empty() {
         return None;
+    }
+
+    // Handle bare Windows drive switch like `D:` or `c:`
+    let bytes = trimmed.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let drive_root = format!("{trimmed}\\");
+        return fs::canonicalize(&drive_root)
+            .ok()
+            .filter(|p| p.is_dir())
+            .map(strip_verbatim_prefix);
     }
 
     // Handle `cd..`, `cd\`, `cd/` without space (common on Windows CMD/PowerShell)
@@ -361,7 +371,10 @@ pub fn maybe_update_cwd(current_cwd: &Path, submitted_cmd: &str) -> Option<PathB
         let cmd = parts.next()?.to_ascii_lowercase();
         let rest = parts.next()?.trim();
         if matches!(cmd.as_str(), "cd" | "chdir" | "set-location" | "sl" | "pushd") {
-            rest
+            rest.strip_prefix("/d ")
+                .or_else(|| rest.strip_prefix("/D "))
+                .map(str::trim)
+                .unwrap_or(rest)
         } else {
             return None;
         }
@@ -434,21 +447,37 @@ fn read_git_head(head_path: &Path) -> Option<String> {
     }
 }
 
-/// Formats `cwd` cleanly for the header (strips Windows `\\?\` prefix and abbreviates home dir).
+/// Formats `cwd` cleanly for the header as the current folder name only (`~` for home, root for drive/filesystem root).
 pub fn abbreviate_path(cwd: &Path) -> String {
     let raw = cwd.to_string_lossy();
     let cleaned = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
     if let Some(home) = home_dir() {
         let home_str = home.to_string_lossy();
-        if let Some(rest) = cleaned.strip_prefix(home_str.as_ref()) {
-            return if rest.is_empty() {
-                "~".to_string()
-            } else {
-                format!("~{rest}")
-            };
+        let home_clean = home_str.strip_prefix(r"\\?\").unwrap_or(&home_str);
+        let trimmed_cwd = cleaned.trim_end_matches(['/', '\\']);
+        let trimmed_home = home_clean.trim_end_matches(['/', '\\']);
+        #[cfg(target_os = "windows")]
+        let is_home = trimmed_cwd.eq_ignore_ascii_case(trimmed_home);
+        #[cfg(not(target_os = "windows"))]
+        let is_home = trimmed_cwd == trimmed_home;
+        if is_home {
+            return "~".to_string();
         }
     }
-    cleaned.to_string()
+    let trimmed = cleaned.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return cleaned.to_string();
+    }
+    let b = trimmed.as_bytes();
+    if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return cleaned.to_string();
+    }
+    trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(cleaned)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -518,5 +547,28 @@ mod tests {
         assert_eq!(detect_git_branch(&sub).as_deref(), Some("feat/awesome"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abbreviates_path_to_current_folder_only() {
+        assert_eq!(
+            abbreviate_path(Path::new(r"D:\Fuentes\apibillingservices")),
+            "apibillingservices"
+        );
+        assert_eq!(abbreviate_path(Path::new(r"D:\")), r"D:\");
+        assert_eq!(abbreviate_path(Path::new("/Users/dev/my-warp")), "my-warp");
+        assert_eq!(abbreviate_path(Path::new("/")), "/");
+        if let Some(home) = home_dir() {
+            assert_eq!(abbreviate_path(&home), "~");
+            assert_eq!(abbreviate_path(&home.join("Downloads")), "Downloads");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tracks_windows_drive_switch_for_session_cwd() {
+        let dir = std::env::temp_dir();
+        let drive_root = maybe_update_cwd(&dir, "C:").expect("should support bare drive switch C:");
+        assert_eq!(drive_root.to_string_lossy().to_ascii_uppercase(), r"C:\");
     }
 }

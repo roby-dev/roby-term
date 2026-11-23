@@ -72,8 +72,19 @@ pub fn discover_shells() -> Vec<ShellProfile> {
 }
 
 #[cfg(target_os = "windows")]
+const PS_SHORT_PROMPT_CMD: &str = "if ((Get-Command prompt -ErrorAction SilentlyContinue).Definition -like '*SessionState.Path.CurrentLocation*') { function prompt { $l = $executionContext.SessionState.Path.CurrentLocation.Path; $n = if ($l -eq $HOME) { '~' } else { Split-Path -Leaf $l }; if (-not $n) { $n = $l }; 'PS ' + $n + ('>' * ($nestedPromptLevel + 1)) + ' ' } }";
+
+#[cfg(target_os = "windows")]
 fn discover_windows_shells() -> Vec<ShellProfile> {
     let mut shells = Vec::new();
+    let ps_args = || {
+        vec![
+            "-NoLogo".to_string(),
+            "-NoExit".to_string(),
+            "-Command".to_string(),
+            PS_SHORT_PROMPT_CMD.to_string(),
+        ]
+    };
 
     if let Some(pwsh) = find_in_path("pwsh.exe") {
         shells.push(ShellProfile::new(
@@ -81,7 +92,7 @@ fn discover_windows_shells() -> Vec<ShellProfile> {
             "PowerShell 7",
             "PS7",
             pwsh.to_string_lossy(),
-            vec!["-NoLogo".to_string()],
+            ps_args(),
         ));
     }
 
@@ -91,7 +102,7 @@ fn discover_windows_shells() -> Vec<ShellProfile> {
             "PowerShell",
             "PS",
             ps.to_string_lossy(),
-            vec!["-NoLogo".to_string()],
+            ps_args(),
         ));
     }
 
@@ -269,5 +280,24 @@ mod tests {
             )
         });
         assert!(has_win_shell);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn powershell_profiles_configure_short_current_dir_prompt() {
+        let shells = discover_shells();
+        let ps_shells: Vec<_> = shells
+            .iter()
+            .filter(|s| matches!(s.kind, ShellKind::PowerShell7 | ShellKind::WindowsPowerShell))
+            .collect();
+        assert!(!ps_shells.is_empty());
+        for ps in ps_shells {
+            assert!(ps.args.iter().any(|a| a == "-NoExit"));
+            let cmd_pos = ps.args.iter().position(|a| a == "-Command").expect("missing -Command");
+            let script = ps.args.get(cmd_pos + 1).expect("missing prompt script");
+            assert!(script.contains("function prompt"));
+            assert!(script.contains("Split-Path -Leaf"));
+            assert!(!script.contains('"'), "avoid double quotes in Win32 args");
+        }
     }
 }
