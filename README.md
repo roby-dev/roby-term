@@ -1,5 +1,7 @@
 # Roby-Term
 
+[![Built with Gentle-AI](https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/docs/assets/brand/built-with-gentle-ai.png)](https://github.com/Gentleman-Programming/gentle-ai)
+
 Ultra-low-RAM, cross-platform (Windows & macOS) Rust terminal emulator with a custom 2D software UI, session sidebar with shell picker, user-differentiated colors, and a syntax-colored command input bar.
 
 ## Why It Stays Light on RAM
@@ -72,3 +74,7 @@ cargo build --release
 # Launch
 cargo run --release
 ```
+
+## Credits
+
+Built with [Gentle-AI](https://github.com/Gentleman-Programming/gentle-ai) by [Gentleman Programming](https://github.com/Gentleman-Programming).
