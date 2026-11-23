@@ -1,6 +1,6 @@
-# my-warp
+# Roby-Term
 
-Ultra-low-RAM, cross-platform (Windows & macOS) Rust terminal emulator with a custom 2D software UI, session sidebar with shell picker, user-differentiated colors, and a Warp-style syntax-colored input bar.
+Ultra-low-RAM, cross-platform (Windows & macOS) Rust terminal emulator with a custom 2D software UI, session sidebar with shell picker, user-differentiated colors, and a syntax-colored command input bar.
 
 ## Why It Stays Light on RAM
 
@@ -16,6 +16,19 @@ Ultra-low-RAM, cross-platform (Windows & macOS) Rust terminal emulator with a cu
   - **macOS**: Zsh, Bash, Fish, PowerShell.
 - **User & Session Color Differentiation**: detects the OS username (`USERNAME` / `USER`) to derive a distinct user accent color & badge, plus unique accent colors per shell type.
 - **Warp-Style Input Bar**: dedicated command bar with cursor editing, Up/Down history, and live syntax highlighting for commands, `--flags`/`-f`, `"strings"`, file paths, `$ENV`/`%ENV%` variables, operators (`|`, `&&`, `;`, `>`), and comments.
+- **100% Local History, Tab Completion & Frecency Predictions**: persists executed commands locally (`%APPDATA%\my-warp\history.log` on Windows, `~/Library/Application Support/my-warp/history.log` on macOS; skips commands starting with a space), ranking suggestions by frequency + recency + shell match alongside real `Tab` completion for files, folders, and `PATH` executables.
+- **User Preferences (Settings Panel)**: click **Settings** in the top-right header or press `Ctrl+,` (`Cmd+,` on macOS) to pick accent presets or type any custom `#HEX` color (e.g., `#A88BD6`) for accent, background, commands, and flags, plus switch system monospace fonts and font size live. Auto-saved locally to `config.ini`.
+- **Live Context Bar (CWD + Git Branch)**: displays your active folder and current Git branch in the header by reading `.git/HEAD` directly (0ms, zero subprocesses).
+- **Command Palette & Local Snippets (`Ctrl+K`)**: filter, save (`name = command`), delete, insert (`Enter`), or run (`Shift+Enter`) reusable command workflows stored locally in `snippets.tsv`.
+- **Split Panes (`Ctrl+Shift+D`)**: run two terminal sessions side-by-side in the same window; click either pane to focus.
+- **Session Rename & Activity Badges**: double-click any session in the sidebar (or press `F2`) to rename it inline, with a green dot for unread background output and a red dot when a process exits.
+- **Full Local Workspace & Session Persistence**: closing `my-warp` automatically saves all open sessions (custom names, shells, `cwd`, split layout, and full scrollback transcripts) locally in `workspace/` and restores them on the next launch.
+- **Built-In Colorized `ls` / `ll` / `la`**: renders folders first (in your accent color), files color-coded by type (`COD`, `CFG`, `EXE`, `DOC`, `BIN`), human-readable sizes, and clickable entries identically on Windows (PowerShell/CMD/Git Bash) and macOS (Zsh/Bash/Fish). Pass `--raw` or pipe (`ls | ...`) to invoke the shell's native command.
+- **Quick Zoom & Custom App Icon**: zoom font size on the fly with `Ctrl++` / `Ctrl+-` / `Ctrl+0`, with a custom embedded app icon (and GUI-only Windows subsystem in release builds).
+- **Native Copy/Paste & Mouse Selection**: drag-select text in the terminal and press `Ctrl+C` (`Cmd+C`) to copy, or `Ctrl+V` (`Cmd+V`) to paste into the input bar, search bar, or settings fields (zero external clipboard crates).
+- **Warp-Style Command Blocks**: visually separates each executed command with an accent gutter and inline **`Copy`** / **`Re-run`** buttons.
+- **Scrollback Search (`Ctrl+F`)**: case-insensitive search across scrollback and viewport with match counter and jump navigation (`Enter` / `Shift+Enter`).
+- **Clickable Paths & URLs**: hover and click any existing file/directory path (e.g., `D:\wauth`, `src/main.rs:42`) to open it in Explorer/Finder, or any `http://` / `https://` URL to open it in your browser.
 - **Automatic TUI Passthrough**: detects alternate-screen apps (`vim`, `htop`, etc.) and forwards keystrokes directly to the PTY (also toggleable manually via `Ctrl+Shift+P` or clicking the header pill).
 
 ## Shortcuts
@@ -23,6 +36,17 @@ Ultra-low-RAM, cross-platform (Windows & macOS) Rust terminal emulator with a cu
 | Shortcut | Action |
 | --- | --- |
 | `Enter` | Run command in active session |
+| `Tab` / `→` (at end) | Complete files/folders/commands or accept ghost prediction |
+| `Ctrl+N` / `Ctrl+P` | Cycle through top-5 completions & suggestions |
+| `Ctrl+K` (`Cmd+K` on macOS) | Open / close Snippets & Workflows palette |
+| `Ctrl+Shift+D` | Toggle side-by-side Split Panes |
+| `F2` / Double-click session | Rename session inline |
+| `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Zoom font size in / out / reset |
+| `Ctrl+F` (`Cmd+F` on macOS) | Search output & scrollback (`Enter` / `Shift+Enter` next/prev) |
+| `Ctrl+C` (`Cmd+C`) | Copy selected text (or send SIGINT when nothing is selected) |
+| `Ctrl+Shift+C` | Copy last command block output |
+| `Ctrl+V` (`Cmd+V`) | Paste from OS clipboard |
+| `Ctrl+,` (`Cmd+,` on macOS) | Open / close Preferences (Settings) panel |
 | `Up` / `Down` | Navigate command history (Warp input mode) |
 | `Ctrl+T` (`Cmd+T` on macOS) | Toggle New Session shell picker |
 | `Ctrl+W` (`Cmd+W` on macOS) | Close active session |

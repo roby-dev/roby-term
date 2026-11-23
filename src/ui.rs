@@ -1,6 +1,10 @@
-use crate::input::TokenKind;
-use crate::session::SessionManager;
+use crate::complete::{abbreviate_path, CompletionItem, CompletionKind};
+use crate::config::{format_hex_color, parse_hex_color, UserConfig, PRESET_ACCENTS};
+use crate::input::{InputBar, TokenKind};
+use crate::session::{Session, SessionManager};
 use crate::shell::ShellProfile;
+use crate::snippets::SnippetStore;
+use crate::terminal::SearchMatch;
 use crate::theme::{Rgb, Theme, UserIdentity};
 use fontdue::{Font, FontSettings, Metrics};
 use std::collections::HashMap;
@@ -11,9 +15,51 @@ pub const HEADER_HEIGHT: u32 = 38;
 pub const INPUT_BAR_HEIGHT: u32 = 62;
 pub const SESSION_ROW_HEIGHT: u32 = 36;
 pub const PICKER_ROW_HEIGHT: u32 = 30;
-pub const FONT_SIZE_TERM: f32 = 15.0;
+pub const SUGGESTION_ROW_HEIGHT: u32 = 26;
 pub const FONT_SIZE_UI: f32 = 13.5;
 pub const FONT_SIZE_SMALL: f32 = 11.5;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemFont {
+    pub name: String,
+    pub path: String,
+}
+
+/// Discovers installed monospace fonts on the current operating system.
+pub fn discover_system_mono_fonts() -> Vec<SystemFont> {
+    #[cfg(target_os = "windows")]
+    let candidates: &[(&str, &str)] = &[
+        ("Cascadia Mono", r"C:\Windows\Fonts\CascadiaMono.ttf"),
+        ("Cascadia Code", r"C:\Windows\Fonts\CascadiaCode.ttf"),
+        ("Consolas", r"C:\Windows\Fonts\consola.ttf"),
+        ("Lucida Console", r"C:\Windows\Fonts\lucon.ttf"),
+        ("Courier New", r"C:\Windows\Fonts\cour.ttf"),
+    ];
+
+    #[cfg(target_os = "macos")]
+    let candidates: &[(&str, &str)] = &[
+        ("SF Mono", "/System/Library/Fonts/SFNSMono.ttf"),
+        ("Menlo", "/System/Library/Fonts/Menlo.ttc"),
+        ("Monaco", "/System/Library/Fonts/Monaco.ttf"),
+        ("Courier New", "/Library/Fonts/Courier New.ttf"),
+    ];
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let candidates: &[(&str, &str)] = &[
+        ("DejaVu Sans Mono", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"),
+        ("DejaVu Sans Mono", "/usr/share/fonts/TTF/DejaVuSansMono.ttf"),
+        ("Liberation Mono", "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf"),
+    ];
+
+    candidates
+        .iter()
+        .filter(|(_, path)| Path::new(path).is_file())
+        .map(|(name, path)| SystemFont {
+            name: (*name).to_string(),
+            path: (*path).to_string(),
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
@@ -37,12 +83,39 @@ impl Rect {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsField {
+    AccentHex,
+    BgHex,
+    CmdHex,
+    FlagHex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
     SessionRow(usize),
     CloseSession(usize),
+    SettingsToggle,
+    SnippetsToggle,
+    SplitToggle,
     NewSessionToggle,
     PickShell(usize),
+    SuggestionRow(usize),
     TogglePassthrough,
+    SearchClose,
+    PaletteClose,
+    PaletteAddToggle,
+    PaletteRow(usize),
+    PaletteDelete(usize),
+    BlockCopy(usize),
+    BlockRerun(usize),
+    SettingsClose,
+    SettingsSwatch(usize),
+    SettingsField(SettingsField),
+    SettingsFontPrev,
+    SettingsFontNext,
+    SettingsSizeDown,
+    SettingsSizeUp,
+    SettingsReset,
     TerminalViewport,
     InputBar,
     None,
@@ -55,6 +128,9 @@ pub struct Layout {
     pub sidebar: Rect,
     pub user_card: Rect,
     pub sessions_top: u32,
+    pub settings_btn: Rect,
+    pub snippets_btn: Rect,
+    pub split_btn: Rect,
     pub new_session_btn: Rect,
     pub header: Rect,
     pub passthrough_pill: Rect,
@@ -81,12 +157,34 @@ impl Layout {
             new_btn_h,
         );
 
-        let pill_w = 138;
+        let btn_h = header_h.saturating_sub(14);
+        let settings_w = 74;
+        let settings_btn = Rect::new(
+            main_x + main_w.saturating_sub(settings_w + 10),
+            7,
+            settings_w,
+            btn_h,
+        );
+        let snippets_w = 76;
+        let snippets_btn = Rect::new(
+            settings_btn.x.saturating_sub(snippets_w + 6),
+            7,
+            snippets_w,
+            btn_h,
+        );
+        let split_w = 54;
+        let split_btn = Rect::new(
+            snippets_btn.x.saturating_sub(split_w + 6),
+            7,
+            split_w,
+            btn_h,
+        );
+        let pill_w = 112;
         let passthrough_pill = Rect::new(
-            main_x + main_w.saturating_sub(pill_w + 12),
+            split_btn.x.saturating_sub(pill_w + 6),
             7,
             pill_w,
-            header_h.saturating_sub(14),
+            btn_h,
         );
 
         Self {
@@ -95,6 +193,9 @@ impl Layout {
             sidebar: Rect::new(0, 0, sidebar_w, height),
             user_card,
             sessions_top,
+            settings_btn,
+            snippets_btn,
+            split_btn,
             new_session_btn,
             header: Rect::new(main_x, 0, main_w, header_h),
             passthrough_pill,
@@ -134,6 +235,176 @@ impl Layout {
         )
     }
 
+    pub fn suggestions_panel(&self, suggestion_count: usize) -> Rect {
+        let h = (suggestion_count as u32) * SUGGESTION_ROW_HEIGHT + 10;
+        let w = self.input_bar.w.saturating_sub(24).min(680);
+        let x = self.input_bar.x + 12;
+        let y = self.input_bar.y.saturating_sub(h + 4);
+        Rect::new(x, y, w, h)
+    }
+
+    pub fn suggestion_row(&self, suggestion_count: usize, idx: usize) -> Rect {
+        let panel = self.suggestions_panel(suggestion_count);
+        Rect::new(
+            panel.x + 5,
+            panel.y + 5 + (idx as u32) * SUGGESTION_ROW_HEIGHT,
+            panel.w.saturating_sub(10),
+            SUGGESTION_ROW_HEIGHT.saturating_sub(2),
+        )
+    }
+
+    pub fn settings_panel(&self) -> Rect {
+        let w = self.viewport.w.saturating_sub(40).min(520);
+        let h = self.height.saturating_sub(80).min(388);
+        let x = self.viewport.x + self.viewport.w.saturating_sub(w) / 2;
+        let y = self.header.h + self.viewport.h.saturating_sub(h) / 2;
+        Rect::new(x, y, w, h)
+    }
+
+    pub fn settings_close_rect(&self) -> Rect {
+        let p = self.settings_panel();
+        Rect::new(p.x + p.w.saturating_sub(34), p.y + 10, 24, 24)
+    }
+
+    pub fn settings_swatch_rect(&self, idx: usize) -> Rect {
+        let p = self.settings_panel();
+        let sw = 38;
+        let gap = 8;
+        let x = p.x + 20 + (idx as u32) * (sw + gap);
+        Rect::new(x, p.y + 72, sw, 24)
+    }
+
+    pub fn settings_field_rect(&self, field: SettingsField) -> Rect {
+        let p = self.settings_panel();
+        let field_x = p.x + 168;
+        let field_w = 132;
+        let y = match field {
+            SettingsField::AccentHex => p.y + 108,
+            SettingsField::BgHex => p.y + 150,
+            SettingsField::CmdHex => p.y + 186,
+            SettingsField::FlagHex => p.y + 222,
+        };
+        Rect::new(field_x, y, field_w, 28)
+    }
+
+    pub fn settings_font_prev_rect(&self) -> Rect {
+        let p = self.settings_panel();
+        Rect::new(p.x + 168, p.y + 272, 28, 28)
+    }
+
+    pub fn settings_font_next_rect(&self) -> Rect {
+        let p = self.settings_panel();
+        Rect::new(p.x + p.w.saturating_sub(48), p.y + 272, 28, 28)
+    }
+
+    pub fn settings_size_down_rect(&self) -> Rect {
+        let p = self.settings_panel();
+        Rect::new(p.x + 168, p.y + 308, 30, 28)
+    }
+
+    pub fn settings_size_up_rect(&self) -> Rect {
+        let p = self.settings_panel();
+        Rect::new(p.x + 266, p.y + 308, 30, 28)
+    }
+
+    pub fn settings_reset_rect(&self) -> Rect {
+        let p = self.settings_panel();
+        Rect::new(p.x + 20, p.y + p.h.saturating_sub(38), 132, 26)
+    }
+
+    pub fn search_bar_rect(&self) -> Rect {
+        let w = self.viewport.w.saturating_sub(24).min(340);
+        let x = self.viewport.x + self.viewport.w.saturating_sub(w + 12);
+        let y = self.viewport.y + 8;
+        Rect::new(x, y, w, 32)
+    }
+
+    pub fn search_close_rect(&self) -> Rect {
+        let r = self.search_bar_rect();
+        Rect::new(r.x + r.w.saturating_sub(26), r.y + 5, 20, 22)
+    }
+
+    /// Returns `(copy_rect, rerun_rect)` for a Warp command block header on `screen_row` inside `vp`.
+    pub fn block_action_rects_in(&self, vp: Rect, screen_row: usize, cell_h: u32) -> (Rect, Rect) {
+        let y = vp.y + 6 + (screen_row as u32) * cell_h;
+        let h = cell_h.clamp(16, 20);
+        let rerun_w = 54;
+        let copy_w = 46;
+        let rerun_x = vp.x + vp.w.saturating_sub(rerun_w + 10);
+        let copy_x = rerun_x.saturating_sub(copy_w + 6);
+        (Rect::new(copy_x, y, copy_w, h), Rect::new(rerun_x, y, rerun_w, h))
+    }
+
+    pub fn split_viewports(&self) -> (Rect, Rect) {
+        let half = self.viewport.w / 2;
+        let left = Rect::new(
+            self.viewport.x,
+            self.viewport.y,
+            half.saturating_sub(1),
+            self.viewport.h,
+        );
+        let right = Rect::new(
+            self.viewport.x + half + 1,
+            self.viewport.y,
+            self.viewport.w.saturating_sub(half + 1),
+            self.viewport.h,
+        );
+        (left, right)
+    }
+
+    pub fn viewport_grid_size(vp: Rect, cell_w: u32, cell_h: u32) -> (usize, usize) {
+        let pad_x = 16;
+        let pad_y = 12;
+        let usable_w = vp.w.saturating_sub(pad_x);
+        let usable_h = vp.h.saturating_sub(pad_y);
+        let cols = (usable_w / cell_w.max(1)).max(10) as usize;
+        let rows = (usable_h / cell_h.max(1)).max(4) as usize;
+        (cols, rows)
+    }
+
+    pub fn pixel_to_cell_in(vp: Rect, px: u32, py: u32, cell_w: u32, cell_h: u32) -> Option<(usize, usize)> {
+        if !vp.contains(px, py) {
+            return None;
+        }
+        let start_x = vp.x + 8;
+        let start_y = vp.y + 6;
+        if px < start_x || py < start_y {
+            return None;
+        }
+        let col = ((px - start_x) / cell_w.max(1)) as usize;
+        let row = ((py - start_y) / cell_h.max(1)) as usize;
+        Some((row, col))
+    }
+
+    pub fn palette_panel(&self) -> Rect {
+        let w = self.viewport.w.saturating_sub(40).min(560);
+        let h = self.height.saturating_sub(90).min(340);
+        let x = self.viewport.x + self.viewport.w.saturating_sub(w) / 2;
+        let y = self.header.h + 28;
+        Rect::new(x, y, w, h)
+    }
+
+    pub fn palette_close_rect(&self) -> Rect {
+        let p = self.palette_panel();
+        Rect::new(p.x + p.w.saturating_sub(32), p.y + 10, 22, 22)
+    }
+
+    pub fn palette_add_rect(&self) -> Rect {
+        let p = self.palette_panel();
+        Rect::new(p.x + p.w.saturating_sub(116), p.y + 10, 76, 22)
+    }
+
+    pub fn palette_row_rect(&self, idx: usize) -> Rect {
+        let p = self.palette_panel();
+        Rect::new(p.x + 14, p.y + 84 + (idx as u32) * 32, p.w.saturating_sub(28), 28)
+    }
+
+    pub fn palette_delete_rect(&self, idx: usize) -> Rect {
+        let r = self.palette_row_rect(idx);
+        Rect::new(r.x + r.w.saturating_sub(24), r.y + 4, 20, 20)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn hit_test(
         &self,
         px: u32,
@@ -141,7 +412,61 @@ impl Layout {
         session_count: usize,
         shell_count: usize,
         picker_open: bool,
+        suggestion_count: usize,
+        settings_open: bool,
     ) -> HitTarget {
+        if settings_open {
+            let panel = self.settings_panel();
+            if panel.contains(px, py) {
+                if self.settings_close_rect().contains(px, py) {
+                    return HitTarget::SettingsClose;
+                }
+                for i in 0..PRESET_ACCENTS.len() {
+                    if self.settings_swatch_rect(i).contains(px, py) {
+                        return HitTarget::SettingsSwatch(i);
+                    }
+                }
+                for field in [
+                    SettingsField::AccentHex,
+                    SettingsField::BgHex,
+                    SettingsField::CmdHex,
+                    SettingsField::FlagHex,
+                ] {
+                    if self.settings_field_rect(field).contains(px, py) {
+                        return HitTarget::SettingsField(field);
+                    }
+                }
+                if self.settings_font_prev_rect().contains(px, py) {
+                    return HitTarget::SettingsFontPrev;
+                }
+                if self.settings_font_next_rect().contains(px, py) {
+                    return HitTarget::SettingsFontNext;
+                }
+                if self.settings_size_down_rect().contains(px, py) {
+                    return HitTarget::SettingsSizeDown;
+                }
+                if self.settings_size_up_rect().contains(px, py) {
+                    return HitTarget::SettingsSizeUp;
+                }
+                if self.settings_reset_rect().contains(px, py) {
+                    return HitTarget::SettingsReset;
+                }
+                return HitTarget::None;
+            }
+        }
+
+        if suggestion_count > 0 && !settings_open {
+            let panel = self.suggestions_panel(suggestion_count);
+            if panel.contains(px, py) {
+                for i in 0..suggestion_count {
+                    if self.suggestion_row(suggestion_count, i).contains(px, py) {
+                        return HitTarget::SuggestionRow(i);
+                    }
+                }
+                return HitTarget::None;
+            }
+        }
+
         if picker_open {
             let panel = self.shell_picker_panel(shell_count);
             if panel.contains(px, py) {
@@ -154,6 +479,15 @@ impl Layout {
             }
         }
 
+        if self.settings_btn.contains(px, py) {
+            return HitTarget::SettingsToggle;
+        }
+        if self.snippets_btn.contains(px, py) {
+            return HitTarget::SnippetsToggle;
+        }
+        if self.split_btn.contains(px, py) {
+            return HitTarget::SplitToggle;
+        }
         if self.new_session_btn.contains(px, py) {
             return HitTarget::NewSessionToggle;
         }
@@ -192,45 +526,92 @@ impl Layout {
         let rows = (usable_h / cell_h.max(1)).max(4) as usize;
         (cols, rows)
     }
+
+    /// Maps window pixel coordinates inside the terminal viewport to `(screen_row, col)`.
+    pub fn pixel_to_grid_cell(&self, px: u32, py: u32, cell_w: u32, cell_h: u32) -> Option<(usize, usize)> {
+        if !self.viewport.contains(px, py) {
+            return None;
+        }
+        let start_x = self.viewport.x + 8;
+        let start_y = self.viewport.y + 6;
+        if px < start_x || py < start_y {
+            return None;
+        }
+        let col = ((px - start_x) / cell_w.max(1)) as usize;
+        let row = ((py - start_y) / cell_h.max(1)) as usize;
+        Some((row, col))
+    }
 }
 
 /// Minimal glyph cache rasterizing characters on demand with `fontdue`.
 pub struct FontRenderer {
     font: Font,
     cache: HashMap<(char, u16), (Metrics, Vec<u8>)>,
+    pub font_name: String,
+    pub term_px: f32,
     pub cell_w: u32,
     pub cell_h: u32,
     pub baseline: i32,
 }
 
 impl FontRenderer {
-    pub fn load_system_mono() -> Result<Self, String> {
-        let bytes = load_system_mono_bytes()?;
+    pub fn load_with_config(
+        preferred_name: Option<&str>,
+        term_px: f32,
+        available: &[SystemFont],
+    ) -> Result<Self, String> {
+        let chosen = preferred_name
+            .and_then(|name| {
+                available
+                    .iter()
+                    .find(|f| f.name.eq_ignore_ascii_case(name))
+            })
+            .or_else(|| available.first())
+            .ok_or_else(|| "No system monospace font found on this machine".to_string())?;
+
+        let bytes = std::fs::read(&chosen.path)
+            .map_err(|e| format!("failed to read font {}: {e}", chosen.path))?;
         let font = Font::from_bytes(bytes, FontSettings::default())
             .map_err(|e| format!("failed to parse system monospace font: {e}"))?;
 
-        let (m_metrics, _) = font.rasterize('M', FONT_SIZE_TERM);
-        let cell_w = (m_metrics.advance_width.ceil() as u32).max(8);
-        let (cell_h, baseline) = if let Some(lm) = font.horizontal_line_metrics(FONT_SIZE_TERM) {
-            let h = (lm.new_line_size.ceil() as u32).max(16);
+        let mut renderer = Self {
+            font,
+            cache: HashMap::with_capacity(128),
+            font_name: chosen.name.clone(),
+            term_px,
+            cell_w: 9,
+            cell_h: 19,
+            baseline: 14,
+        };
+        renderer.recompute_metrics();
+        Ok(renderer)
+    }
+
+    pub fn set_term_size(&mut self, term_px: f32) {
+        self.term_px = term_px;
+        self.cache.clear();
+        self.recompute_metrics();
+    }
+
+    fn recompute_metrics(&mut self) {
+        let (m_metrics, _) = self.font.rasterize('M', self.term_px);
+        self.cell_w = (m_metrics.advance_width.ceil() as u32).max(7);
+        let (cell_h, baseline) = if let Some(lm) = self.font.horizontal_line_metrics(self.term_px) {
+            let h = (lm.new_line_size.ceil() as u32).max(14);
             let base = lm.ascent.ceil() as i32;
             (h, base)
         } else {
-            (20, 15)
+            ((self.term_px * 1.3) as u32, self.term_px as i32)
         };
-
-        Ok(Self {
-            font,
-            cache: HashMap::with_capacity(128),
-            cell_w,
-            cell_h,
-            baseline,
-        })
+        self.cell_h = cell_h;
+        self.baseline = baseline;
     }
 
     fn glyph(&mut self, ch: char, px: f32) -> &(Metrics, Vec<u8>) {
         let key = (ch, (px * 10.0) as u16);
-        self.cache.entry(key).or_insert_with(|| self.font.rasterize(ch, px))
+        self.cache
+            .entry(key)
+            .or_insert_with(|| self.font.rasterize(ch, px))
     }
 
     pub fn measure_text(&mut self, text: &str, px: f32) -> u32 {
@@ -289,7 +670,7 @@ impl FontRenderer {
             return;
         }
         let baseline_y = cell_y + self.baseline;
-        let (metrics, bitmap) = self.glyph(ch, FONT_SIZE_TERM);
+        let (metrics, bitmap) = self.glyph(ch, self.term_px);
         if bitmap.is_empty() {
             return;
         }
@@ -297,41 +678,6 @@ impl FontRenderer {
         let gy = baseline_y - metrics.height as i32 - metrics.ymin;
         canvas.blit_alpha(gx, gy, metrics.width, metrics.height, bitmap, color, max_x);
     }
-}
-
-fn load_system_mono_bytes() -> Result<Vec<u8>, String> {
-    #[cfg(target_os = "windows")]
-    let candidates: &[&str] = &[
-        r"C:\Windows\Fonts\CascadiaMono.ttf",
-        r"C:\Windows\Fonts\CascadiaCode.ttf",
-        r"C:\Windows\Fonts\consola.ttf",
-        r"C:\Windows\Fonts\lucon.ttf",
-        r"C:\Windows\Fonts\cour.ttf",
-    ];
-
-    #[cfg(target_os = "macos")]
-    let candidates: &[&str] = &[
-        "/System/Library/Fonts/SFNSMono.ttf",
-        "/System/Library/Fonts/Menlo.ttc",
-        "/System/Library/Fonts/Monaco.ttf",
-        "/Library/Fonts/Courier New.ttf",
-    ];
-
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    let candidates: &[&str] = &[
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-    ];
-
-    for path in candidates {
-        if Path::new(path).is_file() {
-            if let Ok(bytes) = std::fs::read(path) {
-                return Ok(bytes);
-            }
-        }
-    }
-    Err("No system monospace font found on this machine".to_string())
 }
 
 /// Zero-dependency 2D software framebuffer wrapper over `softbuffer`'s `&mut [u32]`.
@@ -412,17 +758,132 @@ impl<'a> Canvas<'a> {
     }
 }
 
+pub struct SettingsUiState {
+    pub open: bool,
+    pub focused_field: Option<SettingsField>,
+    pub accent_buf: String,
+    pub bg_buf: String,
+    pub cmd_buf: String,
+    pub flag_buf: String,
+}
+
+impl SettingsUiState {
+    pub fn from_config(cfg: &UserConfig, active_accent: Rgb) -> Self {
+        Self {
+            open: false,
+            focused_field: None,
+            accent_buf: format_hex_color(cfg.accent.unwrap_or(active_accent)),
+            bg_buf: format_hex_color(cfg.bg_terminal),
+            cmd_buf: format_hex_color(cfg.syntax_command),
+            flag_buf: format_hex_color(cfg.syntax_flag),
+        }
+    }
+
+    pub fn sync_from_config(&mut self, cfg: &UserConfig, active_accent: Rgb) {
+        self.accent_buf = format_hex_color(cfg.accent.unwrap_or(active_accent));
+        self.bg_buf = format_hex_color(cfg.bg_terminal);
+        self.cmd_buf = format_hex_color(cfg.syntax_command);
+        self.flag_buf = format_hex_color(cfg.syntax_flag);
+    }
+
+    pub fn field_buf(&self, field: SettingsField) -> &str {
+        match field {
+            SettingsField::AccentHex => &self.accent_buf,
+            SettingsField::BgHex => &self.bg_buf,
+            SettingsField::CmdHex => &self.cmd_buf,
+            SettingsField::FlagHex => &self.flag_buf,
+        }
+    }
+
+    pub fn field_buf_mut(&mut self, field: SettingsField) -> &mut String {
+        match field {
+            SettingsField::AccentHex => &mut self.accent_buf,
+            SettingsField::BgHex => &mut self.bg_buf,
+            SettingsField::CmdHex => &mut self.cmd_buf,
+            SettingsField::FlagHex => &mut self.flag_buf,
+        }
+    }
+}
+
+pub struct SearchUiState {
+    pub open: bool,
+    pub query: String,
+    pub matches: Vec<SearchMatch>,
+    pub active_idx: usize,
+}
+
+impl Default for SearchUiState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            query: String::new(),
+            matches: Vec::new(),
+            active_idx: 0,
+        }
+    }
+}
+
+pub struct PaletteUiState {
+    pub open: bool,
+    pub query: String,
+    pub selected: usize,
+    pub adding: bool,
+}
+
+impl Default for PaletteUiState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            query: String::new(),
+            selected: 0,
+            adding: false,
+        }
+    }
+}
+
 pub struct UiState {
     pub picker_open: bool,
     pub hovered: HitTarget,
+    pub hovered_path: Option<(usize, usize, usize)>,
+    pub hovered_path_label: Option<String>,
+    pub selection_start: Option<(usize, usize)>,
+    pub selection_end: Option<(usize, usize)>,
+    pub selecting: bool,
+    pub toast: Option<String>,
+    pub renaming_session: Option<(usize, InputBar)>,
+    pub suggestion_selected: usize,
+    pub search: SearchUiState,
+    pub palette: PaletteUiState,
+    pub settings: SettingsUiState,
 }
 
-impl Default for UiState {
-    fn default() -> Self {
+impl UiState {
+    pub fn new(cfg: &UserConfig, active_accent: Rgb) -> Self {
         Self {
             picker_open: false,
             hovered: HitTarget::None,
+            hovered_path: None,
+            hovered_path_label: None,
+            selection_start: None,
+            selection_end: None,
+            selecting: false,
+            toast: None,
+            renaming_session: None,
+            suggestion_selected: 0,
+            search: SearchUiState::default(),
+            palette: PaletteUiState::default(),
+            settings: SettingsUiState::from_config(cfg, active_accent),
         }
+    }
+
+    pub fn has_non_empty_selection(&self) -> bool {
+        matches!((self.selection_start, self.selection_end), (Some(a), Some(b)) if a != b)
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection_start = None;
+        self.selection_end = None;
+        self.selecting = false;
     }
 }
 
@@ -437,6 +898,10 @@ pub fn render_app(
     shells: &[ShellProfile],
     sessions: &SessionManager,
     ui: &UiState,
+    suggestions: &[CompletionItem],
+    ghost_suffix: Option<&str>,
+    cfg: &UserConfig,
+    snippets: &SnippetStore,
 ) {
     let mut canvas = Canvas::new(pixels, layout.width, layout.height);
     canvas.clear(theme.bg_terminal);
@@ -493,7 +958,8 @@ pub fn render_app(
             break;
         }
         let is_active = idx == sessions.active_index();
-        let is_hovered = matches!(ui.hovered, HitTarget::SessionRow(i) | HitTarget::CloseSession(i) if i == idx);
+        let is_hovered =
+            matches!(ui.hovered, HitTarget::SessionRow(i) | HitTarget::CloseSession(i) if i == idx);
         let bg = if is_active {
             theme.bg_sidebar_active
         } else if is_hovered {
@@ -519,26 +985,93 @@ pub fn render_app(
             (badge_rect.x + badge_rect.w) as i32,
         );
 
-        let title_color = if !sess.alive {
-            theme.fg_muted
-        } else if is_active {
-            theme.fg_primary
+        let is_renaming = matches!(&ui.renaming_session, Some((r_idx, _)) if *r_idx == idx);
+        if let Some((_, ref draft)) = ui
+            .renaming_session
+            .as_ref()
+            .filter(|(r_idx, _)| *r_idx == idx)
+        {
+            let edit_r = Rect::new(
+                row.x + 50,
+                row.y + 6,
+                row.w.saturating_sub(56),
+                row.h.saturating_sub(12),
+            );
+            canvas.fill_rect(edit_r, theme.bg_input);
+            canvas.stroke_rect(edit_r, user.accent);
+            let text_x = (edit_r.x + 5) as i32;
+            let text_y = (edit_r.y + 4) as i32;
+            let text_max_x = (edit_r.x + edit_r.w - 4) as i32;
+            let txt = draft.text();
+
+            // Selection highlight inside session rename box
+            if let Some((c0, c1)) = draft.selected_char_range() {
+                let pre: String = txt.chars().take(c0).collect();
+                let sel: String = txt.chars().skip(c0).take(c1 - c0).collect();
+                let sx = text_x + font.measure_text(&pre, FONT_SIZE_UI) as i32;
+                let sw = font.measure_text(&sel, FONT_SIZE_UI).max(4);
+                let clipped_w = sw.min((text_max_x - sx).max(0) as u32);
+                if clipped_w > 0 && sx >= 0 {
+                    canvas.fill_rect(
+                        Rect::new(sx as u32, edit_r.y + 3, clipped_w, edit_r.h.saturating_sub(6)),
+                        user.accent.lerp(theme.bg_input, 155),
+                    );
+                }
+            }
+
+            font.draw_text(
+                &mut canvas,
+                text_x,
+                text_y,
+                FONT_SIZE_UI,
+                theme.fg_primary,
+                txt,
+                text_max_x,
+            );
+
+            let caret_pre: String = txt.chars().take(draft.cursor_char_index()).collect();
+            let caret_x = (text_x + font.measure_text(&caret_pre, FONT_SIZE_UI) as i32)
+                .min(text_max_x - 2);
+            if caret_x >= 0 {
+                canvas.fill_rect(
+                    Rect::new(caret_x as u32, edit_r.y + 3, 2, edit_r.h.saturating_sub(6)),
+                    user.accent,
+                );
+            }
         } else {
-            theme.fg_muted.lerp(theme.fg_primary, 140)
-        };
-        font.draw_text(
-            &mut canvas,
-            (row.x + 52) as i32,
-            (row.y + 10) as i32,
-            FONT_SIZE_UI,
-            title_color,
-            &sess.title,
-            (row.x + row.w.saturating_sub(28)) as i32,
-        );
+            let title_color = if !sess.alive {
+                theme.fg_muted
+            } else if is_active {
+                theme.fg_primary
+            } else {
+                theme.fg_muted.lerp(theme.fg_primary, 140)
+            };
+            font.draw_text(
+                &mut canvas,
+                (row.x + 52) as i32,
+                (row.y + 10) as i32,
+                FONT_SIZE_UI,
+                title_color,
+                &sess.title,
+                (row.x + row.w.saturating_sub(34)) as i32,
+            );
+        }
+
+        // Background activity / exited status dot
+        if !is_renaming {
+            let dot_r = Rect::new(row.x + row.w.saturating_sub(32), row.y + 15, 6, 6);
+            if !sess.alive {
+                canvas.fill_rect(dot_r, theme.danger);
+            } else if sess.has_unread_output && !is_active {
+                canvas.fill_rect(dot_r, theme.syntax.string_literal);
+            }
+        }
 
         // Close button ('x')
         let close_r = layout.session_close_rect(idx);
-        let close_color = if ui.hovered == HitTarget::CloseSession(idx) {
+        let close_color = if is_renaming {
+            theme.bg_sidebar
+        } else if ui.hovered == HitTarget::CloseSession(idx) {
             theme.danger
         } else if is_active || is_hovered {
             theme.fg_muted
@@ -576,7 +1109,7 @@ pub fn render_app(
         (layout.new_session_btn.x + layout.new_session_btn.w - 8) as i32,
     );
 
-    // 6. Shell picker popup (when open)
+    // 7. Shell picker popup (when open)
     if ui.picker_open {
         let panel = layout.shell_picker_panel(shells.len());
         canvas.fill_rect(panel, theme.bg_header);
@@ -586,7 +1119,10 @@ pub fn render_app(
             if ui.hovered == HitTarget::PickShell(i) {
                 canvas.fill_rect(r, theme.bg_sidebar_active);
             }
-            canvas.fill_rect(Rect::new(r.x + 4, r.y + 6, 4, r.h.saturating_sub(12)), sh.accent);
+            canvas.fill_rect(
+                Rect::new(r.x + 4, r.y + 6, 4, r.h.saturating_sub(12)),
+                sh.accent,
+            );
             font.draw_text(
                 &mut canvas,
                 (r.x + 14) as i32,
@@ -599,20 +1135,87 @@ pub fn render_app(
         }
     }
 
-    // 7. Top header bar
+    // 8. Top header bar
     canvas.fill_rect(layout.header, theme.bg_header);
     canvas.fill_rect(
-        Rect::new(layout.header.x, layout.header.h.saturating_sub(1), layout.header.w, 1),
+        Rect::new(
+            layout.header.x,
+            layout.header.h.saturating_sub(1),
+            layout.header.w,
+            1,
+        ),
         theme.border,
     );
 
+    // Top-right header action buttons: [Split] [Snippets] [Settings]
+    let split_active = sessions.is_split();
+    let split_bg = if split_active || ui.hovered == HitTarget::SplitToggle {
+        theme.bg_sidebar_active
+    } else {
+        theme.bg_sidebar_hover
+    };
+    canvas.fill_rect(layout.split_btn, split_bg);
+    canvas.stroke_rect(
+        layout.split_btn,
+        if split_active { user.accent } else { theme.border },
+    );
+    font.draw_text(
+        &mut canvas,
+        (layout.split_btn.x + 10) as i32,
+        (layout.split_btn.y + 5) as i32,
+        FONT_SIZE_SMALL,
+        if split_active { user.accent } else { theme.fg_primary },
+        "Split",
+        (layout.split_btn.x + layout.split_btn.w - 4) as i32,
+    );
+
+    let snip_bg = if ui.palette.open || ui.hovered == HitTarget::SnippetsToggle {
+        theme.bg_sidebar_active
+    } else {
+        theme.bg_sidebar_hover
+    };
+    canvas.fill_rect(layout.snippets_btn, snip_bg);
+    canvas.stroke_rect(
+        layout.snippets_btn,
+        if ui.palette.open { user.accent } else { theme.border },
+    );
+    font.draw_text(
+        &mut canvas,
+        (layout.snippets_btn.x + 10) as i32,
+        (layout.snippets_btn.y + 5) as i32,
+        FONT_SIZE_SMALL,
+        if ui.palette.open { user.accent } else { theme.fg_primary },
+        "Snippets",
+        (layout.snippets_btn.x + layout.snippets_btn.w - 4) as i32,
+    );
+
+    let settings_bg = if ui.settings.open || ui.hovered == HitTarget::SettingsToggle {
+        theme.bg_sidebar_active
+    } else {
+        theme.bg_sidebar_hover
+    };
+    canvas.fill_rect(layout.settings_btn, settings_bg);
+    canvas.stroke_rect(
+        layout.settings_btn,
+        if ui.settings.open { user.accent } else { theme.border },
+    );
+    font.draw_text(
+        &mut canvas,
+        (layout.settings_btn.x + 10) as i32,
+        (layout.settings_btn.y + 5) as i32,
+        FONT_SIZE_SMALL,
+        if ui.settings.open { user.accent } else { theme.fg_primary },
+        "Settings",
+        (layout.settings_btn.x + layout.settings_btn.w - 4) as i32,
+    );
+
     if let Some(active) = sessions.active() {
-        // Accent stripe along top edge of header (user + session blend)
         canvas.fill_rect(
             Rect::new(layout.header.x, 0, layout.header.w, 2),
-            active.shell.accent,
+            user.accent,
         );
 
+        let header_max_x = (layout.passthrough_pill.x.saturating_sub(10)) as i32;
         let badge = format!("[{}]", active.shell.badge);
         let x0 = (layout.header.x + 14) as i32;
         let next_x = font.draw_text(
@@ -622,20 +1225,43 @@ pub fn render_app(
             FONT_SIZE_UI,
             active.shell.accent,
             &badge,
-            (layout.passthrough_pill.x.saturating_sub(10)) as i32,
+            header_max_x,
         );
         let status = if active.alive { "" } else { " (exited)" };
-        font.draw_text(
+        let after_title = font.draw_text(
             &mut canvas,
             next_x + 8,
             10,
             FONT_SIZE_UI,
             theme.fg_primary,
             &format!("{}{}", active.title, status),
-            (layout.passthrough_pill.x.saturating_sub(10)) as i32,
+            header_max_x,
         );
 
-        // Passthrough / Warp Input toggle pill
+        // Live CWD + Git branch context in header (0ms, no subprocess)
+        let cwd_text = abbreviate_path(&active.cwd);
+        let after_cwd = font.draw_text(
+            &mut canvas,
+            after_title + 12,
+            11,
+            FONT_SIZE_SMALL,
+            theme.syntax.path,
+            &cwd_text,
+            header_max_x,
+        );
+        if let Some(ref branch) = active.git_branch {
+            let git_pill = format!("({branch})");
+            font.draw_text(
+                &mut canvas,
+                after_cwd + 8,
+                11,
+                FONT_SIZE_SMALL,
+                theme.syntax.env_var,
+                &git_pill,
+                header_max_x,
+            );
+        }
+
         let is_pt = active.effective_passthrough();
         let pill_color = if is_pt {
             theme.syntax.flag
@@ -647,12 +1273,12 @@ pub fn render_app(
             pill_color.lerp(theme.bg_header, 200),
         );
         canvas.stroke_rect(layout.passthrough_pill, pill_color.lerp(theme.border, 100));
-        let pill_label = if active.grid.is_alt_screen() {
+        let pill_label = if active.grid.is_tui_active() {
             "TUI PASSTHROUGH"
         } else if active.input.passthrough {
             "PASSTHROUGH"
         } else {
-            "WARP INPUT"
+            "ROBY INPUT"
         };
         font.draw_text(
             &mut canvas,
@@ -664,57 +1290,57 @@ pub fn render_app(
             (layout.passthrough_pill.x + layout.passthrough_pill.w - 4) as i32,
         );
 
-        // 8. Terminal grid viewport
-        let start_x = layout.viewport.x as i32 + 8;
-        let start_y = layout.viewport.y as i32 + 6;
-        let max_x = (layout.viewport.x + layout.viewport.w) as i32;
-        let cw = font.cell_w;
-        let ch = font.cell_h;
-        let (cur_r, cur_c) = active.grid.cursor();
-
-        for row_idx in 0..active.grid.rows() {
-            let cy = start_y + (row_idx as i32) * (ch as i32);
-            if cy + ch as i32 > (layout.viewport.y + layout.viewport.h) as i32 {
-                break;
-            }
-            if let Some(cells) = active.grid.visible_row(row_idx, active.scroll_offset) {
-                for (col_idx, cell) in cells.iter().enumerate() {
-                    let cx = start_x + (col_idx as i32) * (cw as i32);
-                    if cx >= max_x {
-                        break;
-                    }
-                    let (fg, bg) = if cell.inverse {
-                        (cell.bg, cell.fg)
-                    } else {
-                        (cell.fg, cell.bg)
-                    };
-                    if bg != theme.bg_terminal {
-                        canvas.fill_rect(Rect::new(cx as u32, cy as u32, cw, ch), bg);
-                    }
-                    font.draw_cell_char(&mut canvas, cx, cy, cell.ch, fg, max_x);
-                    if cell.underline {
-                        canvas.fill_rect(
-                            Rect::new(cx as u32, (cy as u32) + ch.saturating_sub(2), cw, 1),
-                            fg,
-                        );
-                    }
-                }
-            }
-        }
-
-        // Terminal cursor (shown when at live bottom and in passthrough mode)
-        if active.scroll_offset == 0 && is_pt {
-            let cx = start_x + (cur_c as i32) * (cw as i32);
-            let cy = start_y + (cur_r as i32) * (ch as i32);
-            if cx >= 0 && cy >= 0 && (cx as u32) + cw <= layout.viewport.x + layout.viewport.w {
-                canvas.fill_rect(
-                    Rect::new(cx as u32, cy as u32 + ch.saturating_sub(3), cw, 3),
-                    user.accent,
+        // 9. Terminal grid viewport (single pane or side-by-side Split Panes)
+        if let Some((left_idx, right_idx)) = sessions.split_panes() {
+            let (left_vp, right_vp) = layout.split_viewports();
+            let active_idx = sessions.active_index();
+            if let Some(left_sess) = sessions.get(left_idx) {
+                render_session_pane(
+                    &mut canvas,
+                    layout,
+                    left_vp,
+                    left_sess,
+                    active_idx == left_idx,
+                    font,
+                    theme,
+                    user,
+                    ui,
                 );
             }
+            // Vertical split divider
+            canvas.fill_rect(
+                Rect::new(left_vp.x + left_vp.w, layout.viewport.y, 2, layout.viewport.h),
+                theme.border,
+            );
+            if let Some(right_sess) = sessions.get(right_idx) {
+                render_session_pane(
+                    &mut canvas,
+                    layout,
+                    right_vp,
+                    right_sess,
+                    active_idx == right_idx,
+                    font,
+                    theme,
+                    user,
+                    ui,
+                );
+            }
+        } else {
+            render_session_pane(
+                &mut canvas,
+                layout,
+                layout.viewport,
+                active,
+                true,
+                font,
+                theme,
+                user,
+                ui,
+            );
         }
 
-        // 9. Warp-style syntax-colored input bar
+        // 10. Warp-style syntax-colored input bar
+        let term_px = font.term_px;
         canvas.fill_rect(layout.input_bar, theme.bg_input);
         canvas.fill_rect(
             Rect::new(layout.input_bar.x, layout.input_bar.y, layout.input_bar.w, 2),
@@ -729,7 +1355,7 @@ pub fn render_app(
                 (layout.input_bar.y + 14) as i32,
                 FONT_SIZE_UI,
                 theme.fg_muted,
-                "Passthrough mode active — keystrokes go directly to the shell (Ctrl+Shift+P to return to Warp Input)",
+                "Passthrough mode active — keystrokes go directly to the shell (Ctrl+Shift+P to return to Roby-Term Input)",
                 ib_max_x,
             );
         } else {
@@ -739,7 +1365,7 @@ pub fn render_app(
                 &mut canvas,
                 (layout.input_bar.x + 14) as i32,
                 input_y,
-                FONT_SIZE_TERM,
+                term_px,
                 user.accent,
                 &prompt,
                 ib_max_x,
@@ -751,12 +1377,27 @@ pub fn render_app(
                     &mut canvas,
                     text_start_x,
                     input_y,
-                    FONT_SIZE_TERM,
+                    term_px,
                     theme.fg_muted,
                     "Type a command (flags, paths, strings & vars highlight live)...",
                     ib_max_x,
                 );
             } else {
+                // Visual selection highlight in Roby Input bar (Shift+Home/End/Arrows, Ctrl+A)
+                if let Some((c0, c1)) = active.input.selected_char_range() {
+                    let pre: String = line.chars().take(c0).collect();
+                    let sel: String = line.chars().skip(c0).take(c1 - c0).collect();
+                    let sx = text_start_x + font.measure_text(&pre, term_px) as i32;
+                    let sw = font.measure_text(&sel, term_px).max(4);
+                    let clipped_w = sw.min((ib_max_x - sx).max(0) as u32);
+                    if clipped_w > 0 && sx >= 0 {
+                        canvas.fill_rect(
+                            Rect::new(sx as u32, (input_y + 1) as u32, clipped_w, font.cell_h),
+                            user.accent.lerp(theme.bg_input, 155),
+                        );
+                    }
+                }
+
                 let mut pen_x = text_start_x;
                 for tok in active.input.tokens() {
                     let slice = &line[tok.range];
@@ -769,18 +1410,31 @@ pub fn render_app(
                         &mut canvas,
                         pen_x,
                         input_y,
-                        FONT_SIZE_TERM,
+                        term_px,
                         color,
                         slice,
                         ib_max_x,
                     );
                 }
+
+                if active.input.is_cursor_at_end() {
+                    if let Some(ghost) = ghost_suffix {
+                        font.draw_text(
+                            &mut canvas,
+                            pen_x,
+                            input_y,
+                            term_px,
+                            theme.fg_muted,
+                            ghost,
+                            ib_max_x,
+                        );
+                    }
+                }
             }
 
-            // Caret in input bar
             let prefix_chars = active.input.cursor_char_index();
             let prefix_text: String = line.chars().take(prefix_chars).collect();
-            let caret_offset = font.measure_text(&prefix_text, FONT_SIZE_TERM) as i32;
+            let caret_offset = font.measure_text(&prefix_text, term_px) as i32;
             let caret_x = (text_start_x + caret_offset).min(ib_max_x - 2);
             if caret_x >= 0 {
                 canvas.fill_rect(
@@ -789,28 +1443,857 @@ pub fn render_app(
                 );
             }
 
-            // Subtle bottom hint bar
+            let (hint, hint_color) = if let Some(ref toast) = ui.toast {
+                (toast.clone(), theme.syntax.string_literal)
+            } else if let Some(ref path_label) = ui.hovered_path_label {
+                (path_label.clone(), user.accent)
+            } else {
+                (
+                    "Enter run | Tab complete | Ctrl+F search | Ctrl+C/V copy/paste | Ctrl+, settings | Click paths & URLs"
+                        .to_string(),
+                    theme.fg_muted,
+                )
+            };
             font.draw_text(
                 &mut canvas,
                 (layout.input_bar.x + 14) as i32,
                 (layout.input_bar.y + layout.input_bar.h.saturating_sub(18)) as i32,
                 FONT_SIZE_SMALL,
-                theme.fg_muted,
-                "Enter run  |  Up/Down history  |  Ctrl+T new  |  Ctrl+W close  |  Ctrl+Tab switch  |  Ctrl+Shift+P passthrough",
+                hint_color,
+                &hint,
                 ib_max_x,
             );
+
+            // 11. Floating top-5 completions & suggestions popup (hidden when Settings modal is open)
+            if !suggestions.is_empty() && !ui.settings.open {
+                let panel = layout.suggestions_panel(suggestions.len());
+                canvas.fill_rect(panel, theme.bg_header);
+                canvas.stroke_rect(panel, user.accent.lerp(theme.border, 120));
+
+                for (i, sug) in suggestions.iter().enumerate() {
+                    let row = layout.suggestion_row(suggestions.len(), i);
+                    let is_sel = i == ui.suggestion_selected;
+                    let is_hov = ui.hovered == HitTarget::SuggestionRow(i);
+                    if is_sel {
+                        canvas.fill_rect(row, theme.bg_sidebar_active);
+                        canvas.fill_rect(Rect::new(row.x, row.y, 3, row.h), user.accent);
+                    } else if is_hov {
+                        canvas.fill_rect(row, theme.bg_sidebar_hover);
+                    }
+
+                    let meta_color = match sug.kind {
+                        CompletionKind::Directory => theme.syntax.path,
+                        CompletionKind::File => theme.syntax.string_literal,
+                        CompletionKind::Command => theme.syntax.command,
+                        CompletionKind::History => theme.fg_muted,
+                    };
+                    let meta_w = font.measure_text(&sug.meta, FONT_SIZE_SMALL);
+                    let meta_x = (row.x + row.w).saturating_sub(meta_w + 8) as i32;
+
+                    font.draw_text(
+                        &mut canvas,
+                        (row.x + 10) as i32,
+                        (row.y + 5) as i32,
+                        FONT_SIZE_UI,
+                        if is_sel {
+                            theme.fg_primary
+                        } else {
+                            theme.fg_muted.lerp(theme.fg_primary, 150)
+                        },
+                        &sug.display,
+                        meta_x - 8,
+                    );
+                    font.draw_text(
+                        &mut canvas,
+                        meta_x,
+                        (row.y + 6) as i32,
+                        FONT_SIZE_SMALL,
+                        meta_color,
+                        &sug.meta,
+                        (row.x + row.w - 4) as i32,
+                    );
+                }
+            }
         }
     } else {
         font.draw_text(
             &mut canvas,
             (layout.viewport.x + 24) as i32,
             (layout.viewport.y + 24) as i32,
-            FONT_SIZE_TERM,
+            font.term_px,
             theme.fg_muted,
             "No active sessions. Click '+ New Session' or press Ctrl+T to open a shell.",
             (layout.viewport.x + layout.viewport.w - 16) as i32,
         );
     }
+
+    // 12. Floating Search bar (Ctrl+F)
+    if ui.search.open && !ui.settings.open {
+        let r = layout.search_bar_rect();
+        canvas.fill_rect(r, theme.bg_header);
+        canvas.stroke_rect(r, user.accent);
+        let count_str = if ui.search.query.is_empty() {
+            String::new()
+        } else if ui.search.matches.is_empty() {
+            "0/0".to_string()
+        } else {
+            format!("{}/{}", ui.search.active_idx + 1, ui.search.matches.len())
+        };
+        let close_r = layout.search_close_rect();
+        let count_w = font.measure_text(&count_str, FONT_SIZE_SMALL);
+        let count_x = close_r.x.saturating_sub(count_w + 8) as i32;
+
+        let display_q = if ui.search.query.is_empty() {
+            "Find in output... (Enter/Esc)".to_string()
+        } else {
+            format!("{}|", ui.search.query)
+        };
+        font.draw_text(
+            &mut canvas,
+            (r.x + 10) as i32,
+            (r.y + 8) as i32,
+            FONT_SIZE_UI,
+            if ui.search.query.is_empty() {
+                theme.fg_muted
+            } else {
+                theme.fg_primary
+            },
+            &display_q,
+            count_x - 6,
+        );
+        if !count_str.is_empty() {
+            font.draw_text(
+                &mut canvas,
+                count_x,
+                (r.y + 9) as i32,
+                FONT_SIZE_SMALL,
+                theme.fg_muted,
+                &count_str,
+                (close_r.x - 2) as i32,
+            );
+        }
+        font.draw_text(
+            &mut canvas,
+            (close_r.x + 6) as i32,
+            (close_r.y + 3) as i32,
+            FONT_SIZE_UI,
+            if ui.hovered == HitTarget::SearchClose {
+                theme.danger
+            } else {
+                theme.fg_muted
+            },
+            "x",
+            (close_r.x + close_r.w) as i32,
+        );
+    }
+
+    // 13. Command Palette / Snippets modal (Ctrl+K)
+    if ui.palette.open && !ui.settings.open {
+        render_palette_panel(&mut canvas, layout, font, theme, user, ui, snippets);
+    }
+
+    // 14. Settings (Preferences) modal overlay
+    if ui.settings.open {
+        render_settings_panel(&mut canvas, layout, font, theme, user, ui, cfg);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_session_pane(
+    canvas: &mut Canvas<'_>,
+    layout: &Layout,
+    vp: Rect,
+    sess: &Session,
+    is_focused: bool,
+    font: &mut FontRenderer,
+    theme: &Theme,
+    user: &UserIdentity,
+    ui: &UiState,
+) {
+    if is_focused && vp.w < layout.viewport.w {
+        // Subtle focus indicator bar on top of active split pane
+        canvas.fill_rect(Rect::new(vp.x, vp.y, vp.w, 2), user.accent);
+    }
+    let start_x = vp.x as i32 + 8;
+    let start_y = vp.y as i32 + 6;
+    let max_x = (vp.x + vp.w) as i32;
+    let cw = font.cell_w;
+    let ch = font.cell_h;
+    let (cur_r, cur_c) = sess.grid.cursor();
+
+    let sel_bounds = if is_focused {
+        match (ui.selection_start, ui.selection_end) {
+            (Some(a), Some(b)) if a != b => {
+                if a <= b { Some((a, b)) } else { Some((b, a)) }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let sel_bg = user.accent.lerp(theme.bg_terminal, 170);
+    let match_bg = Rgb::new(249, 226, 175).lerp(theme.bg_terminal, 145);
+    let active_match_bg = Rgb::new(250, 179, 135);
+
+    for row_idx in 0..sess.grid.rows() {
+        let cy = start_y + (row_idx as i32) * (ch as i32);
+        if cy + ch as i32 > (vp.y + vp.h) as i32 {
+            break;
+        }
+        let abs_line = sess.grid.screen_row_to_abs_line(row_idx, sess.scroll_offset);
+
+        // Warp-style block gutter + top divider
+        if !sess.grid.is_alt_screen() {
+            if let Some((b_idx, block)) = sess.blocks.iter().enumerate().find(|(_, b)| {
+                let end = b.end_abs_line.unwrap_or(usize::MAX);
+                abs_line >= b.start_abs_line && abs_line <= end
+            }) {
+                let gutter_color = if b_idx % 2 == 0 {
+                    user.accent.lerp(theme.bg_terminal, 90)
+                } else {
+                    sess.shell.accent.lerp(theme.bg_terminal, 90)
+                };
+                canvas.fill_rect(Rect::new(vp.x + 2, cy as u32, 3, ch), gutter_color);
+                if abs_line == block.start_abs_line && row_idx > 0 {
+                    canvas.fill_rect(
+                        Rect::new(
+                            vp.x + 6,
+                            (cy as u32).saturating_sub(1),
+                            vp.w.saturating_sub(12),
+                            1,
+                        ),
+                        theme.border,
+                    );
+                }
+            }
+        }
+
+        if let Some(cells) = sess.grid.visible_row(row_idx, sess.scroll_offset) {
+            for (col_idx, cell) in cells.iter().enumerate() {
+                let cx = start_x + (col_idx as i32) * (cw as i32);
+                if cx >= max_x {
+                    break;
+                }
+                let (mut fg, mut bg) = if cell.inverse {
+                    (cell.bg, cell.fg)
+                } else {
+                    (cell.fg, cell.bg)
+                };
+
+                if let Some(((sr, sc), (er, ec))) = sel_bounds {
+                    let in_sel = if row_idx > sr && row_idx < er {
+                        true
+                    } else if row_idx == sr && row_idx == er {
+                        col_idx >= sc && col_idx <= ec
+                    } else if row_idx == sr {
+                        col_idx >= sc
+                    } else if row_idx == er {
+                        col_idx <= ec
+                    } else {
+                        false
+                    };
+                    if in_sel {
+                        bg = sel_bg;
+                    }
+                }
+
+                if is_focused && ui.search.open && !ui.search.matches.is_empty() {
+                    for (mi, m) in ui.search.matches.iter().enumerate() {
+                        if m.abs_line == abs_line && col_idx >= m.col_start && col_idx < m.col_end {
+                            if mi == ui.search.active_idx {
+                                bg = active_match_bg;
+                                fg = Rgb::new(17, 19, 26);
+                            } else {
+                                bg = match_bg;
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                let is_hovered_path = is_focused
+                    && matches!(
+                        ui.hovered_path,
+                        Some((hr, c0, c1)) if hr == row_idx && col_idx >= c0 && col_idx < c1
+                    );
+                if bg != theme.bg_terminal {
+                    canvas.fill_rect(Rect::new(cx as u32, cy as u32, cw, ch), bg);
+                }
+                let draw_fg = if is_hovered_path { user.accent } else { fg };
+                font.draw_cell_char(canvas, cx, cy, cell.ch, draw_fg, max_x);
+                if cell.underline || is_hovered_path {
+                    canvas.fill_rect(
+                        Rect::new(cx as u32, (cy as u32) + ch.saturating_sub(2), cw, 1),
+                        draw_fg,
+                    );
+                }
+            }
+        }
+
+        // Warp-style [Copy] and [Re-run] action pills on the focused pane's block start row
+        if is_focused
+            && !sess.grid.is_alt_screen()
+            && !ui.search.open
+            && !ui.settings.open
+            && !ui.palette.open
+        {
+            if let Some((b_idx, _)) = sess
+                .blocks
+                .iter()
+                .enumerate()
+                .find(|(_, b)| b.start_abs_line == abs_line)
+            {
+                let (copy_r, rerun_r) = layout.block_action_rects_in(vp, row_idx, ch);
+                if copy_r.y + copy_r.h <= vp.y + vp.h {
+                    let copy_bg = if ui.hovered == HitTarget::BlockCopy(b_idx) {
+                        theme.bg_sidebar_active
+                    } else {
+                        theme.bg_header
+                    };
+                    canvas.fill_rect(copy_r, copy_bg);
+                    canvas.stroke_rect(copy_r, theme.border);
+                    font.draw_text(
+                        canvas,
+                        (copy_r.x + 8) as i32,
+                        (copy_r.y + 2) as i32,
+                        FONT_SIZE_SMALL,
+                        theme.fg_primary,
+                        "Copy",
+                        (copy_r.x + copy_r.w - 2) as i32,
+                    );
+
+                    let rerun_bg = if ui.hovered == HitTarget::BlockRerun(b_idx) {
+                        theme.bg_sidebar_active
+                    } else {
+                        theme.bg_header
+                    };
+                    canvas.fill_rect(rerun_r, rerun_bg);
+                    canvas.stroke_rect(rerun_r, theme.border);
+                    font.draw_text(
+                        canvas,
+                        (rerun_r.x + 6) as i32,
+                        (rerun_r.y + 2) as i32,
+                        FONT_SIZE_SMALL,
+                        user.accent,
+                        "Re-run",
+                        (rerun_r.x + rerun_r.w - 2) as i32,
+                    );
+                }
+            }
+        }
+    }
+
+    if is_focused && sess.scroll_offset == 0 && sess.effective_passthrough() {
+        let cx = start_x + (cur_c as i32) * (cw as i32);
+        let cy = start_y + (cur_r as i32) * (ch as i32);
+        if cx >= 0 && cy >= 0 && (cx as u32) + cw <= vp.x + vp.w {
+            canvas.fill_rect(
+                Rect::new(cx as u32, cy as u32 + ch.saturating_sub(3), cw, 3),
+                user.accent,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_palette_panel(
+    canvas: &mut Canvas<'_>,
+    layout: &Layout,
+    font: &mut FontRenderer,
+    theme: &Theme,
+    user: &UserIdentity,
+    ui: &UiState,
+    snippets: &SnippetStore,
+) {
+    let p = layout.palette_panel();
+    let max_x = (p.x + p.w - 14) as i32;
+
+    canvas.fill_rect(p, theme.bg_header);
+    canvas.stroke_rect(p, user.accent);
+    canvas.fill_rect(Rect::new(p.x, p.y, p.w, 3), user.accent);
+
+    font.draw_text(
+        canvas,
+        (p.x + 16) as i32,
+        (p.y + 12) as i32,
+        14.5,
+        theme.fg_primary,
+        if ui.palette.adding {
+            "New Snippet (name = command)"
+        } else {
+            "Snippets & Workflows (Ctrl+K)"
+        },
+        (p.x + p.w - 124) as i32,
+    );
+
+    let add_r = layout.palette_add_rect();
+    canvas.fill_rect(
+        add_r,
+        if ui.palette.adding || ui.hovered == HitTarget::PaletteAddToggle {
+            theme.bg_sidebar_active
+        } else {
+            theme.bg_input
+        },
+    );
+    canvas.stroke_rect(add_r, if ui.palette.adding { user.accent } else { theme.border });
+    font.draw_text(
+        canvas,
+        (add_r.x + 10) as i32,
+        (add_r.y + 4) as i32,
+        FONT_SIZE_SMALL,
+        if ui.palette.adding { user.accent } else { theme.fg_primary },
+        if ui.palette.adding { "Cancel" } else { "+ New" },
+        (add_r.x + add_r.w - 4) as i32,
+    );
+
+    let close_r = layout.palette_close_rect();
+    font.draw_text(
+        canvas,
+        (close_r.x + 6) as i32,
+        (close_r.y + 3) as i32,
+        FONT_SIZE_UI,
+        if ui.hovered == HitTarget::PaletteClose {
+            theme.danger
+        } else {
+            theme.fg_muted
+        },
+        "x",
+        (close_r.x + close_r.w) as i32,
+    );
+
+    // Search / Add input box
+    let input_r = Rect::new(p.x + 14, p.y + 42, p.w.saturating_sub(28), 30);
+    canvas.fill_rect(input_r, theme.bg_input);
+    canvas.stroke_rect(input_r, user.accent);
+    let placeholder = if ui.palette.adding {
+        "e.g. build-api = cargo build --release  (Enter to save)"
+    } else {
+        "Filter snippets... (Enter insert | Shift+Enter run | Esc close)"
+    };
+    let display = if ui.palette.query.is_empty() {
+        placeholder.to_string()
+    } else {
+        format!("{}|", ui.palette.query)
+    };
+    font.draw_text(
+        canvas,
+        (input_r.x + 10) as i32,
+        (input_r.y + 7) as i32,
+        FONT_SIZE_UI,
+        if ui.palette.query.is_empty() {
+            theme.fg_muted
+        } else {
+            theme.fg_primary
+        },
+        &display,
+        (input_r.x + input_r.w - 8) as i32,
+    );
+
+    if !ui.palette.adding {
+        let filtered = snippets.filter(&ui.palette.query);
+        for (row_idx, (_, snip)) in filtered.iter().take(7).enumerate() {
+            let r = layout.palette_row_rect(row_idx);
+            if r.y + r.h > p.y + p.h - 10 {
+                break;
+            }
+            let is_sel = row_idx == ui.palette.selected;
+            let is_hov = matches!(
+                ui.hovered,
+                HitTarget::PaletteRow(i) | HitTarget::PaletteDelete(i) if i == row_idx
+            );
+            if is_sel {
+                canvas.fill_rect(r, theme.bg_sidebar_active);
+                canvas.fill_rect(Rect::new(r.x, r.y, 3, r.h), user.accent);
+            } else if is_hov {
+                canvas.fill_rect(r, theme.bg_sidebar_hover);
+            }
+
+            let del_r = layout.palette_delete_rect(row_idx);
+            let after_name = font.draw_text(
+                canvas,
+                (r.x + 10) as i32,
+                (r.y + 6) as i32,
+                FONT_SIZE_UI,
+                user.accent,
+                &snip.name,
+                (r.x + 150) as i32,
+            );
+            font.draw_text(
+                canvas,
+                (after_name + 12).max((r.x + 120) as i32),
+                (r.y + 6) as i32,
+                FONT_SIZE_SMALL,
+                theme.fg_primary,
+                &snip.command,
+                (del_r.x - 6) as i32,
+            );
+
+            if is_sel || is_hov {
+                font.draw_text(
+                    canvas,
+                    (del_r.x + 5) as i32,
+                    (del_r.y + 2) as i32,
+                    FONT_SIZE_SMALL,
+                    if ui.hovered == HitTarget::PaletteDelete(row_idx) {
+                        theme.danger
+                    } else {
+                        theme.fg_muted
+                    },
+                    "x",
+                    (del_r.x + del_r.w) as i32,
+                );
+            }
+        }
+        if filtered.is_empty() {
+            font.draw_text(
+                canvas,
+                (p.x + 20) as i32,
+                (p.y + 94) as i32,
+                FONT_SIZE_UI,
+                theme.fg_muted,
+                "No matching snippets. Click '+ New' to save one.",
+                max_x,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_settings_panel(
+    canvas: &mut Canvas<'_>,
+    layout: &Layout,
+    font: &mut FontRenderer,
+    theme: &Theme,
+    user: &UserIdentity,
+    ui: &UiState,
+    cfg: &UserConfig,
+) {
+    let p = layout.settings_panel();
+    let max_x = (p.x + p.w - 14) as i32;
+
+    canvas.fill_rect(p, theme.bg_header);
+    canvas.stroke_rect(p, user.accent);
+    canvas.fill_rect(Rect::new(p.x, p.y, p.w, 3), user.accent);
+
+    // Header
+    font.draw_text(
+        canvas,
+        (p.x + 20) as i32,
+        (p.y + 14) as i32,
+        15.5,
+        theme.fg_primary,
+        "Preferences (Settings)",
+        max_x - 36,
+    );
+
+    let close_r = layout.settings_close_rect();
+    if ui.hovered == HitTarget::SettingsClose {
+        canvas.fill_rect(close_r, theme.bg_sidebar_hover);
+    }
+    font.draw_text(
+        canvas,
+        (close_r.x + 7) as i32,
+        (close_r.y + 4) as i32,
+        FONT_SIZE_UI,
+        if ui.hovered == HitTarget::SettingsClose {
+            theme.danger
+        } else {
+            theme.fg_muted
+        },
+        "x",
+        (close_r.x + close_r.w) as i32,
+    );
+
+    // Swatches label
+    font.draw_text(
+        canvas,
+        (p.x + 20) as i32,
+        (p.y + 50) as i32,
+        FONT_SIZE_SMALL,
+        theme.fg_muted,
+        "ACCENT PRESETS (click or type any #HEX below)",
+        max_x,
+    );
+
+    for (i, (_, color)) in PRESET_ACCENTS.iter().enumerate() {
+        let r = layout.settings_swatch_rect(i);
+        if r.x + r.w > p.x + p.w - 16 {
+            break;
+        }
+        canvas.fill_rect(r, *color);
+        let is_selected = user.accent == *color;
+        if is_selected || ui.hovered == HitTarget::SettingsSwatch(i) {
+            canvas.stroke_rect(r, theme.fg_primary);
+        }
+    }
+
+    // Editable HEX fields
+    let fields = [
+        (SettingsField::AccentHex, "Accent Color", user.accent),
+        (SettingsField::BgHex, "Background", cfg.bg_terminal),
+        (SettingsField::CmdHex, "Commands", cfg.syntax_command),
+        (SettingsField::FlagHex, "Flags / Params", cfg.syntax_flag),
+    ];
+
+    for (field, label, current_color) in fields {
+        let r = layout.settings_field_rect(field);
+        let focused = ui.settings.focused_field == Some(field);
+        let buf = ui.settings.field_buf(field);
+        let valid = parse_hex_color(buf).is_some();
+
+        font.draw_text(
+            canvas,
+            (p.x + 20) as i32,
+            (r.y + 6) as i32,
+            FONT_SIZE_UI,
+            theme.fg_primary,
+            label,
+            (r.x - 8) as i32,
+        );
+
+        canvas.fill_rect(r, theme.bg_input);
+        let border_color = if focused {
+            if valid { user.accent } else { theme.danger }
+        } else {
+            theme.border
+        };
+        canvas.stroke_rect(r, border_color);
+
+        let display = if focused {
+            format!("{buf}|")
+        } else {
+            buf.to_string()
+        };
+        font.draw_text(
+            canvas,
+            (r.x + 8) as i32,
+            (r.y + 6) as i32,
+            FONT_SIZE_UI,
+            theme.fg_primary,
+            &display,
+            (r.x + r.w - 4) as i32,
+        );
+
+        // Live color preview square next to the HEX input
+        let preview = Rect::new(r.x + r.w + 10, r.y + 2, 24, r.h.saturating_sub(4));
+        canvas.fill_rect(preview, parse_hex_color(buf).unwrap_or(current_color));
+        canvas.stroke_rect(preview, theme.border);
+    }
+
+    // Divider before typography
+    canvas.fill_rect(
+        Rect::new(p.x + 20, p.y + 260, p.w.saturating_sub(40), 1),
+        theme.border,
+    );
+
+    // Font family row
+    let prev_r = layout.settings_font_prev_rect();
+    let next_r = layout.settings_font_next_rect();
+    font.draw_text(
+        canvas,
+        (p.x + 20) as i32,
+        (prev_r.y + 6) as i32,
+        FONT_SIZE_UI,
+        theme.fg_primary,
+        "Font Family",
+        (prev_r.x - 8) as i32,
+    );
+    canvas.fill_rect(
+        prev_r,
+        if ui.hovered == HitTarget::SettingsFontPrev {
+            theme.bg_sidebar_active
+        } else {
+            theme.bg_input
+        },
+    );
+    canvas.stroke_rect(prev_r, theme.border);
+    font.draw_text(
+        canvas,
+        (prev_r.x + 9) as i32,
+        (prev_r.y + 6) as i32,
+        FONT_SIZE_UI,
+        theme.fg_primary,
+        "<",
+        (prev_r.x + prev_r.w) as i32,
+    );
+
+    let font_box = Rect::new(
+        prev_r.x + prev_r.w + 6,
+        prev_r.y,
+        next_r.x.saturating_sub(prev_r.x + prev_r.w + 12),
+        prev_r.h,
+    );
+    canvas.fill_rect(font_box, theme.bg_input);
+    canvas.stroke_rect(font_box, theme.border);
+    font.draw_text(
+        canvas,
+        (font_box.x + 10) as i32,
+        (font_box.y + 6) as i32,
+        FONT_SIZE_UI,
+        theme.fg_primary,
+        &font.font_name.clone(),
+        (font_box.x + font_box.w - 6) as i32,
+    );
+
+    canvas.fill_rect(
+        next_r,
+        if ui.hovered == HitTarget::SettingsFontNext {
+            theme.bg_sidebar_active
+        } else {
+            theme.bg_input
+        },
+    );
+    canvas.stroke_rect(next_r, theme.border);
+    font.draw_text(
+        canvas,
+        (next_r.x + 9) as i32,
+        (next_r.y + 6) as i32,
+        FONT_SIZE_UI,
+        theme.fg_primary,
+        ">",
+        (next_r.x + next_r.w) as i32,
+    );
+
+    // Font size row
+    let down_r = layout.settings_size_down_rect();
+    let up_r = layout.settings_size_up_rect();
+    font.draw_text(
+        canvas,
+        (p.x + 20) as i32,
+        (down_r.y + 6) as i32,
+        FONT_SIZE_UI,
+        theme.fg_primary,
+        "Font Size",
+        (down_r.x - 8) as i32,
+    );
+    canvas.fill_rect(
+        down_r,
+        if ui.hovered == HitTarget::SettingsSizeDown {
+            theme.bg_sidebar_active
+        } else {
+            theme.bg_input
+        },
+    );
+    canvas.stroke_rect(down_r, theme.border);
+    font.draw_text(
+        canvas,
+        (down_r.x + 11) as i32,
+        (down_r.y + 6) as i32,
+        FONT_SIZE_UI,
+        theme.fg_primary,
+        "-",
+        (down_r.x + down_r.w) as i32,
+    );
+
+    font.draw_text(
+        canvas,
+        (down_r.x + down_r.w + 14) as i32,
+        (down_r.y + 6) as i32,
+        FONT_SIZE_UI,
+        theme.fg_primary,
+        &format!("{:.0} px", cfg.font_size),
+        (up_r.x - 4) as i32,
+    );
+
+    canvas.fill_rect(
+        up_r,
+        if ui.hovered == HitTarget::SettingsSizeUp {
+            theme.bg_sidebar_active
+        } else {
+            theme.bg_input
+        },
+    );
+    canvas.stroke_rect(up_r, theme.border);
+    font.draw_text(
+        canvas,
+        (up_r.x + 10) as i32,
+        (up_r.y + 6) as i32,
+        FONT_SIZE_UI,
+        theme.fg_primary,
+        "+",
+        (up_r.x + up_r.w) as i32,
+    );
+
+    // Footer: Reset button + status note
+    let reset_r = layout.settings_reset_rect();
+    canvas.fill_rect(
+        reset_r,
+        if ui.hovered == HitTarget::SettingsReset {
+            theme.bg_sidebar_active
+        } else {
+            theme.bg_input
+        },
+    );
+    canvas.stroke_rect(reset_r, theme.border);
+    font.draw_text(
+        canvas,
+        (reset_r.x + 12) as i32,
+        (reset_r.y + 5) as i32,
+        FONT_SIZE_SMALL,
+        theme.fg_primary,
+        "Reset Defaults",
+        (reset_r.x + reset_r.w - 4) as i32,
+    );
+
+    font.draw_text(
+        canvas,
+        (reset_r.x + reset_r.w + 14) as i32,
+        (reset_r.y + 6) as i32,
+        FONT_SIZE_SMALL,
+        theme.fg_muted,
+        "Auto-saved locally  |  Esc to close",
+        max_x,
+    );
+}
+
+/// Procedurally generates a crisp 32x32 RGBA app icon (`>_` inside a rounded dark frame).
+/// Zero image-decoding dependencies; used for both window taskbar icon and `.exe` resource.
+pub fn build_app_icon_rgba(accent: Rgb) -> Vec<u8> {
+    const SIZE: usize = 32;
+    let mut rgba = vec![0u8; SIZE * SIZE * 4];
+    let bg = Rgb::new(18, 21, 31);
+    let chevron = Rgb::new(137, 220, 235);
+
+    let set_px = |buf: &mut [u8], x: usize, y: usize, c: Rgb, a: u8| {
+        if x < SIZE && y < SIZE {
+            let i = (y * SIZE + x) * 4;
+            buf[i] = c.r;
+            buf[i + 1] = c.g;
+            buf[i + 2] = c.b;
+            buf[i + 3] = a;
+        }
+    };
+
+    // Rounded 32x32 card with 2px accent border
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let dx = if x < 6 { 6 - x } else if x >= SIZE - 6 { x - (SIZE - 7) } else { 0 };
+            let dy = if y < 6 { 6 - y } else if y >= SIZE - 6 { y - (SIZE - 7) } else { 0 };
+            let dist_sq = dx * dx + dy * dy;
+            if dist_sq <= 36 {
+                let is_border = x < 2 || y < 2 || x >= SIZE - 2 || y >= SIZE - 2 || dist_sq >= 22;
+                let color = if is_border { accent } else { bg };
+                set_px(&mut rgba, x, y, color, 255);
+            }
+        }
+    }
+
+    // Crisp `>` chevron (left side)
+    for step in 0..6 {
+        for thick in 0..3 {
+            set_px(&mut rgba, 7 + step + thick, 10 + step, chevron, 255);
+            set_px(&mut rgba, 7 + step + thick, 21 - step, chevron, 255);
+        }
+    }
+
+    // Crisp `_` prompt cursor bar (right side)
+    for y in 19..22 {
+        for x in 17..25 {
+            set_px(&mut rgba, x, y, accent, 255);
+        }
+    }
+
+    rgba
 }
 
 #[cfg(test)]
@@ -818,7 +2301,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_and_hit_testing_cover_sidebar_header_viewport_and_input() {
+    fn layout_and_hit_testing_cover_sidebar_settings_suggestions_and_input() {
         let layout = Layout::compute(1120, 720);
         assert_eq!(layout.sidebar.w, SIDEBAR_WIDTH);
         assert_eq!(layout.viewport.x, SIDEBAR_WIDTH);
@@ -826,14 +2309,27 @@ mod tests {
 
         let row0 = layout.session_row_rect(0);
         assert_eq!(
-            layout.hit_test(row0.x + 20, row0.y + 10, 2, 3, false),
+            layout.hit_test(row0.x + 20, row0.y + 10, 2, 3, false, 0, false),
             HitTarget::SessionRow(0)
         );
 
         let close0 = layout.session_close_rect(0);
         assert_eq!(
-            layout.hit_test(close0.x + 2, close0.y + 2, 2, 3, false),
+            layout.hit_test(close0.x + 2, close0.y + 2, 2, 3, false, 0, false),
             HitTarget::CloseSession(0)
+        );
+
+        assert_eq!(
+            layout.hit_test(
+                layout.settings_btn.x + 10,
+                layout.settings_btn.y + 10,
+                2,
+                3,
+                false,
+                0,
+                false
+            ),
+            HitTarget::SettingsToggle
         );
 
         assert_eq!(
@@ -842,6 +2338,8 @@ mod tests {
                 layout.new_session_btn.y + 10,
                 2,
                 3,
+                false,
+                0,
                 false
             ),
             HitTarget::NewSessionToggle
@@ -849,8 +2347,31 @@ mod tests {
 
         let pick1 = layout.shell_picker_row(3, 1);
         assert_eq!(
-            layout.hit_test(pick1.x + 10, pick1.y + 10, 2, 3, true),
+            layout.hit_test(pick1.x + 10, pick1.y + 10, 2, 3, true, 0, false),
             HitTarget::PickShell(1)
+        );
+
+        let sug1 = layout.suggestion_row(3, 1);
+        assert_eq!(
+            layout.hit_test(sug1.x + 10, sug1.y + 10, 2, 3, false, 3, false),
+            HitTarget::SuggestionRow(1)
+        );
+
+        // Settings modal hit targets
+        let sw0 = layout.settings_swatch_rect(0);
+        assert_eq!(
+            layout.hit_test(sw0.x + 5, sw0.y + 5, 2, 3, false, 0, true),
+            HitTarget::SettingsSwatch(0)
+        );
+        let accent_field = layout.settings_field_rect(SettingsField::AccentHex);
+        assert_eq!(
+            layout.hit_test(accent_field.x + 10, accent_field.y + 10, 2, 3, false, 0, true),
+            HitTarget::SettingsField(SettingsField::AccentHex)
+        );
+        let size_up = layout.settings_size_up_rect();
+        assert_eq!(
+            layout.hit_test(size_up.x + 5, size_up.y + 5, 2, 3, false, 0, true),
+            HitTarget::SettingsSizeUp
         );
 
         assert_eq!(
@@ -859,13 +2380,23 @@ mod tests {
                 layout.passthrough_pill.y + 5,
                 2,
                 3,
+                false,
+                0,
                 false
             ),
             HitTarget::TogglePassthrough
         );
 
         assert_eq!(
-            layout.hit_test(layout.input_bar.x + 20, layout.input_bar.y + 20, 2, 3, false),
+            layout.hit_test(
+                layout.input_bar.x + 20,
+                layout.input_bar.y + 20,
+                2,
+                3,
+                false,
+                0,
+                false
+            ),
             HitTarget::InputBar
         );
     }
