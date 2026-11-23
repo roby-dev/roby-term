@@ -879,6 +879,7 @@ impl Default for PaletteUiState {
 
 pub struct UiState {
     pub picker_open: bool,
+    pub picker_selected: usize,
     pub hovered: HitTarget,
     pub hovered_path: Option<(usize, usize, usize)>,
     pub hovered_path_label: Option<String>,
@@ -898,6 +899,7 @@ impl UiState {
     pub fn new(cfg: &UserConfig, active_accent: Rgb) -> Self {
         Self {
             picker_open: false,
+            picker_selected: 0,
             hovered: HitTarget::None,
             hovered_path: None,
             hovered_path_label: None,
@@ -1212,7 +1214,7 @@ pub fn render_app(
         canvas.stroke_rect(panel, user.accent);
         for (i, sh) in shells.iter().enumerate() {
             let r = layout.shell_picker_row(shells.len(), i);
-            if ui.hovered == HitTarget::PickShell(i) {
+            if i == ui.picker_selected || ui.hovered == HitTarget::PickShell(i) {
                 canvas.fill_rect(r, theme.bg_sidebar_active);
             }
             canvas.fill_rect(
@@ -1445,13 +1447,23 @@ pub fn render_app(
 
         let ib_max_x = (layout.input_bar.x + layout.input_bar.w - 12) as i32;
         if is_pt {
+            let (pt_msg, pt_color) = if let Some(ref toast) = ui.toast {
+                (toast.as_str(), theme.syntax.string_literal)
+            } else if let Some(ref link_label) = ui.hovered_path_label {
+                (link_label.as_str(), user.accent)
+            } else {
+                (
+                    "Passthrough mode active — drag to copy | Click paths & URLs | Ctrl+Shift+P to return to Roby-Term Input",
+                    theme.fg_muted,
+                )
+            };
             font.draw_text(
                 &mut canvas,
                 (layout.input_bar.x + 14) as i32,
-                (layout.input_bar.y + 14) as i32,
+                (layout.input_bar.y + 18) as i32,
                 FONT_SIZE_UI,
-                theme.fg_muted,
-                "Passthrough mode active — keystrokes go directly to the shell (Ctrl+Shift+P to return to Roby-Term Input)",
+                pt_color,
+                pt_msg,
                 ib_max_x,
             );
         } else {
