@@ -2,7 +2,11 @@
 name = "my-warp"
 version = "0.1.0"
 edition = "2021"
-description = "Ultra-low-RAM cross-platform (Windows & macOS) Rust terminal with session sidebar, user color themes, and Warp-style syntax-colored input bar"
+description = "Roby-Term: ultra-low-RAM cross-platform (Windows & macOS) Rust terminal with session sidebar, user color themes, and syntax-colored input bar"
+
+[[bin]]
+name = "roby-term"
+path = "src/main.rs"
 
 [dependencies]
 # Cross-platform windowing & native 2D framebuffer (no GPU driver / WebView bloat)

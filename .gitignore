@@ -1,5 +1,29 @@
-/target
+# Rust build artifacts
+/target/
 **/*.rs.bk
 *.pdb
+
+# Binaries & native libraries
+*.exe
+*.dll
+*.so
+*.dylib
+*.res
+
+# OS generated files
 .DS_Store
+.AppleDouble
+.LSOverride
 Thumbs.db
+Desktop.ini
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local environment & secrets
+.env
+.env.*

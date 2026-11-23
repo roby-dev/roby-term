@@ -1,6 +1,13 @@
+pub mod builtin;
+pub mod clipboard;
+pub mod complete;
+pub mod config;
+pub mod history;
 pub mod input;
 pub mod session;
 pub mod shell;
+pub mod snippets;
 pub mod terminal;
 pub mod theme;
 pub mod ui;
+pub mod workspace;
