@@ -9,6 +9,7 @@ use crate::shell::ShellProfile;
 use crate::snippets::SnippetStore;
 use crate::terminal::SearchMatch;
 use crate::theme::{Rgb, Theme, UserIdentity};
+use crate::updater::{UpdateStatus, CURRENT_VERSION};
 use fontdue::{Font, FontSettings, Metrics};
 use std::collections::HashMap;
 use std::path::Path;
@@ -132,6 +133,8 @@ pub enum HitTarget {
     SettingsPluginClaude,
     SettingsPluginCodex,
     SettingsReset,
+    SettingsCheckUpdate,
+    UpdateAction,
     UsageCardRefresh,
     TerminalViewport,
     InputBar,
@@ -369,6 +372,22 @@ impl Layout {
         Rect::new(p.x + 20, p.y + p.h.saturating_sub(36), 132, 26)
     }
 
+    pub fn settings_update_rect(&self) -> Rect {
+        let reset = self.settings_reset_rect();
+        Rect::new(reset.x + reset.w + 10, reset.y, 146, reset.h)
+    }
+
+    /// Floating header pill positioned to the left of `passthrough_pill` when an update is ready.
+    pub fn update_pill_rect(&self) -> Rect {
+        let w = 118;
+        Rect::new(
+            self.passthrough_pill.x.saturating_sub(w + 6),
+            self.passthrough_pill.y,
+            w,
+            self.passthrough_pill.h,
+        )
+    }
+
     /// Returns `(agy, claude, codex)` checkbox rects inside the Settings modal.
     pub fn settings_plugin_rects(&self) -> (Rect, Rect, Rect) {
         let p = self.settings_panel();
@@ -575,6 +594,9 @@ impl Layout {
                 }
                 if self.settings_reset_rect().contains(px, py) {
                     return HitTarget::SettingsReset;
+                }
+                if self.settings_update_rect().contains(px, py) {
+                    return HitTarget::SettingsCheckUpdate;
                 }
                 return HitTarget::None;
             }
@@ -1028,6 +1050,7 @@ pub struct UiState {
     pub history_modal: HistoryModalUiState,
     pub ports: PortsUiState,
     pub settings: SettingsUiState,
+    pub update_status: UpdateStatus,
 }
 
 impl UiState {
@@ -1051,6 +1074,7 @@ impl UiState {
             history_modal: HistoryModalUiState::default(),
             ports: PortsUiState::default(),
             settings: SettingsUiState::from_config(cfg, active_accent),
+            update_status: UpdateStatus::Idle,
         }
     }
 
@@ -1496,7 +1520,12 @@ pub fn render_app(
             user.accent,
         );
 
-        let header_max_x = (layout.passthrough_pill.x.saturating_sub(10)) as i32;
+        let right_edge_x = if ui.update_status.shows_header_pill() {
+            layout.update_pill_rect().x
+        } else {
+            layout.passthrough_pill.x
+        };
+        let header_max_x = (right_edge_x.saturating_sub(10)) as i32;
         let badge = format!("[{}]", active.shell.badge);
         let x0 = (layout.header.x + 14) as i32;
         let next_x = font.draw_text(
@@ -1540,6 +1569,41 @@ pub fn render_app(
                 theme.syntax.env_var,
                 &git_pill,
                 header_max_x,
+            );
+        }
+
+        if ui.update_status.shows_header_pill() {
+            let upd_r = layout.update_pill_rect();
+            let (upd_color, upd_label) = match &ui.update_status {
+                UpdateStatus::Available(info) => (
+                    theme.syntax.string_literal,
+                    format!("Update v{}", info.version),
+                ),
+                UpdateStatus::Downloading(_) => (user.accent, "Updating...".to_string()),
+                UpdateStatus::ReadyToRestart { version, .. } => (
+                    theme.syntax.string_literal,
+                    format!("Restart v{version}"),
+                ),
+                UpdateStatus::Error {
+                    from_install: true, ..
+                } => (theme.danger, "Open Releases".to_string()),
+                _ => (theme.fg_muted, String::new()),
+            };
+            let upd_bg = if ui.hovered == HitTarget::UpdateAction {
+                upd_color.lerp(theme.bg_header, 145)
+            } else {
+                upd_color.lerp(theme.bg_header, 195)
+            };
+            canvas.fill_rect(upd_r, upd_bg);
+            canvas.stroke_rect(upd_r, upd_color);
+            font.draw_text(
+                &mut canvas,
+                (upd_r.x + 8) as i32,
+                (upd_r.y + 5) as i32,
+                FONT_SIZE_SMALL,
+                upd_color,
+                &upd_label,
+                (upd_r.x + upd_r.w - 4) as i32,
             );
         }
 
@@ -2655,13 +2719,63 @@ fn render_settings_panel(
         (reset_r.x + reset_r.w - 4) as i32,
     );
 
+    let upd_r = layout.settings_update_rect();
+    let (upd_btn_label, upd_btn_color) = match &ui.update_status {
+        UpdateStatus::Checking => ("Checking...".to_string(), theme.fg_muted),
+        UpdateStatus::Available(info) => (
+            format!("Update v{}", info.version),
+            theme.syntax.string_literal,
+        ),
+        UpdateStatus::Downloading(_) => ("Downloading...".to_string(), user.accent),
+        UpdateStatus::ReadyToRestart { version, .. } => (
+            format!("Restart v{version}"),
+            theme.syntax.string_literal,
+        ),
+        UpdateStatus::UpToDate => ("Up to date".to_string(), theme.fg_muted),
+        UpdateStatus::Error {
+            from_install: true, ..
+        } => ("Open Releases".to_string(), theme.danger),
+        UpdateStatus::Error {
+            from_install: false, ..
+        } => ("Retry Update".to_string(), theme.danger),
+        UpdateStatus::Idle => ("Check Updates".to_string(), theme.fg_primary),
+    };
+    canvas.fill_rect(
+        upd_r,
+        if ui.hovered == HitTarget::SettingsCheckUpdate {
+            theme.bg_sidebar_active
+        } else {
+            theme.bg_input
+        },
+    );
+    canvas.stroke_rect(
+        upd_r,
+        if matches!(
+            ui.update_status,
+            UpdateStatus::Available(_) | UpdateStatus::ReadyToRestart { .. }
+        ) {
+            theme.syntax.string_literal
+        } else {
+            theme.border
+        },
+    );
     font.draw_text(
         canvas,
-        (reset_r.x + reset_r.w + 14) as i32,
-        (reset_r.y + 6) as i32,
+        (upd_r.x + 12) as i32,
+        (upd_r.y + 5) as i32,
+        FONT_SIZE_SMALL,
+        upd_btn_color,
+        &upd_btn_label,
+        (upd_r.x + upd_r.w - 4) as i32,
+    );
+
+    font.draw_text(
+        canvas,
+        (upd_r.x + upd_r.w + 12) as i32,
+        (upd_r.y + 6) as i32,
         FONT_SIZE_SMALL,
         theme.fg_muted,
-        "Auto-saved locally  |  Esc to close",
+        &format!("v{CURRENT_VERSION}  |  Esc to close"),
         max_x,
     );
 }
@@ -3078,6 +3192,13 @@ mod tests {
             layout.hit_test(size_up.x + 5, size_up.y + 5, 2, 3, false, 0, true),
             HitTarget::SettingsSizeUp
         );
+        let check_upd = layout.settings_update_rect();
+        assert_eq!(
+            layout.hit_test(check_upd.x + 5, check_upd.y + 5, 2, 3, false, 0, true),
+            HitTarget::SettingsCheckUpdate
+        );
+        let upd_pill = layout.update_pill_rect();
+        assert!(upd_pill.x + upd_pill.w < layout.passthrough_pill.x);
 
         assert_eq!(
             layout.hit_test(
