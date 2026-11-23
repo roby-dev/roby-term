@@ -22,6 +22,10 @@ use my_warp::ui::{
     build_app_icon_rgba, discover_system_mono_fonts, render_app, FontRenderer, HitTarget, Layout,
     Rect, SettingsField, SystemFont, UiState,
 };
+use my_warp::updater::{
+    check_latest_release, cleanup_old_binary, download_and_install_update, relaunch_exe,
+    ReleaseInfo, UpdateStatus, CURRENT_VERSION, RELEASES_PAGE_URL,
+};
 use my_warp::workspace::{default_workspace_dir, load_workspace, save_workspace};
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
@@ -58,6 +62,9 @@ struct App {
     agent_usage: AgentUsage,
     usage_rx: Option<Receiver<AgentUsage>>,
     ports_rx: Option<Receiver<Vec<ListeningPort>>>,
+    update_check_rx: Option<Receiver<Result<Option<ReleaseInfo>, String>>>,
+    update_check_manual: bool,
+    update_install_rx: Option<Receiver<Result<(String, std::path::PathBuf), String>>>,
     last_usage_refresh: Instant,
     ui: UiState,
     layout: Layout,
@@ -69,6 +76,7 @@ struct App {
 
 impl App {
     fn new(proxy: EventLoopProxy<()>) -> Result<Self, String> {
+        cleanup_old_binary();
         let config = UserConfig::load_default();
         let available_fonts = discover_system_mono_fonts();
         let font = FontRenderer::load_with_config(
@@ -130,6 +138,9 @@ impl App {
             agent_usage: AgentUsage::default(),
             usage_rx: None,
             ports_rx: None,
+            update_check_rx: None,
+            update_check_manual: false,
+            update_install_rx: None,
             last_usage_refresh: Instant::now(),
             ui,
             layout,
@@ -139,6 +150,7 @@ impl App {
             last_session_click: None,
         };
         app.refresh_plugins_async();
+        app.check_updates_async(false);
         Ok(app)
     }
 
@@ -213,6 +225,202 @@ impl App {
             }
         }
         false
+    }
+
+    fn check_updates_async(&mut self, manual: bool) {
+        if self.update_install_rx.is_some() {
+            return;
+        }
+        if self.update_check_rx.is_some() {
+            if manual {
+                self.update_check_manual = true;
+                self.ui.update_status = UpdateStatus::Checking;
+            }
+            return;
+        }
+        self.update_check_manual = manual;
+        if manual {
+            self.ui.update_status = UpdateStatus::Checking;
+        }
+        let (tx, rx) = mpsc::channel();
+        let wake = self.proxy.clone();
+        match thread::Builder::new()
+            .name("update-check".into())
+            .spawn(move || {
+                let res = check_latest_release();
+                let _ = tx.send(res);
+                let _ = wake.send_event(());
+            }) {
+            Ok(_) => self.update_check_rx = Some(rx),
+            Err(e) => {
+                if manual {
+                    self.ui.update_status = UpdateStatus::Error {
+                        message: format!("failed to start update check: {e}"),
+                        from_install: false,
+                    };
+                    self.ui.toast = Some(format!("Update check failed: {e}"));
+                } else {
+                    self.ui.update_status = UpdateStatus::Idle;
+                }
+            }
+        }
+    }
+
+    fn install_update_async(&mut self, info: ReleaseInfo) {
+        if self.update_install_rx.is_some() {
+            return;
+        }
+        self.ui.update_status = UpdateStatus::Downloading(info.version.clone());
+        self.ui.toast = Some(format!("Downloading Roby-Term v{}...", info.version));
+        let (tx, rx) = mpsc::channel();
+        let wake = self.proxy.clone();
+        match thread::Builder::new()
+            .name("update-install".into())
+            .spawn(move || {
+                let res = download_and_install_update(&info);
+                let _ = tx.send(res);
+                let _ = wake.send_event(());
+            }) {
+            Ok(_) => self.update_install_rx = Some(rx),
+            Err(e) => {
+                self.ui.update_status = UpdateStatus::Error {
+                    message: format!("failed to start updater: {e}"),
+                    from_install: true,
+                };
+                self.ui.toast = Some(format!(
+                    "Auto-update failed ({e}). Click to open Releases."
+                ));
+            }
+        }
+    }
+
+    fn handle_update_click(&mut self) {
+        match self.ui.update_status.clone() {
+            UpdateStatus::Available(info) => {
+                self.install_update_async(info);
+            }
+            UpdateStatus::ReadyToRestart { version, exe_path } => {
+                if let Some(dir) = default_workspace_dir() {
+                    let _ = save_workspace(&dir, &self.sessions.to_snapshot());
+                }
+                if relaunch_exe(&exe_path).is_ok() {
+                    std::process::exit(0);
+                } else {
+                    self.ui.toast = Some(format!(
+                        "Updated to v{version} — please close and reopen Roby-Term."
+                    ));
+                }
+            }
+            UpdateStatus::Checking | UpdateStatus::Downloading(_) => {}
+            UpdateStatus::Error { from_install, .. } => {
+                if from_install {
+                    let _ = open_url_in_browser(RELEASES_PAGE_URL);
+                    self.ui.update_status = UpdateStatus::Idle;
+                } else {
+                    self.check_updates_async(true);
+                }
+            }
+            UpdateStatus::Idle | UpdateStatus::UpToDate => {
+                self.check_updates_async(true);
+            }
+        }
+    }
+
+    fn poll_updates(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(ref rx) = self.update_check_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    let manual = self.update_check_manual;
+                    self.update_check_rx = None;
+                    self.update_check_manual = false;
+                    changed = true;
+                    match res {
+                        Ok(Some(info)) => {
+                            let ver = info.version.clone();
+                            self.ui.update_status = UpdateStatus::Available(info);
+                            if manual {
+                                self.ui.toast = Some(format!("New version v{ver} available!"));
+                            }
+                        }
+                        Ok(None) => {
+                            self.ui.update_status = UpdateStatus::UpToDate;
+                            if manual {
+                                self.ui.toast =
+                                    Some(format!("You are up to date (v{CURRENT_VERSION})!"));
+                            }
+                        }
+                        Err(e) => {
+                            if manual {
+                                self.ui.update_status = UpdateStatus::Error {
+                                    message: e.clone(),
+                                    from_install: false,
+                                };
+                                self.ui.toast = Some(format!("Update check failed: {e}"));
+                            } else {
+                                self.ui.update_status = UpdateStatus::Idle;
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let manual = self.update_check_manual;
+                    self.update_check_rx = None;
+                    self.update_check_manual = false;
+                    changed = true;
+                    if manual {
+                        self.ui.update_status = UpdateStatus::Error {
+                            message: "update check interrupted".to_string(),
+                            from_install: false,
+                        };
+                        self.ui.toast = Some("Update check failed: interrupted".to_string());
+                    } else {
+                        self.ui.update_status = UpdateStatus::Idle;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(ref rx) = self.update_install_rx {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.update_install_rx = None;
+                    changed = true;
+                    match res {
+                        Ok((ver, exe_path)) => {
+                            self.ui.update_status = UpdateStatus::ReadyToRestart {
+                                version: ver.clone(),
+                                exe_path,
+                            };
+                            self.ui.toast = Some(format!(
+                                "Updated to v{ver}! Click 'Restart v{ver}' to apply."
+                            ));
+                        }
+                        Err(e) => {
+                            self.ui.update_status = UpdateStatus::Error {
+                                message: e.clone(),
+                                from_install: true,
+                            };
+                            self.ui.toast = Some(format!(
+                                "Auto-update failed ({e}). Click to open Releases."
+                            ));
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.update_install_rx = None;
+                    changed = true;
+                    self.ui.update_status = UpdateStatus::Error {
+                        message: "update worker exited unexpectedly".to_string(),
+                        from_install: true,
+                    };
+                    self.ui.toast =
+                        Some("Auto-update failed. Click to open Releases.".to_string());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        changed
     }
 
     fn handle_dropped_file(&mut self, raw_path: std::path::PathBuf) {
@@ -392,6 +600,17 @@ impl App {
                     }
                 }
             }
+        }
+
+        if !self.ui.settings.open
+            && !self.ui.picker_open
+            && !self.ui.palette.open
+            && !self.ui.history_modal.open
+            && !self.ui.ports.open
+            && self.ui.update_status.shows_header_pill()
+            && self.layout.update_pill_rect().contains(px, py)
+        {
+            return HitTarget::UpdateAction;
         }
 
         if !self.ui.settings.open && !self.ui.picker_open && self.layout.sidebar.w > 0 {
@@ -958,6 +1177,9 @@ impl App {
                 if was_split && !self.sessions.is_split() {
                     self.resize_sessions_for_current_layout();
                 }
+            }
+            HitTarget::UpdateAction | HitTarget::SettingsCheckUpdate => {
+                self.handle_update_click();
             }
             HitTarget::TogglePassthrough => {
                 self.ui.picker_open = false;
@@ -1991,6 +2213,7 @@ impl App {
         self.sessions.poll_all();
         self.poll_plugin_usage();
         self.poll_ports();
+        self.poll_updates();
         let (suggestions, ghost_suffix) = self.current_suggestions();
         if !suggestions.is_empty() && self.ui.suggestion_selected >= suggestions.len() {
             self.ui.suggestion_selected = 0;
@@ -2061,7 +2284,8 @@ impl ApplicationHandler<()> for App {
         let sess_changed = self.sessions.poll_all();
         let plugin_changed = self.poll_plugin_usage();
         let ports_changed = self.poll_ports();
-        if sess_changed || plugin_changed || ports_changed {
+        let updates_changed = self.poll_updates();
+        if sess_changed || plugin_changed || ports_changed || updates_changed {
             if sess_changed && self.ui.search.open {
                 self.refresh_search();
             }

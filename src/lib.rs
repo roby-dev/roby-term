@@ -12,4 +12,5 @@ pub mod snippets;
 pub mod terminal;
 pub mod theme;
 pub mod ui;
+pub mod updater;
 pub mod workspace;

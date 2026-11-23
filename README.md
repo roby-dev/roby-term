@@ -36,6 +36,7 @@ Ultra-low-RAM, cross-platform (Windows & macOS) Rust terminal emulator with a cu
 - **Warp-Style Command Blocks & Execution Timer**: visually separates each executed command with an accent gutter, elapsed duration badge (`42ms`, `11.4s`, `2m 05s`), and inline **`Copy`** / **`Re-run`** buttons.
 - **Scrollback Search (`Ctrl+F`)**: case-insensitive search across scrollback and viewport with match counter and jump navigation (`Enter` / `Shift+Enter`).
 - **Clickable Paths & URLs**: hover and click any existing file/directory path (e.g., `D:\wauth`, `src/main.rs:42`) to open it in Explorer/Finder, or any `http://` / `https://` URL to open it in your browser.
+- **Automatic Update Detection & 1-Click Self-Updater**: checks GitHub Releases asynchronously on startup (zero extra crates), shows a header `Update vX.Y.Z` pill when a newer release exists, downloads & verifies the platform binary (`MZ` / Mach-O header check), swaps it safely in place, and relaunches with your workspace intact (also manually triggerable from **Settings**).
 - **Automatic TUI Passthrough**: detects alternate-screen apps (`vim`, `htop`, etc.) and forwards keystrokes directly to the PTY (also toggleable manually via `Ctrl+Shift+P` or clicking the header pill).
 
 ## Shortcuts
