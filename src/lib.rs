@@ -5,6 +5,7 @@ pub mod config;
 pub mod history;
 pub mod input;
 pub mod plugins;
+pub mod ports;
 pub mod session;
 pub mod shell;
 pub mod snippets;
