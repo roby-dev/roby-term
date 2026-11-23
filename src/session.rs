@@ -1,5 +1,5 @@
 use crate::builtin::try_run_builtin;
-use crate::complete::{detect_git_branch, maybe_update_cwd};
+use crate::complete::{detect_git_branch, maybe_update_cwd, strip_verbatim_prefix};
 use crate::input::InputBar;
 use crate::shell::{default_shell, ShellProfile};
 use crate::terminal::TerminalGrid;
@@ -83,8 +83,9 @@ impl Session {
             .map_err(|e| format!("openpty failed: {e}"))?;
 
         let cwd = initial_cwd
+            .map(strip_verbatim_prefix)
             .filter(|p| p.is_dir())
-            .or_else(|| std::env::current_dir().ok())
+            .or_else(|| std::env::current_dir().ok().map(strip_verbatim_prefix))
             .unwrap_or_else(|| PathBuf::from("."));
 
         let mut cmd = CommandBuilder::new(&shell.program);

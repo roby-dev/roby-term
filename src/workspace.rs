@@ -1,3 +1,4 @@
+use crate::complete::strip_verbatim_prefix;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -125,7 +126,7 @@ pub fn load_workspace(dir: &Path) -> Option<WorkspaceSnapshot> {
                 let id = parts[0].parse::<usize>().unwrap_or(sessions.len() + 1);
                 let title = parts[1].to_string();
                 let shell_program = parts[2].to_string();
-                let cwd = PathBuf::from(parts[3]);
+                let cwd = strip_verbatim_prefix(PathBuf::from(parts[3]));
                 let transcript = fs::read_to_string(dir.join(parts[4])).unwrap_or_default();
                 sessions.push(SavedSession {
                     id,
