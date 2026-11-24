@@ -87,6 +87,7 @@ mod win32 {
     extern "system" {
         pub fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
         pub fn GlobalLock(hmem: *mut c_void) -> *mut c_void;
+        pub fn GlobalSize(hmem: *mut c_void) -> usize;
         pub fn GlobalUnlock(hmem: *mut c_void) -> i32;
         pub fn GlobalFree(hmem: *mut c_void) -> *mut c_void;
     }
@@ -95,7 +96,8 @@ mod win32 {
 #[cfg(target_os = "windows")]
 fn win32_set_clipboard(text: &str) -> bool {
     use std::ptr;
-    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let clean: String = text.chars().filter(|&c| c != '\0').collect();
+    let utf16: Vec<u16> = clean.encode_utf16().chain(std::iter::once(0)).collect();
     let byte_len = utf16.len() * std::mem::size_of::<u16>();
 
     unsafe {
@@ -144,8 +146,9 @@ fn win32_get_clipboard() -> Option<String> {
             win32::CloseClipboard();
             return None;
         }
+        let max_units = win32::GlobalSize(hmem) / std::mem::size_of::<u16>();
         let mut len = 0usize;
-        while *src.add(len) != 0 {
+        while len < max_units && *src.add(len) != 0 {
             len += 1;
         }
         let slice = std::slice::from_raw_parts(src, len);

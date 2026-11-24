@@ -187,7 +187,9 @@ impl UserConfig {
                 }
                 "font_size" => {
                     if let Ok(sz) = val.parse::<f32>() {
-                        cfg.font_size = sz.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+                        if sz.is_finite() {
+                            cfg.font_size = sz.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+                        }
                     }
                 }
                 "plugin_agy" => cfg.plugin_agy = val.eq_ignore_ascii_case("true"),
@@ -315,6 +317,20 @@ mod tests {
         assert_eq!(reloaded.bg_terminal, Rgb::new(12, 14, 20));
         assert_eq!(reloaded.font_name.as_deref(), Some("Consolas"));
         assert_eq!(reloaded.font_size, 17.0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignores_non_finite_font_size_in_config() {
+        let dir = std::env::temp_dir().join("my_warp_cfg_nan_test");
+        let path = dir.join("config.ini");
+        let _ = fs::create_dir_all(&dir);
+        fs::write(&path, "font_size=NaN\n").expect("write nan config");
+
+        let cfg = UserConfig::load_from_path(path.clone());
+        assert!(cfg.font_size.is_finite());
+        assert_eq!(cfg.font_size, DEFAULT_FONT_SIZE);
 
         let _ = fs::remove_dir_all(&dir);
     }

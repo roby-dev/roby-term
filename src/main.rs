@@ -181,21 +181,31 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let wake = self.proxy.clone();
         self.usage_rx = Some(rx);
-        let _ = thread::Builder::new()
+        if thread::Builder::new()
             .name("plugin-usage".into())
             .spawn(move || {
                 let usage = collect_today_usage(a, c, x);
                 let _ = tx.send(usage);
                 let _ = wake.send_event(());
-            });
+            })
+            .is_err()
+        {
+            self.usage_rx = None;
+        }
     }
 
     fn poll_plugin_usage(&mut self) -> bool {
         if let Some(ref rx) = self.usage_rx {
-            if let Ok(usage) = rx.try_recv() {
-                self.agent_usage = usage;
-                self.usage_rx = None;
-                return true;
+            match rx.try_recv() {
+                Ok(usage) => {
+                    self.agent_usage = usage;
+                    self.usage_rx = None;
+                    return true;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.usage_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
         if self.enabled_plugin_count() > 0
@@ -212,22 +222,35 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let wake = self.proxy.clone();
         self.ports_rx = Some(rx);
-        let _ = thread::Builder::new()
+        if thread::Builder::new()
             .name("ports-scan".into())
             .spawn(move || {
                 let list = list_listening_ports();
                 let _ = tx.send(list);
                 let _ = wake.send_event(());
-            });
+            })
+            .is_err()
+        {
+            self.ports_rx = None;
+            self.ui.ports.loading = false;
+        }
     }
 
     fn poll_ports(&mut self) -> bool {
         if let Some(ref rx) = self.ports_rx {
-            if let Ok(list) = rx.try_recv() {
-                self.ui.ports.ports = list;
-                self.ui.ports.loading = false;
-                self.ports_rx = None;
-                return true;
+            match rx.try_recv() {
+                Ok(list) => {
+                    self.ui.ports.ports = list;
+                    self.ui.ports.loading = false;
+                    self.ports_rx = None;
+                    return true;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.ui.ports.loading = false;
+                    self.ports_rx = None;
+                    return true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
         false
@@ -310,6 +333,7 @@ impl App {
                     let _ = save_workspace(&dir, &self.sessions.to_snapshot());
                 }
                 if relaunch_exe(&exe_path).is_ok() {
+                    self.sessions.close_all();
                     std::process::exit(0);
                 } else {
                     self.ui.toast = Some(format!(
@@ -320,7 +344,7 @@ impl App {
             UpdateStatus::Checking | UpdateStatus::Downloading(_) => {}
             UpdateStatus::Error { from_install, .. } => {
                 if from_install {
-                    let _ = open_url_in_browser(RELEASES_PAGE_URL);
+                    open_url_in_browser(RELEASES_PAGE_URL);
                     self.ui.update_status = UpdateStatus::Idle;
                 } else {
                     self.check_updates_async(true);
@@ -579,6 +603,8 @@ impl App {
         if !self.ui.settings.open
             && !self.ui.search.open
             && !self.ui.palette.open
+            && !self.ui.history_modal.open
+            && !self.ui.ports.open
             && active_vp.contains(px, py)
         {
             if let Some(sess) = self.sessions.active() {
@@ -982,6 +1008,7 @@ impl App {
                 self.ui.settings.open = false;
                 self.ui.palette.open = false;
                 self.ui.search.open = false;
+                self.ui.history_modal.open = false;
                 self.ui.ports.open = !self.ui.ports.open;
                 if self.ui.ports.open {
                     self.refresh_ports_async();
@@ -1041,6 +1068,8 @@ impl App {
                 self.ui.picker_open = false;
                 self.ui.settings.open = false;
                 self.ui.search.open = false;
+                self.ui.history_modal.open = false;
+                self.ui.ports.open = false;
                 self.ui.palette.open = !self.ui.palette.open;
                 self.ui.palette.adding = false;
                 self.ui.palette.query.clear();
@@ -1094,6 +1123,8 @@ impl App {
                 self.ui.picker_open = false;
                 self.ui.search.open = false;
                 self.ui.palette.open = false;
+                self.ui.history_modal.open = false;
+                self.ui.ports.open = false;
                 self.ui.settings.open = !self.ui.settings.open;
                 self.ui.settings.focused_field = None;
                 if self.ui.settings.open {
@@ -1200,6 +1231,7 @@ impl App {
             }
             HitTarget::CloseSession(idx) => {
                 self.ui.picker_open = false;
+                self.ui.renaming_session = None;
                 self.ui.suggestion_selected = 0;
                 self.ui.clear_selection();
                 let was_split = self.sessions.is_split();
@@ -1282,14 +1314,7 @@ impl App {
     }
 
     fn primary_modifier(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            self.modifiers.super_key() || self.modifiers.control_key()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.modifiers.control_key()
-        }
+        primary_modifier_for_state(self.modifiers)
     }
 
     fn allows_text_input(&self) -> bool {
@@ -1598,6 +1623,8 @@ impl App {
                     self.ui.picker_open = false;
                     self.ui.search.open = false;
                     self.ui.palette.open = false;
+                    self.ui.history_modal.open = false;
+                    self.ui.ports.open = false;
                     self.ui.settings.open = !self.ui.settings.open;
                     self.ui.settings.focused_field = None;
                     if self.ui.settings.open {
@@ -1636,6 +1663,8 @@ impl App {
                 {
                     self.ui.picker_open = false;
                     self.ui.search.open = false;
+                    self.ui.history_modal.open = false;
+                    self.ui.ports.open = false;
                     self.ui.palette.open = !self.ui.palette.open;
                     self.ui.palette.adding = false;
                     self.ui.palette.query.clear();
@@ -1649,6 +1678,8 @@ impl App {
                     && !self.ui.palette.open
                 {
                     self.ui.picker_open = false;
+                    self.ui.history_modal.open = false;
+                    self.ui.ports.open = false;
                     self.ui.search.open = !self.ui.search.open;
                     if self.ui.search.open {
                         self.refresh_search();
@@ -1662,6 +1693,7 @@ impl App {
                     self.ui.picker_open = false;
                     self.ui.palette.open = false;
                     self.ui.search.open = false;
+                    self.ui.history_modal.open = false;
                     self.ui.ports.open = !self.ui.ports.open;
                     if self.ui.ports.open {
                         self.refresh_ports_async();
@@ -1754,11 +1786,7 @@ impl App {
                     }
                     Key::Character(s) if s.eq_ignore_ascii_case("v") => {
                         if let Some(clip) = paste_text() {
-                            let clean: String = clip
-                                .replace(['\r', '\n'], " ")
-                                .chars()
-                                .take(32usize.saturating_sub(draft.text().chars().count()))
-                                .collect();
+                            let clean = sanitize_rename_paste(&clip, &draft);
                             draft.insert_str(&clean);
                         }
                         self.ui.renaming_session = Some((idx, draft));
@@ -1843,15 +1871,20 @@ impl App {
             }
         }
 
-        // F2 starts inline rename of active session
+        // F2 starts inline rename of active session (auto-expanding sidebar so it's visible)
         if matches!(event.logical_key, Key::Named(NamedKey::F2)) {
-            let idx = self.sessions.active_index();
-            if let Some(title) = self.sessions.get(idx).map(|s| s.title.clone()) {
-                let mut edit = InputBar::new();
-                edit.set_text(title);
-                self.ui.renaming_session = Some((idx, edit));
-                self.request_redraw();
-                return;
+            if !self.ui.sidebar_visible {
+                self.toggle_sidebar();
+            }
+            if self.layout.sidebar.w > 0 {
+                let idx = self.sessions.active_index();
+                if let Some(title) = self.sessions.get(idx).map(|s| s.title.clone()) {
+                    let mut edit = InputBar::new();
+                    edit.set_text(title);
+                    self.ui.renaming_session = Some((idx, edit));
+                    self.request_redraw();
+                    return;
+                }
             }
         }
 
@@ -1962,8 +1995,13 @@ impl App {
                     return;
                 }
                 Key::Character(s) if allow_unshifted_shortcut && s.eq_ignore_ascii_case("t") => {
-                    self.ui.picker_open = !self.ui.picker_open;
-                    self.ui.picker_selected = 0;
+                    if !self.ui.picker_open && !self.ui.sidebar_visible {
+                        self.toggle_sidebar();
+                    }
+                    if self.layout.sidebar.w > 0 || self.ui.picker_open {
+                        self.ui.picker_open = !self.ui.picker_open;
+                        self.ui.picker_selected = 0;
+                    }
                     self.request_redraw();
                     return;
                 }
@@ -2500,6 +2538,19 @@ impl ApplicationHandler<()> for App {
     }
 }
 
+/// Returns true when the active modifier combination is the primary shortcut modifier
+/// (`Cmd` or `Ctrl` on macOS; `Ctrl` without `Alt`/AltGr on Windows and Linux).
+fn primary_modifier_for_state(modifiers: ModifiersState) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        modifiers.super_key() || modifiers.control_key()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        modifiers.control_key() && !modifiers.alt_key()
+    }
+}
+
 /// Returns true when the active modifier combination permits inserting printable
 /// `event.text` into text inputs.
 ///
@@ -2624,6 +2675,21 @@ fn encode_passthrough_nav_key(key: NamedKey, alt: bool, ctrl: bool) -> Option<&'
         }),
         _ => None,
     }
+}
+
+/// Sanitizes clipboard text for inline session rename (single-line, capped at 32 chars
+/// accounting for any currently selected characters that will be replaced).
+fn sanitize_rename_paste(clip: &str, draft: &InputBar) -> String {
+    let selected_chars = draft
+        .selected_text()
+        .map_or(0, |sel| sel.chars().count());
+    let kept_chars = draft.text().chars().count().saturating_sub(selected_chars);
+    let remaining = 32usize.saturating_sub(kept_chars);
+    clip.replace("\r\n", " ")
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .take(remaining)
+        .collect()
 }
 
 fn main() {
@@ -2753,5 +2819,27 @@ mod tests {
             encode_passthrough_nav_key(NamedKey::Delete, true, false),
             Some(b"\x1b[3;3~".as_slice())
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn primary_modifier_excludes_altgr_on_windows_and_linux() {
+        assert!(primary_modifier_for_state(ModifiersState::CONTROL));
+        assert!(primary_modifier_for_state(
+            ModifiersState::CONTROL | ModifiersState::SHIFT
+        ));
+        assert!(!primary_modifier_for_state(
+            ModifiersState::CONTROL | ModifiersState::ALT
+        ));
+    }
+
+    #[test]
+    fn rename_paste_replaces_selected_full_length_title() {
+        let mut draft = InputBar::new();
+        draft.set_text("12345678901234567890123456789012"); // 32 chars
+        draft.select_all();
+        let pasted = sanitize_rename_paste("New Session\r\nName", &draft);
+        draft.insert_str(&pasted);
+        assert_eq!(draft.text(), "New Session Name");
     }
 }

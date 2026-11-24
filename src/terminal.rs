@@ -260,7 +260,11 @@ impl TerminalGrid {
                 cells.len()
             };
             if c0 <= c1 {
-                let s: String = cells[c0..c1].iter().map(|c| c.ch).collect();
+                let s: String = cells[c0..c1]
+                    .iter()
+                    .filter(|c| c.ch != '\0')
+                    .map(|c| c.ch)
+                    .collect();
                 lines.push(s.trim_end().to_string());
             }
         }
@@ -272,7 +276,11 @@ impl TerminalGrid {
         let mut lines = Vec::new();
         for abs in start_abs..=end_abs {
             if let Some(cells) = self.row_at_abs_line(abs) {
-                let s: String = cells.iter().map(|c| c.ch).collect();
+                let s: String = cells
+                    .iter()
+                    .filter(|c| c.ch != '\0')
+                    .map(|c| c.ch)
+                    .collect();
                 lines.push(s.trim_end().to_string());
             }
         }
@@ -286,11 +294,19 @@ impl TerminalGrid {
     pub fn dump_transcript(&self) -> String {
         let mut lines = Vec::with_capacity(self.scrollback.len() + self.cells.len());
         for row in &self.scrollback {
-            let s: String = row.iter().map(|c| c.ch).collect();
+            let s: String = row
+                .iter()
+                .filter(|c| c.ch != '\0')
+                .map(|c| c.ch)
+                .collect();
             lines.push(s.trim_end().to_string());
         }
         for row in &self.cells {
-            let s: String = row.iter().map(|c| c.ch).collect();
+            let s: String = row
+                .iter()
+                .filter(|c| c.ch != '\0')
+                .map(|c| c.ch)
+                .collect();
             lines.push(s.trim_end().to_string());
         }
         while lines.last().is_some_and(|l| l.is_empty()) {
@@ -795,10 +811,7 @@ impl Perform for TerminalGrid {
                         _ => {}
                     },
                     1006 => match action {
-                        'h' => {
-                            self.sgr_mouse = true;
-                            self.mouse_tracking = true;
-                        }
+                        'h' => self.sgr_mouse = true,
                         'l' => self.sgr_mouse = false,
                         _ => {}
                     },
@@ -1105,7 +1118,11 @@ pub fn detect_link_at_col(row: &[Cell], col: usize, cwd: &Path) -> Option<Detect
         end += 1;
     }
 
-    let raw: String = row[start..end].iter().map(|c| c.ch).collect();
+    let raw: String = row[start..end]
+        .iter()
+        .filter(|c| c.ch != '\0')
+        .map(|c| c.ch)
+        .collect();
     let trimmed = raw.trim_end_matches([',', ';', '.']);
 
     // 1. Check HTTP / HTTPS URL first
@@ -1225,7 +1242,11 @@ pub fn detect_path_at_col(row: &[Cell], col: usize, cwd: &Path) -> Option<Detect
         end += 1;
     }
 
-    let raw: String = row[start..end].iter().map(|c| c.ch).collect();
+    let raw: String = row[start..end]
+        .iter()
+        .filter(|c| c.ch != '\0')
+        .map(|c| c.ch)
+        .collect();
     let trimmed_end = raw.trim_end_matches([',', ';', '.']);
     let mut candidate_str = trimmed_end;
 
@@ -1568,5 +1589,40 @@ mod tests {
         assert!(!is_safe_browser_url("calc.exe"));
         assert!(!is_safe_browser_url("https://example.com/\r\ncalc.exe"));
         assert!(!is_safe_browser_url("https://example.com/ with space"));
+    }
+
+    #[test]
+    fn wide_char_continuation_cells_are_stripped_from_selection_and_transcript() {
+        let fg = Rgb::new(220, 220, 220);
+        let bg = Rgb::new(10, 10, 10);
+        let mut grid = TerminalGrid::new(20, 3, fg, bg);
+        grid.feed("hi ✨ world".as_bytes());
+
+        let selected = grid.extract_selection((0, 0), (0, 12), 0);
+        assert_eq!(selected, "hi ✨ world");
+        assert!(!selected.contains('\0'));
+
+        let abs = grid.extract_abs_range(0, 0);
+        assert_eq!(abs, "hi ✨ world");
+        assert!(!abs.contains('\0'));
+
+        let transcript = grid.dump_transcript();
+        assert_eq!(transcript, "hi ✨ world");
+        assert!(!transcript.contains('\0'));
+    }
+
+    #[test]
+    fn sgr_mouse_mode_1006_does_not_leave_mouse_tracking_stuck() {
+        let fg = Rgb::new(220, 220, 220);
+        let bg = Rgb::new(10, 10, 10);
+        let mut grid = TerminalGrid::new(20, 5, fg, bg);
+
+        grid.feed(b"\x1b[?1006h");
+        assert!(grid.sgr_mouse_enabled());
+        assert!(!grid.mouse_tracking_enabled());
+        grid.feed(b"\x1b[?1006l");
+        assert!(!grid.sgr_mouse_enabled());
+        assert!(!grid.mouse_tracking_enabled());
+        assert!(!grid.is_tui_active());
     }
 }

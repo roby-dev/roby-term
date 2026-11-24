@@ -955,12 +955,16 @@ impl<'a> Canvas<'a> {
                 if px < 0 || px >= max_x {
                     continue;
                 }
-                let a = alpha_map[src_row + col];
+                let Some(&a) = alpha_map.get(src_row + col) else {
+                    continue;
+                };
                 if a == 0 {
                     continue;
                 }
                 let idx = dst_row + px as usize;
-                self.pixels[idx] = color.blend_over(self.pixels[idx], a);
+                if let Some(dst) = self.pixels.get_mut(idx) {
+                    *dst = color.blend_over(*dst, a);
+                }
             }
         }
     }
@@ -3299,5 +3303,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn canvas_blit_alpha_does_not_panic_when_buffer_is_smaller_than_dimensions() {
+        let mut pixels = vec![0u32; 4]; // smaller than 10x10
+        let mut canvas = Canvas::new_scaled(&mut pixels, 10, 10, 1.0);
+        let alpha = vec![255u8; 4 * 4];
+        canvas.blit_alpha(0, 0, 4, 4, &alpha, Rgb::new(0xFF, 0xFF, 0xFF), 10);
     }
 }

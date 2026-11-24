@@ -458,6 +458,7 @@ pub fn is_interactive_command(raw_cmd: &str) -> bool {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -678,6 +679,13 @@ impl SessionManager {
             return false;
         }
         self.close(self.active)
+    }
+
+    /// Drops every active session so child shells are killed and reaped before process exit.
+    pub fn close_all(&mut self) {
+        self.sessions.clear();
+        self.split_pair = None;
+        self.active = 0;
     }
 
     pub fn resize_all(&mut self, cols: usize, rows: usize) {
