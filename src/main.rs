@@ -300,7 +300,7 @@ impl App {
             return;
         }
         self.ui.update_status = UpdateStatus::Downloading(info.version.clone());
-        self.ui.toast = Some(format!("Downloading Roby-Term v{}...", info.version));
+        self.ui.toast = Some(format!("Downloading Velt v{}...", info.version));
         let (tx, rx) = mpsc::channel();
         let wake = self.proxy.clone();
         match thread::Builder::new()
@@ -337,7 +337,7 @@ impl App {
                     std::process::exit(0);
                 } else {
                     self.ui.toast = Some(format!(
-                        "Updated to v{version} — please close and reopen Roby-Term."
+                        "Updated to v{version} — please close and reopen Velt."
                     ));
                 }
             }
@@ -670,7 +670,13 @@ impl App {
         let mut next_target = None;
 
         let active_vp = self.active_pane_rect();
-        if !self.ui.settings.open && !self.ui.palette.open && !self.ui.selecting {
+        if !self.ui.settings.open
+            && !self.ui.palette.open
+            && !self.ui.history_modal.open
+            && !self.ui.ports.open
+            && !self.ui.search.open
+            && !self.ui.selecting
+        {
             if let Some((row, col)) = Layout::pixel_to_cell_in(
                 active_vp,
                 self.cursor_pos.0,
@@ -1192,6 +1198,9 @@ impl App {
             HitTarget::NewSessionToggle => {
                 self.ui.settings.open = false;
                 self.ui.palette.open = false;
+                self.ui.history_modal.open = false;
+                self.ui.ports.open = false;
+                self.ui.search.open = false;
                 self.ui.picker_open = !self.ui.picker_open;
             }
             HitTarget::PickShell(idx) => {
@@ -1238,6 +1247,9 @@ impl App {
                 self.sessions.close(idx);
                 if was_split && !self.sessions.is_split() {
                     self.resize_sessions_for_current_layout();
+                }
+                if self.ui.search.open {
+                    self.refresh_search();
                 }
             }
             HitTarget::UpdateAction | HitTarget::SettingsCheckUpdate => {
@@ -1637,7 +1649,6 @@ impl App {
                 }
                 if allow_unshifted_shortcut
                     && s.eq_ignore_ascii_case("b")
-                    && !shift
                     && !self.ui.settings.open
                 {
                     self.toggle_sidebar();
@@ -1646,7 +1657,6 @@ impl App {
                 }
                 if allow_unshifted_shortcut
                     && s.eq_ignore_ascii_case("r")
-                    && !shift
                     && !self.ui.settings.open
                 {
                     self.ui.picker_open = false;
@@ -1927,7 +1937,8 @@ impl App {
                                     sess.write_bytes(&payload);
                                 }
                             } else {
-                                let single_line = clip.replace("\r\n", " ").replace('\n', " ");
+                                let single_line =
+                                    clip.replace("\r\n", " ").replace(['\r', '\n'], " ");
                                 sess.input.insert_str(&single_line);
                                 self.ui.suggestion_selected = 0;
                             }
@@ -1937,7 +1948,7 @@ impl App {
                     return;
                 }
                 Key::Character(s) if s.eq_ignore_ascii_case("c") => {
-                    // 1. Copy Roby Input bar selection if present
+                    // 1. Copy Velt Input bar selection if present
                     if let Some(sess) = self.sessions.active() {
                         if !sess.effective_passthrough() {
                             if let Some(sel) = sess.input.selected_text() {
@@ -2088,6 +2099,25 @@ impl App {
         let Some(sess) = self.sessions.active_mut() else {
             return;
         };
+
+        if let Key::Named(named) = event.logical_key {
+            if let Some(action) = resolve_scroll_action(
+                named,
+                sess.effective_passthrough(),
+                sess.grid.is_alt_screen(),
+                primary,
+                shift,
+            ) {
+                match action {
+                    ScrollAction::PageUp => sess.scroll_page_up(),
+                    ScrollAction::PageDown => sess.scroll_page_down(),
+                    ScrollAction::Top => sess.scroll_to_top(),
+                    ScrollAction::Bottom => sess.scroll_to_bottom(),
+                }
+                self.request_redraw();
+                return;
+            }
+        }
 
         if sess.effective_passthrough() {
             sess.scroll_offset = 0;
@@ -2371,7 +2401,7 @@ impl ApplicationHandler<()> for App {
             return;
         }
         let mut attrs = Window::default_attributes()
-            .with_title(format!("Roby-Term — {}@{}", self.user.username, self.user.hostname))
+            .with_title(format!("Velt — {}@{}", self.user.username, self.user.hostname))
             .with_inner_size(LogicalSize::new(1120.0, 720.0))
             .with_min_inner_size(LogicalSize::new(640.0, 400.0));
         if let Ok(icon) = Icon::from_rgba(build_app_icon_rgba(self.user.accent), 32, 32) {
@@ -2525,7 +2555,7 @@ impl ApplicationHandler<()> for App {
                     } else if lines > 0 {
                         sess.scroll_up(lines as usize);
                     } else {
-                        sess.scroll_down((-lines) as usize);
+                        sess.scroll_down(lines.unsigned_abs() as usize);
                     }
                     self.request_redraw();
                 }
@@ -2596,7 +2626,7 @@ fn encode_passthrough_paste(text: &str, bracketed_paste_enabled: bool) -> Vec<u8
 }
 
 /// Returns true when an unshifted primary shortcut (`Ctrl+W/T/R/B/F/K`) should be
-/// handled by Roby-Term rather than forwarded to the active PTY.
+/// handled by Velt rather than forwarded to the active PTY.
 ///
 /// On Windows/Linux (`Ctrl` is primary), plain `Ctrl+*` shortcuts yield to the PTY
 /// in passthrough mode so interactive TUIs/agents (`vim`, `tmux`, `bash`, `claude`)
@@ -2690,6 +2720,50 @@ fn sanitize_rename_paste(clip: &str, draft: &InputBar) -> String {
         .chars()
         .take(remaining)
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollAction {
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+}
+
+/// Resolves keyboard scrollback navigation for normal and passthrough modes.
+///
+/// - Normal mode: `PageUp`/`PageDown` scroll by page; `Ctrl+Home`/`Ctrl+End` (`Cmd` on macOS)
+///   jump to the start or bottom of the session scrollback.
+/// - Passthrough mode (when not in alt-screen): `Shift+PageUp`/`Shift+PageDown` scroll by page
+///   and `Shift+Home`/`Shift+End` (or `Ctrl+Home`/`Ctrl+End`) jump to top/bottom without
+///   forwarding to the PTY.
+fn resolve_scroll_action(
+    key: NamedKey,
+    passthrough: bool,
+    alt_screen: bool,
+    primary: bool,
+    shift: bool,
+) -> Option<ScrollAction> {
+    if alt_screen {
+        return None;
+    }
+    if passthrough {
+        match key {
+            NamedKey::PageUp if shift => Some(ScrollAction::PageUp),
+            NamedKey::PageDown if shift => Some(ScrollAction::PageDown),
+            NamedKey::Home if shift || primary => Some(ScrollAction::Top),
+            NamedKey::End if shift || primary => Some(ScrollAction::Bottom),
+            _ => None,
+        }
+    } else {
+        match key {
+            NamedKey::PageUp => Some(ScrollAction::PageUp),
+            NamedKey::PageDown => Some(ScrollAction::PageDown),
+            NamedKey::Home if primary => Some(ScrollAction::Top),
+            NamedKey::End if primary => Some(ScrollAction::Bottom),
+            _ => None,
+        }
+    }
 }
 
 fn main() {
@@ -2841,5 +2915,68 @@ mod tests {
         let pasted = sanitize_rename_paste("New Session\r\nName", &draft);
         draft.insert_str(&pasted);
         assert_eq!(draft.text(), "New Session Name");
+    }
+
+    #[test]
+    fn resolve_scroll_action_covers_normal_passthrough_and_alt_screen() {
+        // Normal mode: PageUp/PageDown always scroll; primary+Home/End jump to top/bottom
+        assert_eq!(
+            resolve_scroll_action(NamedKey::PageUp, false, false, false, false),
+            Some(ScrollAction::PageUp)
+        );
+        assert_eq!(
+            resolve_scroll_action(NamedKey::PageDown, false, false, false, false),
+            Some(ScrollAction::PageDown)
+        );
+        assert_eq!(
+            resolve_scroll_action(NamedKey::Home, false, false, true, false),
+            Some(ScrollAction::Top)
+        );
+        assert_eq!(
+            resolve_scroll_action(NamedKey::End, false, false, true, false),
+            Some(ScrollAction::Bottom)
+        );
+        // Plain Home/End and Shift+Home/End remain input-bar cursor/selection in normal mode
+        assert_eq!(
+            resolve_scroll_action(NamedKey::Home, false, false, false, false),
+            None
+        );
+        assert_eq!(
+            resolve_scroll_action(NamedKey::Home, false, false, false, true),
+            None
+        );
+
+        // Passthrough mode (non-alt-screen): Shift+PageUp/PageDown and Shift/Ctrl+Home/End scroll
+        assert_eq!(
+            resolve_scroll_action(NamedKey::PageUp, true, false, false, true),
+            Some(ScrollAction::PageUp)
+        );
+        assert_eq!(
+            resolve_scroll_action(NamedKey::PageDown, true, false, false, true),
+            Some(ScrollAction::PageDown)
+        );
+        assert_eq!(
+            resolve_scroll_action(NamedKey::Home, true, false, false, true),
+            Some(ScrollAction::Top)
+        );
+        assert_eq!(
+            resolve_scroll_action(NamedKey::End, true, false, true, false),
+            Some(ScrollAction::Bottom)
+        );
+        // Unmodified PageUp/PageDown in passthrough still go to the PTY
+        assert_eq!(
+            resolve_scroll_action(NamedKey::PageUp, true, false, false, false),
+            None
+        );
+
+        // Alt-screen apps never intercept scrollback shortcuts
+        assert_eq!(
+            resolve_scroll_action(NamedKey::PageUp, true, true, false, true),
+            None
+        );
+        assert_eq!(
+            resolve_scroll_action(NamedKey::Home, true, true, true, false),
+            None
+        );
     }
 }

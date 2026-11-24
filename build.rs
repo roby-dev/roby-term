@@ -40,7 +40,7 @@ fn main() {
 
     if let Ok(s) = status {
         if s.success() && res_path.is_file() {
-            println!("cargo:rustc-link-arg-bin=roby-term={}", res_path.display());
+            println!("cargo:rustc-link-arg-bin=velt={}", res_path.display());
         }
     }
 }

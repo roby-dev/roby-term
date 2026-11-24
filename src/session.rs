@@ -216,7 +216,7 @@ impl Session {
                 }
             }
         }
-        // When a TUI/agent exits alternate screen back to the normal shell, restore Roby Input automatically.
+        // When a TUI/agent exits alternate screen back to the normal shell, restore Velt Input automatically.
         if was_alt && !self.grid.is_alt_screen() {
             self.input.passthrough = false;
         }
@@ -342,6 +342,24 @@ impl Session {
 
     pub fn scroll_down(&mut self, lines: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    pub fn scroll_page_up(&mut self) {
+        let step = self.grid.rows().saturating_sub(1).max(1);
+        self.scroll_up(step);
+    }
+
+    pub fn scroll_page_down(&mut self) {
+        let step = self.grid.rows().saturating_sub(1).max(1);
+        self.scroll_down(step);
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_offset = self.grid.scrollback_len();
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
     }
 
     pub fn display_accent(&self) -> Rgb {
@@ -544,7 +562,17 @@ impl SessionManager {
         self.next_id += 1;
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
+        self.sync_split_for_active();
         Ok(self.active)
+    }
+
+    /// Keeps `split_pair` aligned whenever `active` moves to a session outside the visible pair.
+    fn sync_split_for_active(&mut self) {
+        if let Some((l, r)) = self.split_pair {
+            if self.active != l && self.active != r {
+                self.split_pair = Some((l, self.active));
+            }
+        }
     }
 
     pub fn sessions(&self) -> &[Session] {
@@ -574,6 +602,7 @@ impl SessionManager {
             }
             if idx != self.active {
                 self.active = idx;
+                self.sync_split_for_active();
                 return true;
             }
         }
@@ -635,6 +664,7 @@ impl SessionManager {
         self.next_id += 1;
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
+        self.sync_split_for_active();
         Ok(self.active)
     }
 
@@ -643,6 +673,7 @@ impl SessionManager {
             return false;
         }
         self.active = (self.active + 1) % self.sessions.len();
+        self.sync_split_for_active();
         if let Some(sess) = self.sessions.get_mut(self.active) {
             sess.has_unread_output = false;
         }

@@ -51,17 +51,23 @@ fn list_windows_ports() -> Vec<ListeningPort> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let netstat = Command::new("netstat")
-        .args(["-ano", "-p", "tcp"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    let Ok(out) = netstat else {
+    let mut combined = String::new();
+    for proto in ["tcp", "tcpv6"] {
+        if let Ok(out) = Command::new("netstat")
+            .args(["-ano", "-p", proto])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            combined.push_str(&String::from_utf8_lossy(&out.stdout));
+            combined.push('\n');
+        }
+    }
+    if combined.is_empty() {
         return Vec::new();
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
+    }
 
     let pid_map = windows_pid_names();
-    parse_windows_netstat(&text, &pid_map)
+    parse_windows_netstat(&combined, &pid_map)
 }
 
 #[cfg(target_os = "windows")]
@@ -102,7 +108,7 @@ pub fn parse_windows_netstat(text: &str, pid_names: &HashMap<u32, String>) -> Ve
             continue;
         }
         // State can be "LISTENING" (English) or localized ("ESCUCHANDO" in Spanish Windows)
-        let state = parts[3].to_ascii_uppercase();
+        let state = parts[3].to_uppercase();
         if !matches!(state.as_str(), "LISTENING" | "ESCUCHANDO" | "ABHÖREN" | "ÉCOUTE") {
             continue;
         }
@@ -186,5 +192,21 @@ mod tests {
         assert_eq!(ports.len(), 2);
         assert_eq!(ports[0], ListeningPort { port: 3000, pid: 1234, process: "node.exe".into() });
         assert_eq!(ports[1], ListeningPort { port: 8080, pid: 5678, process: "cargo.exe".into() });
+    }
+
+    #[test]
+    fn parses_ipv6_and_mixed_case_unicode_listening_states() {
+        let sample = "\
+  TCP    [::1]:5173             [::]:0                 Abhören         2222
+  TCP    [::]:3000              [::]:0                 écoute          3333
+";
+        let mut names = HashMap::new();
+        names.insert(2222, "vite.exe".to_string());
+        names.insert(3333, "node.exe".to_string());
+
+        let ports = parse_windows_netstat(sample, &names);
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].port, 3000);
+        assert_eq!(ports[1].port, 5173);
     }
 }

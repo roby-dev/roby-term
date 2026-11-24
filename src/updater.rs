@@ -5,11 +5,11 @@ use std::process::Command;
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RELEASES_API_URL: &str =
-    "https://api.github.com/repos/roby-dev/roby-term/releases/latest";
-pub const RELEASES_PAGE_URL: &str = "https://github.com/roby-dev/roby-term/releases/latest";
+    "https://api.github.com/repos/roby-dev/velt/releases/latest";
+pub const RELEASES_PAGE_URL: &str = "https://github.com/roby-dev/velt/releases/latest";
 
-const TRUSTED_RELEASE_TAG_PREFIX: &str = "https://github.com/roby-dev/roby-term/releases/tag/";
-const TRUSTED_DOWNLOAD_PREFIX: &str = "https://github.com/roby-dev/roby-term/releases/download/";
+const TRUSTED_RELEASE_TAG_PREFIX: &str = "https://github.com/roby-dev/velt/releases/tag/";
+const TRUSTED_DOWNLOAD_PREFIX: &str = "https://github.com/roby-dev/velt/releases/download/";
 const MIN_BINARY_BYTES: u64 = 200_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +82,7 @@ pub fn is_safe_release_tag(tag: &str) -> bool {
 }
 
 /// Validates that a download URL matches the exact official GitHub release asset path shape:
-/// `https://github.com/roby-dev/roby-term/releases/download/<safe_tag>/<asset_name>`.
+/// `https://github.com/roby-dev/velt/releases/download/<safe_tag>/<asset_name>`.
 pub fn is_trusted_download_url(url: &str, asset_name: &str) -> bool {
     let Some(rest) = url.strip_prefix(TRUSTED_DOWNLOAD_PREFIX) else {
         return false;
@@ -104,11 +104,11 @@ fn is_trusted_release_tag_url(url: &str) -> bool {
 pub fn platform_asset_name() -> Option<&'static str> {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
-        Some("roby-term-windows-x64.exe")
+        Some("velt-windows-x64.exe")
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        Some("roby-term-macos-arm64")
+        Some("velt-macos-arm64")
     }
     #[cfg(not(any(
         all(target_os = "windows", target_arch = "x86_64"),
@@ -244,7 +244,7 @@ pub fn check_latest_release() -> Result<Option<ReleaseInfo>, String> {
             "--max-time",
             "8",
             "-H",
-            "User-Agent: roby-term",
+            "User-Agent: velt",
             "-H",
             "Accept: application/vnd.github+json",
             "--",
@@ -373,7 +373,7 @@ pub fn download_and_install_update(info: &ReleaseInfo) -> Result<(String, PathBu
             "--max-time",
             "90",
             "-H",
-            "User-Agent: roby-term",
+            "User-Agent: velt",
             "-o",
             staging_str,
             "--",
@@ -454,32 +454,32 @@ mod tests {
     #[test]
     fn parses_github_latest_release_payload() {
         let sample = r#"{
-            "url": "https://api.github.com/repos/roby-dev/roby-term/releases/123",
-            "html_url": "https://github.com/roby-dev/roby-term/releases/tag/v0.8.0",
+            "url": "https://api.github.com/repos/roby-dev/velt/releases/123",
+            "html_url": "https://github.com/roby-dev/velt/releases/tag/v0.8.0",
             "tag_name": "v0.8.0",
             "assets": [
                 {
-                    "name": "roby-term-macos-arm64",
-                    "browser_download_url": "https://github.com/roby-dev/roby-term/releases/download/v0.8.0/roby-term-macos-arm64"
+                    "name": "velt-macos-arm64",
+                    "browser_download_url": "https://github.com/roby-dev/velt/releases/download/v0.8.0/velt-macos-arm64"
                 },
                 {
-                    "name": "roby-term-windows-x64.exe",
-                    "browser_download_url": "https://github.com/roby-dev/roby-term/releases/download/v0.8.0/roby-term-windows-x64.exe"
+                    "name": "velt-windows-x64.exe",
+                    "browser_download_url": "https://github.com/roby-dev/velt/releases/download/v0.8.0/velt-windows-x64.exe"
                 }
             ]
         }"#;
 
-        let win = parse_github_release_json(sample, "roby-term-windows-x64.exe").unwrap();
+        let win = parse_github_release_json(sample, "velt-windows-x64.exe").unwrap();
         assert_eq!(win.tag, "v0.8.0");
         assert_eq!(win.version, "0.8.0");
         assert_eq!(
             win.html_url,
-            "https://github.com/roby-dev/roby-term/releases/tag/v0.8.0"
+            "https://github.com/roby-dev/velt/releases/tag/v0.8.0"
         );
-        assert!(win.download_url.ends_with("roby-term-windows-x64.exe"));
+        assert!(win.download_url.ends_with("velt-windows-x64.exe"));
 
-        let mac = parse_github_release_json(sample, "roby-term-macos-arm64").unwrap();
-        assert!(mac.download_url.ends_with("roby-term-macos-arm64"));
+        let mac = parse_github_release_json(sample, "velt-macos-arm64").unwrap();
+        assert!(mac.download_url.ends_with("velt-macos-arm64"));
     }
 
     #[test]
@@ -493,18 +493,18 @@ mod tests {
     fn ignores_untrusted_download_url_host() {
         let sample = r#"{
             "tag_name": "v0.9.0",
-            "html_url": "https://github.com/roby-dev/roby-term/releases/tag/v0.9.0",
+            "html_url": "https://github.com/roby-dev/velt/releases/tag/v0.9.0",
             "assets": [
                 {
-                    "name": "roby-term-windows-x64.exe",
-                    "browser_download_url": "https://evil.example.com/roby-term-windows-x64.exe"
+                    "name": "velt-windows-x64.exe",
+                    "browser_download_url": "https://evil.example.com/velt-windows-x64.exe"
                 }
             ]
         }"#;
-        let info = parse_github_release_json(sample, "roby-term-windows-x64.exe").unwrap();
+        let info = parse_github_release_json(sample, "velt-windows-x64.exe").unwrap();
         assert_eq!(
             info.download_url,
-            "https://github.com/roby-dev/roby-term/releases/download/v0.9.0/roby-term-windows-x64.exe"
+            "https://github.com/roby-dev/velt/releases/download/v0.9.0/velt-windows-x64.exe"
         );
     }
 
@@ -531,7 +531,7 @@ mod tests {
 
     #[test]
     fn reads_file_header_prefix_only() {
-        let path = std::env::temp_dir().join("roby_term_test_header.bin");
+        let path = std::env::temp_dir().join("velt_test_header.bin");
         fs::write(&path, b"MZ\x90\x00EXTRA_BYTES_HERE").unwrap();
         let hdr = read_file_header(&path).unwrap();
         let _ = fs::remove_file(&path);
@@ -546,27 +546,27 @@ mod tests {
         assert!(!is_safe_release_tag(".."));
         assert!(is_safe_release_tag("v0.8.0-rc.1"));
 
-        let asset = "roby-term-windows-x64.exe";
+        let asset = "velt-windows-x64.exe";
         assert!(is_trusted_download_url(
-            "https://github.com/roby-dev/roby-term/releases/download/v0.8.0/roby-term-windows-x64.exe",
+            "https://github.com/roby-dev/velt/releases/download/v0.8.0/velt-windows-x64.exe",
             asset
         ));
         assert!(!is_trusted_download_url(
-            "https://github.com/roby-dev/roby-term/releases/download/v1/../../../../attacker/evil/releases/download/v1/roby-term-windows-x64.exe",
+            "https://github.com/roby-dev/velt/releases/download/v1/../../../../attacker/evil/releases/download/v1/velt-windows-x64.exe",
             asset
         ));
         assert!(!is_trusted_download_url(
-            "https://github.com/roby-dev/roby-term/releases/download/v1/evil?x=roby-term-windows-x64.exe",
+            "https://github.com/roby-dev/velt/releases/download/v1/evil?x=velt-windows-x64.exe",
             asset
         ));
         assert!(!is_trusted_download_url(
-            "https://github.com/roby-dev/roby-term/releases/download/v1/evil-roby-term-windows-x64.exe",
+            "https://github.com/roby-dev/velt/releases/download/v1/evil-velt-windows-x64.exe",
             asset
         ));
 
         let evil_tag_json = r#"{
             "tag_name": "v9.0.0-x/../../../../attacker/evil/releases/download/v1",
-            "html_url": "https://github.com/roby-dev/roby-term/releases/tag/v9.0.0",
+            "html_url": "https://github.com/roby-dev/velt/releases/tag/v9.0.0",
             "assets": []
         }"#;
         assert!(parse_github_release_json(evil_tag_json, asset).is_none());
@@ -574,11 +574,11 @@ mod tests {
 
     #[test]
     fn skips_non_string_json_key_occurrences() {
-        let payload = r#"{"html_url": null, "nested": {"html_url": "https://github.com/roby-dev/roby-term/releases/tag/v0.8.0"}, "tag_name": "v0.8.0"}"#;
-        let info = parse_github_release_json(payload, "roby-term-windows-x64.exe").unwrap();
+        let payload = r#"{"html_url": null, "nested": {"html_url": "https://github.com/roby-dev/velt/releases/tag/v0.8.0"}, "tag_name": "v0.8.0"}"#;
+        let info = parse_github_release_json(payload, "velt-windows-x64.exe").unwrap();
         assert_eq!(
             info.html_url,
-            "https://github.com/roby-dev/roby-term/releases/tag/v0.8.0"
+            "https://github.com/roby-dev/velt/releases/tag/v0.8.0"
         );
     }
 }

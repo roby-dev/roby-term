@@ -440,8 +440,8 @@ fn read_git_head(head_path: &Path) -> Option<String> {
         Some(branch.to_string())
     } else if let Some(rest) = trimmed.strip_prefix("ref: ") {
         Some(rest.to_string())
-    } else if trimmed.len() >= 7 {
-        Some(trimmed[..7].to_string())
+    } else if trimmed.chars().count() >= 7 {
+        Some(trimmed.chars().take(7).collect())
     } else {
         None
     }
@@ -570,5 +570,16 @@ mod tests {
         let dir = std::env::temp_dir();
         let drive_root = maybe_update_cwd(&dir, "C:").expect("should support bare drive switch C:");
         assert_eq!(drive_root.to_string_lossy().to_ascii_uppercase(), r"C:\");
+    }
+
+    #[test]
+    fn read_git_head_handles_multibyte_utf8_without_panic() {
+        let dir = std::env::temp_dir().join("my_warp_git_head_utf8_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        // 8 bytes, byte index 7 falls inside a multi-byte char
+        fs::write(dir.join(".git").join("HEAD"), "abcdeéé\n").unwrap();
+        assert_eq!(detect_git_branch(&dir).as_deref(), Some("abcdeéé"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

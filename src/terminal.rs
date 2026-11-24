@@ -335,21 +335,33 @@ impl TerminalGrid {
             if row.len() < q_len {
                 continue;
             }
-            let row_chars: Vec<char> = row
+            let non_nul: Vec<(usize, char)> = row
                 .iter()
-                .map(|c| c.ch.to_lowercase().next().unwrap_or(c.ch))
+                .enumerate()
+                .filter(|(_, c)| c.ch != '\0')
+                .map(|(idx, c)| (idx, c.ch.to_lowercase().next().unwrap_or(c.ch)))
                 .collect();
-            let mut col = 0;
-            while col + q_len <= row_chars.len() {
-                if row_chars[col..col + q_len] == q_lower[..] {
+            if non_nul.len() < q_len {
+                continue;
+            }
+            let mut i = 0;
+            while i + q_len <= non_nul.len() {
+                if (0..q_len).all(|k| non_nul[i + k].1 == q_lower[k]) {
+                    let col_start = non_nul[i].0;
+                    let last_col = non_nul[i + q_len - 1].0;
+                    let col_end = if last_col + 1 < row.len() && row[last_col + 1].ch == '\0' {
+                        last_col + 2
+                    } else {
+                        last_col + 1
+                    };
                     matches.push(SearchMatch {
                         abs_line: self.evicted_lines + rel,
-                        col_start: col,
-                        col_end: col + q_len,
+                        col_start,
+                        col_end,
                     });
-                    col += q_len;
+                    i += q_len;
                 } else {
-                    col += 1;
+                    i += 1;
                 }
             }
         }
@@ -467,7 +479,7 @@ impl TerminalGrid {
         let n = count.min(bottom - top + 1);
         for _ in 0..n {
             let removed = self.cells.remove(top);
-            if top == 0 {
+            if top == 0 && bottom == self.rows - 1 {
                 self.push_scrollback(removed);
             }
             self.cells.insert(bottom, self.blank_row());
@@ -577,6 +589,7 @@ impl TerminalGrid {
 
     fn leave_alt_screen(&mut self) {
         if self.alt_screen {
+            self.alt_screen = false;
             let mut saved_row = self.saved_cursor.0;
             if let Some(mut main_cells) = self.saved_main_cells.take() {
                 let blank = Cell::blank(self.default_fg, self.default_bg);
@@ -601,7 +614,6 @@ impl TerminalGrid {
             self.cursor_col = self.saved_cursor.1.min(self.cols - 1);
             self.scroll_top = 0;
             self.scroll_bottom = self.rows - 1;
-            self.alt_screen = false;
             // Clear stale TUI protocol flags when returning to the normal shell
             self.mouse_tracking = false;
             self.sgr_mouse = false;
@@ -716,21 +728,31 @@ impl Perform for TerminalGrid {
             underline: self.cur_underline,
             inverse: self.cur_inverse,
         };
+        let blank = Cell::blank(self.default_fg, self.default_bg);
         if let Some(row) = self.cells.get_mut(self.cursor_row) {
-            if let Some(slot) = row.get_mut(self.cursor_col) {
-                *slot = cell;
-            }
-            if width == 2 {
-                if let Some(cont) = row.get_mut(self.cursor_col + 1) {
-                    *cont = Cell {
-                        ch: '\0',
-                        fg: self.cur_fg,
-                        bg: self.cur_bg,
-                        bold: self.cur_bold,
-                        underline: self.cur_underline,
-                        inverse: self.cur_inverse,
-                    };
+            let col = self.cursor_col;
+            if col < row.len() {
+                // Clean up partner cell if overwriting half of a wide-character pair
+                if row[col].ch == '\0' && col > 0 {
+                    row[col - 1] = blank;
                 }
+                if col + 1 < row.len() && row[col + 1].ch == '\0' {
+                    row[col + 1] = blank;
+                }
+                row[col] = cell;
+            }
+            if width == 2 && col + 1 < row.len() {
+                if col + 2 < row.len() && row[col + 2].ch == '\0' {
+                    row[col + 2] = blank;
+                }
+                row[col + 1] = Cell {
+                    ch: '\0',
+                    fg: self.cur_fg,
+                    bg: self.cur_bg,
+                    bold: self.cur_bold,
+                    underline: self.cur_underline,
+                    inverse: self.cur_inverse,
+                };
             }
         }
         self.cursor_col += width;
@@ -888,7 +910,8 @@ impl Perform for TerminalGrid {
             'n' => {
                 // DSR — Device Status Report (`CSI 6 n` -> cursor position)
                 if raw_param(0) == 6 {
-                    let resp = format!("\x1b[{};{}R", self.cursor_row + 1, self.cursor_col + 1);
+                    let col = self.cursor_col.min(self.cols - 1);
+                    let resp = format!("\x1b[{};{}R", self.cursor_row + 1, col + 1);
                     self.pending_responses.push(resp.into_bytes());
                 }
             }
@@ -927,8 +950,9 @@ impl Perform for TerminalGrid {
                 let count = param(0, 1);
                 let blank = Cell::blank(self.default_fg, self.cur_bg);
                 if let Some(row) = self.cells.get_mut(self.cursor_row) {
-                    let end = (self.cursor_col + count).min(self.cols);
-                    for c in self.cursor_col..end {
+                    let col = self.cursor_col.min(self.cols - 1);
+                    let end = (col + count).min(self.cols);
+                    for c in col..end {
                         row[c] = blank;
                     }
                 }
@@ -938,7 +962,7 @@ impl Perform for TerminalGrid {
                 let count = param(0, 1);
                 let blank = Cell::blank(self.default_fg, self.cur_bg);
                 if let Some(row) = self.cells.get_mut(self.cursor_row) {
-                    let col = self.cursor_col.min(self.cols);
+                    let col = self.cursor_col.min(self.cols - 1);
                     let del = count.min(self.cols.saturating_sub(col));
                     if del > 0 {
                         row.drain(col..col + del);
@@ -951,7 +975,7 @@ impl Perform for TerminalGrid {
                 let count = param(0, 1);
                 let blank = Cell::blank(self.default_fg, self.cur_bg);
                 if let Some(row) = self.cells.get_mut(self.cursor_row) {
-                    let col = self.cursor_col.min(self.cols);
+                    let col = self.cursor_col.min(self.cols - 1);
                     let ins = count.min(self.cols.saturating_sub(col));
                     for _ in 0..ins {
                         row.pop();
@@ -1015,8 +1039,9 @@ impl Perform for TerminalGrid {
                 let blank = Cell::blank(self.default_fg, self.cur_bg);
                 match raw_param(0) {
                     0 => {
+                        let col = self.cursor_col.min(self.cols - 1);
                         if let Some(row) = self.cells.get_mut(self.cursor_row) {
-                            for c in self.cursor_col..self.cols {
+                            for c in col..self.cols {
                                 row[c] = blank;
                             }
                         }
@@ -1034,10 +1059,13 @@ impl Perform for TerminalGrid {
                             }
                         }
                     }
-                    2 | 3 => {
+                    2 => {
                         for row in &mut self.cells {
                             row.fill(blank);
                         }
+                    }
+                    3 => {
+                        self.scrollback.clear();
                     }
                     _ => {}
                 }
@@ -1047,7 +1075,8 @@ impl Perform for TerminalGrid {
                 if let Some(row) = self.cells.get_mut(self.cursor_row) {
                     match raw_param(0) {
                         0 => {
-                            for c in self.cursor_col..self.cols {
+                            let col = self.cursor_col.min(self.cols - 1);
+                            for c in col..self.cols {
                                 row[c] = blank;
                             }
                         }
@@ -1624,5 +1653,57 @@ mod tests {
         assert!(!grid.sgr_mouse_enabled());
         assert!(!grid.mouse_tracking_enabled());
         assert!(!grid.is_tui_active());
+    }
+
+    #[test]
+    fn leave_alt_screen_shrink_preserves_scrolled_main_lines_in_scrollback() {
+        let fg = Rgb::new(220, 220, 220);
+        let bg = Rgb::new(10, 10, 10);
+        let mut grid = TerminalGrid::new(20, 5, fg, bg);
+        grid.feed(b"line0\r\nline1\r\nline2\r\nline3\r\nline4");
+        assert_eq!(grid.scrollback_len(), 0);
+
+        grid.feed(b"\x1b[?1049h");
+        grid.resize(20, 3);
+        grid.feed(b"\x1b[?1049l");
+
+        assert_eq!(grid.scrollback_len(), 2);
+        assert!(grid.dump_transcript().starts_with("line0\nline1\n"));
+    }
+
+    #[test]
+    fn search_matches_handles_wide_chars_and_full_column_span() {
+        let fg = Rgb::new(220, 220, 220);
+        let bg = Rgb::new(10, 10, 10);
+        let mut grid = TerminalGrid::new(20, 2, fg, bg);
+        grid.feed("hi ✨ world".as_bytes());
+
+        let m = grid.search_matches("✨ world");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].col_start, 3);
+        assert_eq!(m[0].col_end, 11); // '✨'(2 cols) + " world"(6 cols) = 8 cols -> 3..11
+    }
+
+    #[test]
+    fn vt_csi_3j_clears_scrollback_and_pending_wrap_clamps_dsr_and_erase() {
+        let fg = Rgb::new(220, 220, 220);
+        let bg = Rgb::new(10, 10, 10);
+        let mut grid = TerminalGrid::new(4, 2, fg, bg);
+        grid.feed(b"aaaa\r\nbbbb\r\ncccc");
+        assert!(grid.scrollback_len() > 0);
+
+        // CSI 3 J clears scrollback without wiping active screen
+        grid.feed(b"\x1b[3J");
+        assert_eq!(grid.scrollback_len(), 0);
+        assert_eq!(grid.extract_selection((1, 0), (1, 3), 0), "cccc");
+
+        // Pending wrap: after printing 4 chars in 4-col grid, cursor_col == 4
+        // DSR CSI 6 n must report col 4 (not 5) and CSI 0 K must erase last cell
+        let mut g2 = TerminalGrid::new(4, 2, fg, bg);
+        g2.feed(b"abcd\x1b[6n");
+        let resp = g2.take_responses();
+        assert_eq!(resp, vec![b"\x1b[1;4R".to_vec()]);
+        g2.feed(b"\x1b[0K");
+        assert_eq!(g2.extract_selection((0, 0), (0, 3), 0), "abc");
     }
 }

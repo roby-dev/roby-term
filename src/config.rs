@@ -22,7 +22,7 @@ pub struct ThemePreset {
 
 pub const THEME_PRESETS: &[ThemePreset] = &[
     ThemePreset {
-        name: "Roby Violet",
+        name: "Velt Violet",
         accent: Rgb::new(0xA8, 0x8B, 0xD6),
         bg_terminal: Rgb::new(17, 19, 26),
         syntax_command: Rgb::new(137, 220, 235),
@@ -234,7 +234,7 @@ fn save_to_path(cfg: &UserConfig, path: &Path) -> std::io::Result<()> {
         .unwrap_or_else(|| "auto".to_string());
     let font_str = cfg.font_name.as_deref().unwrap_or("auto");
     let body = format!(
-        "# Roby-Term user preferences\naccent={}\nbg_terminal={}\nsyntax_command={}\nsyntax_flag={}\nfont_name={}\nfont_size={:.1}\nplugin_agy={}\nplugin_claude={}\nplugin_codex={}\n",
+        "# Velt user preferences\naccent={}\nbg_terminal={}\nsyntax_command={}\nsyntax_flag={}\nfont_name={}\nfont_size={:.1}\nplugin_agy={}\nplugin_claude={}\nplugin_codex={}\n",
         accent_str,
         format_hex_color(cfg.bg_terminal),
         format_hex_color(cfg.syntax_command),

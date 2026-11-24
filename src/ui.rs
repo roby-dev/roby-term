@@ -1681,7 +1681,7 @@ pub fn render_app(
         } else if active.input.passthrough {
             "PASSTHROUGH"
         } else {
-            "ROBY INPUT"
+            "VELT INPUT"
         };
         font.draw_text(
             &mut canvas,
@@ -1758,7 +1758,7 @@ pub fn render_app(
                 (link_label.as_str(), user.accent)
             } else {
                 (
-                    "Passthrough mode active — drag to copy | Click paths & URLs | Ctrl+Shift+P to return to Roby-Term Input",
+                    "Passthrough mode active — drag to copy | Click paths & URLs | Ctrl+Shift+P to return to Velt Input",
                     theme.fg_muted,
                 )
             };
@@ -1796,7 +1796,7 @@ pub fn render_app(
                     ib_max_x,
                 );
             } else {
-                // Visual selection highlight in Roby Input bar (Shift+Home/End/Arrows, Ctrl+A)
+                // Visual selection highlight in Velt Input bar (Shift+Home/End/Arrows, Ctrl+A)
                 if let Some((c0, c1)) = active.input.selected_char_range() {
                     let pre: String = line.chars().take(c0).collect();
                     let sel: String = line.chars().skip(c0).take(c1 - c0).collect();

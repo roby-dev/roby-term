@@ -20,13 +20,13 @@ jobs:
           - os: windows-latest
             target_name: windows-x64
             rust_target: x86_64-pc-windows-msvc
-            bin_name: roby-term.exe
-            artifact_name: roby-term-windows-x64.exe
+            bin_name: velt.exe
+            artifact_name: velt-windows-x64.exe
           - os: macos-latest
             target_name: macos-arm64
             rust_target: aarch64-apple-darwin
-            bin_name: roby-term
-            artifact_name: roby-term-macos-arm64
+            bin_name: velt
+            artifact_name: velt-macos-arm64
 
     steps:
       - name: Checkout
@@ -57,10 +57,10 @@ jobs:
             VERSION="${GITHUB_REF_NAME#v}"
             [[ -z "$VERSION" || "$VERSION" == "$GITHUB_REF_NAME" ]] && VERSION="0.0.0"
 
-            APP_DIR="dist/dmg-stage/Roby-Term.app"
+            APP_DIR="dist/dmg-stage/Velt.app"
             mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
-            cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/roby-term"
-            chmod +x "$APP_DIR/Contents/MacOS/roby-term"
+            cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/velt"
+            chmod +x "$APP_DIR/Contents/MacOS/velt"
 
             cat > "$APP_DIR/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -70,13 +70,13 @@ jobs:
             <key>CFBundleDevelopmentRegion</key>
             <string>en</string>
             <key>CFBundleExecutable</key>
-            <string>roby-term</string>
+            <string>velt</string>
             <key>CFBundleIdentifier</key>
-            <string>com.robydev.roby-term</string>
+            <string>com.robydev.velt</string>
             <key>CFBundleInfoDictionaryVersion</key>
             <string>6.0</string>
             <key>CFBundleName</key>
-            <string>Roby-Term</string>
+            <string>Velt</string>
             <key>CFBundlePackageType</key>
             <string>APPL</string>
             <key>CFBundleShortVersionString</key>
@@ -93,7 +93,7 @@ jobs:
 
             codesign --force --deep --sign - "$APP_DIR"
             ln -s /Applications dist/dmg-stage/Applications
-            hdiutil create -volname "Roby-Term" -srcfolder dist/dmg-stage -ov -format UDZO "dist/Roby-Term-macos-arm64.dmg"
+            hdiutil create -volname "Velt" -srcfolder dist/dmg-stage -ov -format UDZO "dist/Velt-macos-arm64.dmg"
             rm -rf dist/dmg-stage
           else
             cp "$BIN_PATH" "dist/${{ matrix.artifact_name }}"
