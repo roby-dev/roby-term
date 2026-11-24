@@ -14,6 +14,7 @@ pub struct Cell {
     pub fg: Rgb,
     pub bg: Rgb,
     pub bold: bool,
+    pub dim: bool,
     pub underline: bool,
     pub inverse: bool,
 }
@@ -25,6 +26,7 @@ impl Cell {
             fg,
             bg,
             bold: false,
+            dim: false,
             underline: false,
             inverse: false,
         }
@@ -48,6 +50,7 @@ pub struct TerminalGrid {
     cur_fg: Rgb,
     cur_bg: Rgb,
     cur_bold: bool,
+    cur_dim: bool,
     cur_underline: bool,
     cur_inverse: bool,
     alt_screen: bool,
@@ -96,6 +99,7 @@ impl TerminalGrid {
             cur_fg: default_fg,
             cur_bg: default_bg,
             cur_bold: false,
+            cur_dim: false,
             cur_underline: false,
             cur_inverse: false,
             alt_screen: false,
@@ -512,6 +516,7 @@ impl TerminalGrid {
         self.cur_fg = self.default_fg;
         self.cur_bg = self.default_bg;
         self.cur_bold = false;
+        self.cur_dim = false;
         self.cur_underline = false;
         self.cur_inverse = false;
     }
@@ -525,9 +530,13 @@ impl TerminalGrid {
             match code {
                 0 => self.reset_sgr(),
                 1 => self.cur_bold = true,
+                2 => self.cur_dim = true,
                 4 => self.cur_underline = true,
                 7 => self.cur_inverse = true,
-                22 => self.cur_bold = false,
+                22 => {
+                    self.cur_bold = false;
+                    self.cur_dim = false;
+                }
                 24 => self.cur_underline = false,
                 27 => self.cur_inverse = false,
                 30..=37 => self.cur_fg = ansi_256_color((code - 30) as u8),
@@ -538,31 +547,39 @@ impl TerminalGrid {
                 100..=107 => self.cur_bg = ansi_256_color((code - 100 + 8) as u8),
                 38 | 48 => {
                     let is_fg = code == 38;
-                    if let Some(mode_sub) = iter.next() {
-                        match mode_sub.first().copied().unwrap_or(0) {
-                            5 => {
-                                if let Some(idx_sub) = iter.next() {
-                                    let idx = idx_sub.first().copied().unwrap_or(0) as u8;
-                                    let color = ansi_256_color(idx);
-                                    if is_fg {
-                                        self.cur_fg = color;
-                                    } else {
-                                        self.cur_bg = color;
-                                    }
-                                }
+                    // Support both colon-separated (`38:2::R:G:B`, `48:5:N`) and semicolon-separated SGR
+                    let parsed = if sub.len() > 1 {
+                        match sub[1] {
+                            5 if sub.len() >= 3 => Some(ansi_256_color(sub[2] as u8)),
+                            2 if sub.len() >= 6 => {
+                                Some(Rgb::new(sub[3] as u8, sub[4] as u8, sub[5] as u8))
                             }
+                            2 if sub.len() == 5 => {
+                                Some(Rgb::new(sub[2] as u8, sub[3] as u8, sub[4] as u8))
+                            }
+                            _ => None,
+                        }
+                    } else if let Some(mode_sub) = iter.next() {
+                        match mode_sub.first().copied().unwrap_or(0) {
+                            5 => iter
+                                .next()
+                                .map(|idx_sub| ansi_256_color(idx_sub.first().copied().unwrap_or(0) as u8)),
                             2 => {
                                 let r = iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
                                 let g = iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
                                 let b = iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
-                                let color = Rgb::new(r, g, b);
-                                if is_fg {
-                                    self.cur_fg = color;
-                                } else {
-                                    self.cur_bg = color;
-                                }
+                                Some(Rgb::new(r, g, b))
                             }
-                            _ => {}
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(color) = parsed {
+                        if is_fg {
+                            self.cur_fg = color;
+                        } else {
+                            self.cur_bg = color;
                         }
                     }
                 }
@@ -725,6 +742,7 @@ impl Perform for TerminalGrid {
             fg: self.cur_fg,
             bg: self.cur_bg,
             bold: self.cur_bold,
+            dim: self.cur_dim,
             underline: self.cur_underline,
             inverse: self.cur_inverse,
         };
@@ -750,6 +768,7 @@ impl Perform for TerminalGrid {
                     fg: self.cur_fg,
                     bg: self.cur_bg,
                     bold: self.cur_bold,
+                    dim: self.cur_dim,
                     underline: self.cur_underline,
                     inverse: self.cur_inverse,
                 };
@@ -775,6 +794,30 @@ impl Perform for TerminalGrid {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.len() >= 2 && params[1] == b"?" {
+            match params[0] {
+                b"10" => {
+                    let c = self.default_fg;
+                    let resp = format!(
+                        "\x1b]10;rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}\x1b\\",
+                        c.r, c.g, c.b
+                    );
+                    self.pending_responses.push(resp.into_bytes());
+                }
+                b"11" => {
+                    let c = self.default_bg;
+                    let resp = format!(
+                        "\x1b]11;rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}\x1b\\",
+                        c.r, c.g, c.b
+                    );
+                    self.pending_responses.push(resp.into_bytes());
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1705,5 +1748,29 @@ mod tests {
         assert_eq!(resp, vec![b"\x1b[1;4R".to_vec()]);
         g2.feed(b"\x1b[0K");
         assert_eq!(g2.extract_selection((0, 0), (0, 3), 0), "abc");
+    }
+
+    #[test]
+    fn responds_to_osc_10_and_11_color_queries_and_parses_colon_sgr_and_dim() {
+        let fg = Rgb::new(0xE0, 0xE2, 0xEC);
+        let bg = Rgb::new(0x0C, 0x0E, 0x14);
+        let mut grid = TerminalGrid::new(20, 3, fg, bg);
+
+        // OSC 10 & OSC 11 queries (used by Codex / Ratatui to theme input box)
+        grid.feed(b"\x1b]10;?\x07\x1b]11;?\x1b\\");
+        let resps = grid.take_responses();
+        assert_eq!(resps.len(), 2);
+        assert_eq!(resps[0], b"\x1b]10;rgb:e0e0/e2e2/ecec\x1b\\");
+        assert_eq!(resps[1], b"\x1b]11;rgb:0c0c/0e0e/1414\x1b\\");
+
+        // Colon-separated truecolor background (`48:2::30:34:48`) + SGR 2 dim
+        grid.feed(b"\x1b[2;48:2::30:34:48mX\x1b[22;49mY");
+        let row = grid.visible_row(0, 0).unwrap();
+        assert_eq!(row[0].ch, 'X');
+        assert_eq!(row[0].bg, Rgb::new(30, 34, 48));
+        assert!(row[0].dim);
+        assert_eq!(row[1].ch, 'Y');
+        assert_eq!(row[1].bg, bg);
+        assert!(!row[1].dim);
     }
 }

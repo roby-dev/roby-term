@@ -2142,7 +2142,8 @@ fn render_session_pane(
                 if bg != theme.bg_terminal {
                     canvas.fill_rect(Rect::new(cx as u32, cy as u32, cw, ch), bg);
                 }
-                let draw_fg = if is_hovered_path { user.accent } else { fg };
+                let base_fg = if cell.dim { fg.lerp(bg, 115) } else { fg };
+                let draw_fg = if is_hovered_path { user.accent } else { base_fg };
                 font.draw_cell_char(canvas, cx, cy, cell.ch, draw_fg, max_x);
                 if cell.underline || is_hovered_path {
                     canvas.fill_rect(

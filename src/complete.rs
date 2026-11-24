@@ -117,6 +117,7 @@ pub fn complete_input(
     let (token_start, token, is_first_word) = split_last_token(input);
     let prefix_before = &input[..token_start];
 
+    let dirs_only = is_dir_only_command(input);
     let looks_like_path = !is_first_word
         || token.contains('/')
         || token.contains('\\')
@@ -124,11 +125,11 @@ pub fn complete_input(
         || token.starts_with('~');
 
     if looks_like_path {
-        complete_path(prefix_before, token, cwd, limit)
+        complete_path(prefix_before, token, cwd, limit, dirs_only)
     } else {
         // First word without path separator: include matching folders/files in `cwd`
         // AND matching commands from `PATH`, so typing e.g. `Tak` + Tab finds `TakanaCore\`.
-        let mut results = complete_path(prefix_before, token, cwd, limit);
+        let mut results = complete_path(prefix_before, token, cwd, limit, false);
         if results.len() < limit {
             let remaining = limit - results.len();
             for cmd in cmd_index.match_prefix(token, remaining) {
@@ -146,6 +147,24 @@ pub fn complete_input(
         results.truncate(limit);
         results
     }
+}
+
+/// Returns true if the active token is an argument to a directory-only command (`cd`, `pushd`, `Set-Location`, etc.).
+pub fn is_dir_only_command(input: &str) -> bool {
+    if input.is_empty() {
+        return false;
+    }
+    let (_, _, is_first_word) = split_last_token(input);
+    if is_first_word {
+        return false;
+    }
+    let Some(first) = input.split_whitespace().next() else {
+        return false;
+    };
+    matches!(
+        first.to_ascii_lowercase().as_str(),
+        "cd" | "chdir" | "pushd" | "set-location" | "sl" | "rmdir"
+    )
 }
 
 /// Returns true if the active token is a path/argument (so path completions should take priority).
@@ -230,6 +249,7 @@ fn complete_path(
     raw_token: &str,
     cwd: &Path,
     limit: usize,
+    dirs_only: bool,
 ) -> Vec<CompletionItem> {
     let quoted = raw_token.starts_with('"') || raw_token.starts_with('\'');
     let unquoted = raw_token.trim_start_matches(['"', '\'']);
@@ -268,6 +288,9 @@ fn complete_path(
         }
 
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if dirs_only && !is_dir {
+            continue;
+        }
         let mut completed = format!("{dir_prefix}{fname}");
         if is_dir {
             completed.push(sep_char);
@@ -580,6 +603,26 @@ mod tests {
         // 8 bytes, byte index 7 falls inside a multi-byte char
         fs::write(dir.join(".git").join("HEAD"), "abcdeéé\n").unwrap();
         assert_eq!(detect_git_branch(&dir).as_deref(), Some("abcdeéé"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cd_completes_only_directories_from_cwd() {
+        let dir = std::env::temp_dir().join("my_warp_cd_dirs_only_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("alpha_dir")).unwrap();
+        fs::create_dir_all(dir.join("beta_dir")).unwrap();
+        fs::write(dir.join("a_file.txt"), "hi").unwrap();
+
+        let idx = PathCommandIndex::from_list(vec!["cd".into()]);
+        assert!(is_dir_only_command("cd "));
+        assert!(is_dir_only_command("Set-Location a"));
+        assert!(!is_dir_only_command("cat "));
+
+        let items = complete_input("cd ", &dir, &idx, 8);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| i.kind == CompletionKind::Directory));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

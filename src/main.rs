@@ -41,7 +41,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Icon, Window, WindowId};
 
-const MAX_VISIBLE_SUGGESTIONS: usize = 5;
+const MAX_VISIBLE_SUGGESTIONS: usize = 8;
 
 struct App {
     proxy: EventLoopProxy<()>,
@@ -833,18 +833,22 @@ impl App {
         }
 
         let path_mode = is_completing_path(text);
+        let dir_only_mode = my_warp::complete::is_dir_only_command(text);
         let fs_or_cmd = complete_input(text, &sess.cwd, &self.cmd_index, MAX_VISIBLE_SUGGESTIONS);
-        let hist_items: Vec<CompletionItem> = self
-            .history
-            .suggest(text, &sess.shell.badge, MAX_VISIBLE_SUGGESTIONS)
-            .into_iter()
-            .map(|s| CompletionItem {
-                display: s.command.clone(),
-                replacement: s.command,
-                meta: format!("{} {}x", s.shell_badge, s.count),
-                kind: CompletionKind::History,
-            })
-            .collect();
+        let hist_items: Vec<CompletionItem> = if dir_only_mode {
+            Vec::new()
+        } else {
+            self.history
+                .suggest(text, &sess.shell.badge, MAX_VISIBLE_SUGGESTIONS)
+                .into_iter()
+                .map(|s| CompletionItem {
+                    display: s.command.clone(),
+                    replacement: s.command,
+                    meta: format!("{} {}x", s.shell_badge, s.count),
+                    kind: CompletionKind::History,
+                })
+                .collect()
+        };
 
         let mut merged = Vec::with_capacity(MAX_VISIBLE_SUGGESTIONS);
         if path_mode {
