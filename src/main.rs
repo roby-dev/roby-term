@@ -1292,6 +1292,10 @@ impl App {
         }
     }
 
+    fn allows_text_input(&self) -> bool {
+        allows_text_input_for_modifiers(self.modifiers)
+    }
+
     fn handle_history_modal_key(&mut self, event: KeyEvent) {
         let primary = self.primary_modifier();
         if primary {
@@ -1346,7 +1350,7 @@ impl App {
                 self.ui.history_modal.selected = 0;
             }
             _ => {
-                if !self.modifiers.control_key() && !self.modifiers.alt_key() {
+                if self.allows_text_input() {
                     if let Some(text) = &event.text {
                         for ch in text.chars() {
                             if !ch.is_control() {
@@ -1425,7 +1429,7 @@ impl App {
                 self.ui.palette.selected = 0;
             }
             _ => {
-                if !self.modifiers.control_key() && !self.modifiers.alt_key() {
+                if self.allows_text_input() {
                     if let Some(text) = &event.text {
                         for ch in text.chars() {
                             if !ch.is_control() {
@@ -1551,7 +1555,7 @@ impl App {
                 self.refresh_search();
             }
             _ => {
-                if !self.modifiers.control_key() && !self.modifiers.alt_key() {
+                if self.allows_text_input() {
                     if let Some(text) = &event.text {
                         let mut changed = false;
                         for ch in text.chars() {
@@ -1801,7 +1805,7 @@ impl App {
                     return;
                 }
                 _ => {
-                    if !ctrl && !self.modifiers.alt_key() && !self.modifiers.super_key() {
+                    if self.allows_text_input() {
                         if let Some(text) = &event.text {
                             for ch in text.chars() {
                                 if !ch.is_control()
@@ -2231,7 +2235,7 @@ impl App {
                 self.ui.suggestion_navigated = false;
             }
             _ => {
-                if !ctrl && !self.modifiers.alt_key() && !self.modifiers.super_key() {
+                if allows_text_input_for_modifiers(self.modifiers) {
                     if let Some(text) = &event.text {
                         for ch in text.chars() {
                             if !ch.is_control() {
@@ -2457,6 +2461,26 @@ impl ApplicationHandler<()> for App {
     }
 }
 
+/// Returns true when the active modifier combination permits inserting printable
+/// `event.text` into text inputs.
+///
+/// On macOS, Option (`ALT`) is used to compose symbols like `@`, `#`, `~`, `|`, `\`, `[`, `]`, `{`, `}`.
+/// On Windows/Linux, AltGr is reported as `CONTROL | ALT` and is also used for symbol composition.
+fn allows_text_input_for_modifiers(modifiers: ModifiersState) -> bool {
+    if modifiers.super_key() {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        !modifiers.control_key()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (!modifiers.control_key() && !modifiers.alt_key())
+            || (modifiers.control_key() && modifiers.alt_key())
+    }
+}
+
 fn main() {
     let event_loop = EventLoop::<()>::with_user_event()
         .build()
@@ -2466,4 +2490,45 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let mut app = App::new(proxy).expect("failed to initialize my-warp");
     event_loop.run_app(&mut app).expect("event loop error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allows_plain_and_shift_text_input() {
+        assert!(allows_text_input_for_modifiers(ModifiersState::empty()));
+        assert!(allows_text_input_for_modifiers(ModifiersState::SHIFT));
+    }
+
+    #[test]
+    fn blocks_super_and_plain_control_text_input() {
+        assert!(!allows_text_input_for_modifiers(ModifiersState::SUPER));
+        assert!(!allows_text_input_for_modifiers(
+            ModifiersState::SUPER | ModifiersState::ALT
+        ));
+        assert!(!allows_text_input_for_modifiers(ModifiersState::CONTROL));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn allows_macos_option_symbol_composition() {
+        assert!(allows_text_input_for_modifiers(ModifiersState::ALT));
+        assert!(allows_text_input_for_modifiers(
+            ModifiersState::ALT | ModifiersState::SHIFT
+        ));
+        assert!(!allows_text_input_for_modifiers(
+            ModifiersState::CONTROL | ModifiersState::ALT
+        ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn allows_altgr_symbol_composition_on_non_macos() {
+        assert!(allows_text_input_for_modifiers(
+            ModifiersState::CONTROL | ModifiersState::ALT
+        ));
+        assert!(!allows_text_input_for_modifiers(ModifiersState::ALT));
+    }
 }
