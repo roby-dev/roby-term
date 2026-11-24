@@ -1867,13 +1867,12 @@ impl App {
                     if let Some(clip) = paste_text() {
                         if let Some(sess) = self.sessions.active_mut() {
                             if sess.effective_passthrough() {
-                                let is_multiline = clip.contains('\n') || clip.contains('\r');
-                                if is_multiline && sess.grid.bracketed_paste_enabled() {
-                                    sess.write_bytes(b"\x1b[200~");
-                                    sess.write_bytes(clip.as_bytes());
-                                    sess.write_bytes(b"\x1b[201~");
-                                } else {
-                                    sess.write_bytes(clip.as_bytes());
+                                let payload = encode_passthrough_paste(
+                                    &clip,
+                                    sess.grid.bracketed_paste_enabled(),
+                                );
+                                if !payload.is_empty() {
+                                    sess.write_bytes(&payload);
                                 }
                             } else {
                                 let single_line = clip.replace("\r\n", " ").replace('\n', " ");
@@ -2481,6 +2480,30 @@ fn allows_text_input_for_modifiers(modifiers: ModifiersState) -> bool {
     }
 }
 
+/// Encodes clipboard text for PTY paste in passthrough mode.
+///
+/// Normalizes CRLF/LF line endings to CR (`\r`), strips embedded bracketed-paste
+/// markers, and wraps the payload atomically in `\x1b[200~ ... \x1b[201~` whenever
+/// bracketed paste is enabled OR the paste spans multiple lines (important on
+/// Windows ConPTY, which often swallows `CSI ? 2004 h` from CLI agents).
+fn encode_passthrough_paste(text: &str, bracketed_paste_enabled: bool) -> Vec<u8> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+    let is_multiline = normalized.contains('\r');
+    if bracketed_paste_enabled || is_multiline {
+        let sanitized = normalized.replace("\x1b[200~", "").replace("\x1b[201~", "");
+        let mut out = Vec::with_capacity(sanitized.len() + 12);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(sanitized.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        normalized.into_bytes()
+    }
+}
+
 fn main() {
     let event_loop = EventLoop::<()>::with_user_event()
         .build()
@@ -2530,5 +2553,37 @@ mod tests {
             ModifiersState::CONTROL | ModifiersState::ALT
         ));
         assert!(!allows_text_input_for_modifiers(ModifiersState::ALT));
+    }
+
+    #[test]
+    fn passthrough_paste_wraps_multiline_even_without_bracketed_flag_and_normalizes_crlf() {
+        let input = "Paragraph 1\r\n\r\n1. Item A\n2. Item B";
+        let encoded = encode_passthrough_paste(input, false);
+        assert_eq!(
+            encoded,
+            b"\x1b[200~Paragraph 1\r\r1. Item A\r2. Item B\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn passthrough_paste_wraps_single_line_only_when_bracketed_enabled() {
+        assert_eq!(encode_passthrough_paste("hello world", false), b"hello world");
+        assert_eq!(
+            encode_passthrough_paste("hello world", true),
+            b"\x1b[200~hello world\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn passthrough_paste_strips_nested_bracketed_markers() {
+        let input = "before\x1b[201~injected\r\n\x1b[200~after";
+        let encoded = encode_passthrough_paste(input, true);
+        assert_eq!(encoded, b"\x1b[200~beforeinjected\rafter\x1b[201~");
+    }
+
+    #[test]
+    fn passthrough_paste_empty_returns_empty() {
+        assert!(encode_passthrough_paste("", false).is_empty());
+        assert!(encode_passthrough_paste("", true).is_empty());
     }
 }
