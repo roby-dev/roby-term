@@ -429,6 +429,7 @@ impl InputBar {
         self.history_index = Some(next_idx);
         self.buffer = self.history[next_idx].clone();
         self.cursor = self.buffer.len();
+        self.selection_anchor = None;
     }
 
     pub fn history_next(&mut self) {
@@ -444,6 +445,7 @@ impl InputBar {
             self.buffer = std::mem::take(&mut self.draft_before_history);
         }
         self.cursor = self.buffer.len();
+        self.selection_anchor = None;
     }
 
     fn prev_char_boundary(&self) -> usize {
@@ -544,5 +546,34 @@ mod tests {
         assert_eq!(bar.selected_text(), Some("Backend Core"));
         bar.insert_str("DB");
         assert_eq!(bar.text(), "DB");
+    }
+
+    #[test]
+    fn history_navigation_clears_selection_anchor_without_panic() {
+        let mut bar = InputBar::new();
+        bar.set_text("ls");
+        let _ = bar.submit();
+
+        // Type a much longer draft and select part of it
+        bar.set_text("this is a very long draft command");
+        bar.move_left_with_select(true);
+        bar.move_left_with_select(true);
+        assert!(bar.selected_range().is_some());
+
+        // Recalling shorter history entry must clear selection_anchor
+        bar.history_prev();
+        assert_eq!(bar.text(), "ls");
+        assert_eq!(bar.selected_range(), None);
+        assert_eq!(bar.selected_char_range(), None);
+
+        // Navigating forward with active selection must also clear selection_anchor
+        bar.select_all();
+        assert!(bar.selected_range().is_some());
+        bar.history_next();
+        assert_eq!(bar.text(), "this is a very long draft command");
+        assert_eq!(bar.selected_range(), None);
+        assert_eq!(bar.selected_char_range(), None);
+        bar.backspace();
+        assert_eq!(bar.text(), "this is a very long draft comman");
     }
 }

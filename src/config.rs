@@ -73,6 +73,9 @@ pub const PRESET_ACCENTS: &[(&str, Rgb)] = &[
 /// Parses `#RRGGBB`, `RRGGBB`, `#RGB`, or `RGB` into an `Rgb` color.
 pub fn parse_hex_color(input: &str) -> Option<Rgb> {
     let s = input.trim().trim_start_matches('#');
+    if !s.is_ascii() {
+        return None;
+    }
     match s.len() {
         6 => {
             let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -285,6 +288,13 @@ mod tests {
         assert_eq!(parse_hex_color("#f0a"), Some(Rgb::new(0xFF, 0x00, 0xAA)));
         assert_eq!(parse_hex_color("not-hex"), None);
         assert_eq!(format_hex_color(Rgb::new(0xA8, 0x8B, 0xD6)), "#A88BD6");
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_non_ascii_without_panic() {
+        assert_eq!(parse_hex_color("ña"), None); // 3 bytes, non-ASCII
+        assert_eq!(parse_hex_color("ééé"), None); // 6 bytes, non-ASCII
+        assert_eq!(parse_hex_color("#ñññ"), None); // 6 bytes after '#'
     }
 
     #[test]

@@ -561,10 +561,27 @@ impl TerminalGrid {
 
     fn leave_alt_screen(&mut self) {
         if self.alt_screen {
-            if let Some(main_cells) = self.saved_main_cells.take() {
+            let mut saved_row = self.saved_cursor.0;
+            if let Some(mut main_cells) = self.saved_main_cells.take() {
+                let blank = Cell::blank(self.default_fg, self.default_bg);
+                for row in &mut main_cells {
+                    row.resize(self.cols, blank);
+                }
+                while main_cells.len() > self.rows {
+                    if saved_row >= self.rows {
+                        let top = main_cells.remove(0);
+                        self.push_scrollback(top);
+                        saved_row = saved_row.saturating_sub(1);
+                    } else {
+                        main_cells.pop();
+                    }
+                }
+                while main_cells.len() < self.rows {
+                    main_cells.push(vec![blank; self.cols]);
+                }
                 self.cells = main_cells;
             }
-            self.cursor_row = self.saved_cursor.0.min(self.rows - 1);
+            self.cursor_row = saved_row.min(self.rows - 1);
             self.cursor_col = self.saved_cursor.1.min(self.cols - 1);
             self.scroll_top = 0;
             self.scroll_bottom = self.rows - 1;
@@ -1122,10 +1139,47 @@ pub fn open_link(target: &LinkTarget) {
     }
 }
 
+/// Returns true when `url` is a valid HTTP(S) URL with no control or whitespace characters.
+pub fn is_safe_browser_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && !url.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
 pub fn open_url_in_browser(url: &str) {
+    if !is_safe_browser_url(url) {
+        return;
+    }
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr;
+
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut core::ffi::c_void,
+                lp_operation: *const u16,
+                lp_file: *const u16,
+                lp_parameters: *const u16,
+                lp_directory: *const u16,
+                n_show_cmd: i32,
+            ) -> isize;
+        }
+
+        let op: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
+        let target: Vec<u16> = OsStr::new(url).encode_wide().chain(Some(0)).collect();
+        unsafe {
+            ShellExecuteW(
+                ptr::null_mut(),
+                op.as_ptr(),
+                target.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                1, // SW_SHOWNORMAL
+            );
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -1477,5 +1531,42 @@ mod tests {
         g2.commit_screen_to_scrollback();
         assert_eq!(g2.scrollback_len(), 5);
         assert_eq!(row_text(&g2, 0), "");
+    }
+
+    #[test]
+    fn leave_alt_screen_after_resize_normalizes_main_grid_without_panic() {
+        let fg = Rgb::new(220, 220, 220);
+        let bg = Rgb::new(10, 10, 10);
+        let mut grid = TerminalGrid::new(20, 5, fg, bg);
+        grid.feed(b"main line 1\r\nmain line 2");
+
+        // Enter alt screen, grow window, leave alt screen, then clear/scroll
+        grid.feed(b"\x1b[?1049h");
+        grid.resize(40, 12);
+        grid.feed(b"\x1b[?1049l");
+
+        assert_eq!(grid.cols(), 40);
+        assert_eq!(grid.rows(), 12);
+        grid.feed(b"\x1b[2J\x1b[12;1Hbottom\r\nscrolled");
+        assert!(grid.visible_row(11, 0).is_some());
+
+        // Enter alt screen again, shrink window, leave alt screen
+        grid.feed(b"\x1b[?1049h");
+        grid.resize(10, 3);
+        grid.feed(b"\x1b[?1049l");
+        assert_eq!(grid.cols(), 10);
+        assert_eq!(grid.rows(), 3);
+        grid.feed(b"\x1b[K");
+    }
+
+    #[test]
+    fn is_safe_browser_url_allows_http_query_and_rejects_unsafe_schemes() {
+        assert!(is_safe_browser_url("https://example.com/?a=1&b=2"));
+        assert!(is_safe_browser_url("http://localhost:3000/api?x=1&y=2"));
+        assert!(!is_safe_browser_url("file:///C:/Windows/System32/calc.exe"));
+        assert!(!is_safe_browser_url("javascript:alert(1)"));
+        assert!(!is_safe_browser_url("calc.exe"));
+        assert!(!is_safe_browser_url("https://example.com/\r\ncalc.exe"));
+        assert!(!is_safe_browser_url("https://example.com/ with space"));
     }
 }

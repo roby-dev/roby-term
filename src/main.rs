@@ -1584,6 +1584,12 @@ impl App {
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
         let primary = self.primary_modifier();
+        let is_passthrough = self
+            .sessions
+            .active()
+            .is_some_and(|s| s.effective_passthrough());
+        let allow_unshifted_shortcut =
+            allows_unshifted_primary_shortcut(is_passthrough, cfg!(target_os = "macos"), shift);
 
         // Global overlay toggles: Ctrl+, (Settings), Ctrl+K (Snippets), Ctrl+F (Search), Ctrl+Shift+D (Split)
         if primary {
@@ -1602,12 +1608,20 @@ impl App {
                     self.request_redraw();
                     return;
                 }
-                if s.eq_ignore_ascii_case("b") && !shift && !self.ui.settings.open {
+                if allow_unshifted_shortcut
+                    && s.eq_ignore_ascii_case("b")
+                    && !shift
+                    && !self.ui.settings.open
+                {
                     self.toggle_sidebar();
                     self.request_redraw();
                     return;
                 }
-                if s.eq_ignore_ascii_case("r") && !shift && !self.ui.settings.open {
+                if allow_unshifted_shortcut
+                    && s.eq_ignore_ascii_case("r")
+                    && !shift
+                    && !self.ui.settings.open
+                {
                     self.ui.picker_open = false;
                     self.ui.palette.open = false;
                     self.ui.ports.open = false;
@@ -1618,7 +1632,8 @@ impl App {
                     self.request_redraw();
                     return;
                 }
-                if s.eq_ignore_ascii_case("k") && !self.ui.settings.open {
+                if allow_unshifted_shortcut && s.eq_ignore_ascii_case("k") && !self.ui.settings.open
+                {
                     self.ui.picker_open = false;
                     self.ui.search.open = false;
                     self.ui.palette.open = !self.ui.palette.open;
@@ -1628,7 +1643,11 @@ impl App {
                     self.request_redraw();
                     return;
                 }
-                if s.eq_ignore_ascii_case("f") && !self.ui.settings.open && !self.ui.palette.open {
+                if allow_unshifted_shortcut
+                    && s.eq_ignore_ascii_case("f")
+                    && !self.ui.settings.open
+                    && !self.ui.palette.open
+                {
                     self.ui.picker_open = false;
                     self.ui.search.open = !self.ui.search.open;
                     if self.ui.search.open {
@@ -1942,13 +1961,13 @@ impl App {
                     self.request_redraw();
                     return;
                 }
-                Key::Character(s) if s.eq_ignore_ascii_case("t") => {
+                Key::Character(s) if allow_unshifted_shortcut && s.eq_ignore_ascii_case("t") => {
                     self.ui.picker_open = !self.ui.picker_open;
                     self.ui.picker_selected = 0;
                     self.request_redraw();
                     return;
                 }
-                Key::Character(s) if s.eq_ignore_ascii_case("w") => {
+                Key::Character(s) if allow_unshifted_shortcut && s.eq_ignore_ascii_case("w") => {
                     let was_split = self.sessions.is_split();
                     self.sessions.close_active();
                     if was_split && !self.sessions.is_split() {
@@ -2504,6 +2523,17 @@ fn encode_passthrough_paste(text: &str, bracketed_paste_enabled: bool) -> Vec<u8
     }
 }
 
+/// Returns true when an unshifted primary shortcut (`Ctrl+W/T/R/B/F/K`) should be
+/// handled by Roby-Term rather than forwarded to the active PTY.
+///
+/// On Windows/Linux (`Ctrl` is primary), plain `Ctrl+*` shortcuts yield to the PTY
+/// in passthrough mode so interactive TUIs/agents (`vim`, `tmux`, `bash`, `claude`)
+/// receive them; holding `Shift` still invokes the app shortcut. On macOS (`Cmd` is
+/// primary), `Cmd+*` never collides with terminal `Ctrl+*`.
+fn allows_unshifted_primary_shortcut(passthrough: bool, primary_is_cmd: bool, shift: bool) -> bool {
+    !passthrough || primary_is_cmd || shift
+}
+
 fn main() {
     let event_loop = EventLoop::<()>::with_user_event()
         .build()
@@ -2585,5 +2615,18 @@ mod tests {
     fn passthrough_paste_empty_returns_empty() {
         assert!(encode_passthrough_paste("", false).is_empty());
         assert!(encode_passthrough_paste("", true).is_empty());
+    }
+
+    #[test]
+    fn unshifted_primary_shortcuts_yield_to_pty_in_windows_linux_passthrough() {
+        // Normal mode: shortcuts always allowed
+        assert!(allows_unshifted_primary_shortcut(false, false, false));
+        assert!(allows_unshifted_primary_shortcut(false, true, false));
+        // macOS passthrough (Cmd is primary): Cmd shortcuts do not collide with Ctrl+*
+        assert!(allows_unshifted_primary_shortcut(true, true, false));
+        // Windows/Linux passthrough (Ctrl is primary): plain Ctrl+* must go to PTY
+        assert!(!allows_unshifted_primary_shortcut(true, false, false));
+        // Windows/Linux passthrough with Shift (Ctrl+Shift+*): allowed for app shortcuts
+        assert!(allows_unshifted_primary_shortcut(true, false, true));
     }
 }
