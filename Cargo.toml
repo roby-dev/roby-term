@@ -1,6 +1,6 @@
 [package]
 name = "my-warp"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2021"
 description = "Roby-Term: ultra-low-RAM cross-platform (Windows & macOS) Rust terminal with session sidebar, user color themes, and syntax-colored input bar"
 
