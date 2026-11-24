@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "my-warp"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "fontdue",
  "portable-pty",
