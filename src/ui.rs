@@ -707,6 +707,7 @@ pub struct FontRenderer {
     cache: HashMap<(char, u16), (Metrics, Vec<u8>)>,
     pub font_name: String,
     pub term_px: f32,
+    pub scale: f32,
     pub cell_w: u32,
     pub cell_h: u32,
     pub baseline: i32,
@@ -737,6 +738,7 @@ impl FontRenderer {
             cache: HashMap::with_capacity(128),
             font_name: chosen.name.clone(),
             term_px,
+            scale: 1.0,
             cell_w: 9,
             cell_h: 19,
             baseline: 14,
@@ -751,12 +753,23 @@ impl FontRenderer {
         self.recompute_metrics();
     }
 
+    pub fn set_scale_factor(&mut self, scale: f32) {
+        let next = scale.max(1.0);
+        if (self.scale - next).abs() > 0.001 {
+            self.scale = next;
+            self.cache.clear();
+            self.recompute_metrics();
+        }
+    }
+
     fn recompute_metrics(&mut self) {
-        let (m_metrics, _) = self.font.rasterize('M', self.term_px);
-        self.cell_w = (m_metrics.advance_width.ceil() as u32).max(7);
-        let (cell_h, baseline) = if let Some(lm) = self.font.horizontal_line_metrics(self.term_px) {
-            let h = (lm.new_line_size.ceil() as u32).max(14);
-            let base = lm.ascent.ceil() as i32;
+        let s = self.scale.max(1.0);
+        let phys_px = self.term_px * s;
+        let (m_metrics, _) = self.font.rasterize('M', phys_px);
+        self.cell_w = ((m_metrics.advance_width / s).ceil() as u32).max(7);
+        let (cell_h, baseline) = if let Some(lm) = self.font.horizontal_line_metrics(phys_px) {
+            let h = ((lm.new_line_size / s).ceil() as u32).max(14);
+            let base = (lm.ascent / s).ceil() as i32;
             (h, base)
         } else {
             ((self.term_px * 1.3) as u32, self.term_px as i32)
@@ -773,12 +786,14 @@ impl FontRenderer {
     }
 
     pub fn measure_text(&mut self, text: &str, px: f32) -> u32 {
+        let s = self.scale.max(1.0);
+        let phys_px = px * s;
         let mut w = 0.0f32;
         for ch in text.chars() {
-            let (m, _) = self.glyph(ch, px);
+            let (m, _) = self.glyph(ch, phys_px);
             w += m.advance_width;
         }
-        w.ceil() as u32
+        (w / s).ceil() as u32
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -792,27 +807,30 @@ impl FontRenderer {
         text: &str,
         max_x: i32,
     ) -> i32 {
+        let s = canvas.scale();
+        let phys_px = px * s;
+        let phys_max_x = ((max_x as f32) * s).round() as i32;
         let ascent = self
             .font
-            .horizontal_line_metrics(px)
+            .horizontal_line_metrics(phys_px)
             .map(|lm| lm.ascent.ceil() as i32)
-            .unwrap_or((px * 0.8) as i32);
-        let baseline_y = y + ascent;
-        let mut pen_x = x as f32;
+            .unwrap_or((phys_px * 0.8) as i32);
+        let baseline_y = ((y as f32) * s).round() as i32 + ascent;
+        let mut pen_x = (x as f32) * s;
 
         for ch in text.chars() {
-            if pen_x as i32 >= max_x {
+            if pen_x as i32 >= phys_max_x {
                 break;
             }
-            let (metrics, bitmap) = self.glyph(ch, px);
+            let (metrics, bitmap) = self.glyph(ch, phys_px);
             let gx = pen_x.round() as i32 + metrics.xmin;
             let gy = baseline_y - metrics.height as i32 - metrics.ymin;
             if !bitmap.is_empty() && ch != ' ' {
-                canvas.blit_alpha(gx, gy, metrics.width, metrics.height, bitmap, color, max_x);
+                canvas.blit_alpha(gx, gy, metrics.width, metrics.height, bitmap, color, phys_max_x);
             }
             pen_x += metrics.advance_width;
         }
-        pen_x.round() as i32
+        (pen_x / s).round() as i32
     }
 
     pub fn draw_cell_char(
@@ -827,31 +845,52 @@ impl FontRenderer {
         if ch == ' ' || ch == '\0' {
             return;
         }
-        let baseline_y = cell_y + self.baseline;
-        let (metrics, bitmap) = self.glyph(ch, self.term_px);
+        let s = canvas.scale();
+        let phys_px = self.term_px * s;
+        let phys_max_x = ((max_x as f32) * s).round() as i32;
+        let phys_x = ((cell_x as f32) * s).round() as i32;
+        let phys_y = ((cell_y as f32) * s).round() as i32;
+        let ascent = self
+            .font
+            .horizontal_line_metrics(phys_px)
+            .map(|lm| lm.ascent.ceil() as i32)
+            .unwrap_or(((self.baseline as f32) * s).round() as i32);
+        let baseline_y = phys_y + ascent;
+        let (metrics, bitmap) = self.glyph(ch, phys_px);
         if bitmap.is_empty() {
             return;
         }
-        let gx = cell_x + metrics.xmin;
+        let gx = phys_x + metrics.xmin;
         let gy = baseline_y - metrics.height as i32 - metrics.ymin;
-        canvas.blit_alpha(gx, gy, metrics.width, metrics.height, bitmap, color, max_x);
+        canvas.blit_alpha(gx, gy, metrics.width, metrics.height, bitmap, color, phys_max_x);
     }
 }
 
 /// Zero-dependency 2D software framebuffer wrapper over `softbuffer`'s `&mut [u32]`.
+/// Accepts logical UI coordinates and renders into the physical framebuffer at `scale`.
 pub struct Canvas<'a> {
     pixels: &'a mut [u32],
     width: u32,
     height: u32,
+    scale: f32,
 }
 
 impl<'a> Canvas<'a> {
     pub fn new(pixels: &'a mut [u32], width: u32, height: u32) -> Self {
+        Self::new_scaled(pixels, width, height, 1.0)
+    }
+
+    pub fn new_scaled(pixels: &'a mut [u32], width: u32, height: u32, scale: f32) -> Self {
         Self {
             pixels,
             width,
             height,
+            scale: scale.max(1.0),
         }
+    }
+
+    pub fn scale(&self) -> f32 {
+        self.scale
     }
 
     pub fn clear(&mut self, color: Rgb) {
@@ -859,14 +898,25 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn fill_rect(&mut self, r: Rect, color: Rgb) {
+        if r.w == 0 || r.h == 0 || self.width == 0 || self.height == 0 {
+            return;
+        }
         let c = color.to_u32();
-        let x0 = r.x.min(self.width);
-        let y0 = r.y.min(self.height);
-        let x1 = r.x.saturating_add(r.w).min(self.width);
-        let y1 = r.y.saturating_add(r.h).min(self.height);
+        let s = self.scale;
+        let x0 = (((r.x as f32) * s).round().max(0.0) as u32).min(self.width);
+        let y0 = (((r.y as f32) * s).round().max(0.0) as u32).min(self.height);
+        let x1 = (((r.x.saturating_add(r.w) as f32) * s).round().max(0.0) as u32).min(self.width);
+        let y1 = (((r.y.saturating_add(r.h) as f32) * s).round().max(0.0) as u32).min(self.height);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
         for y in y0..y1 {
-            let row_start = (y * self.width) as usize;
-            self.pixels[row_start + x0 as usize..row_start + x1 as usize].fill(c);
+            let row_start = (y as usize) * (self.width as usize);
+            let start = row_start + x0 as usize;
+            let end = row_start + x1 as usize;
+            if end <= self.pixels.len() {
+                self.pixels[start..end].fill(c);
+            }
         }
     }
 
@@ -1091,8 +1141,12 @@ impl UiState {
 
 /// Renders the entire terminal application into the 2D software framebuffer.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn render_app(
     pixels: &mut [u32],
+    phys_width: u32,
+    phys_height: u32,
+    scale: f32,
     layout: &Layout,
     font: &mut FontRenderer,
     theme: &Theme,
@@ -1107,7 +1161,7 @@ pub fn render_app(
     history: &HistoryStore,
     usage: &AgentUsage,
 ) {
-    let mut canvas = Canvas::new(pixels, layout.width, layout.height);
+    let mut canvas = Canvas::new_scaled(pixels, phys_width, phys_height, scale);
     canvas.clear(theme.bg_terminal);
 
     // 1..7 Sidebar (skipped when collapsed via Ctrl+B)
@@ -3225,5 +3279,25 @@ mod tests {
             ),
             HitTarget::InputBar
         );
+    }
+
+    #[test]
+    fn canvas_hidpi_scales_logical_rects_to_physical_pixels() {
+        let mut pixels = vec![0u32; 20 * 20];
+        let mut canvas = Canvas::new_scaled(&mut pixels, 20, 20, 2.0);
+        let color = Rgb::new(0x12, 0x34, 0x56);
+        canvas.fill_rect(Rect::new(2, 3, 4, 2), color);
+
+        let expected = color.to_u32();
+        for y in 0..20 {
+            for x in 0..20 {
+                let inside = (4..12).contains(&x) && (6..10).contains(&y);
+                assert_eq!(
+                    pixels[y * 20 + x] == expected,
+                    inside,
+                    "unexpected pixel at ({x}, {y})"
+                );
+            }
+        }
     }
 }

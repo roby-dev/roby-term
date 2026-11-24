@@ -68,6 +68,9 @@ struct App {
     last_usage_refresh: Instant,
     ui: UiState,
     layout: Layout,
+    scale_factor: f64,
+    phys_width: u32,
+    phys_height: u32,
     modifiers: ModifiersState,
     cursor_pos: (u32, u32),
     hovered_link_target: Option<LinkTarget>,
@@ -144,6 +147,9 @@ impl App {
             last_usage_refresh: Instant::now(),
             ui,
             layout,
+            scale_factor: 1.0,
+            phys_width: 1120,
+            phys_height: 720,
             modifiers: ModifiersState::empty(),
             cursor_pos: (0, 0),
             hovered_link_target: None,
@@ -713,11 +719,12 @@ impl App {
         }
 
         if reload_font {
-            if let Ok(new_font) = FontRenderer::load_with_config(
+            if let Ok(mut new_font) = FontRenderer::load_with_config(
                 self.config.font_name.as_deref(),
                 self.config.font_size,
                 &self.available_fonts,
             ) {
+                new_font.set_scale_factor(self.scale_factor as f32);
                 self.font = new_font;
                 self.resize_sessions_for_current_layout();
             }
@@ -860,17 +867,40 @@ impl App {
         }
     }
 
+    fn logical_size_from_physical(phys_w: u32, phys_h: u32, scale: f64) -> (u32, u32) {
+        let s = scale.max(1.0);
+        let lw = ((phys_w as f64) / s).round().max(1.0) as u32;
+        let lh = ((phys_h as f64) / s).round().max(1.0) as u32;
+        (lw, lh)
+    }
+
     fn handle_resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
-        self.layout = Layout::compute_with_sidebar(width, height, self.ui.sidebar_visible);
+        self.phys_width = width;
+        self.phys_height = height;
+        let (lw, lh) = Self::logical_size_from_physical(width, height, self.scale_factor);
+        self.layout = Layout::compute_with_sidebar(lw, lh, self.ui.sidebar_visible);
         if let Some(ref mut surface) = self.surface {
             if let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
                 let _ = surface.resize(w, h);
             }
         }
         self.resize_sessions_for_current_layout();
+        self.ui.clear_selection();
+        self.request_redraw();
+    }
+
+    fn handle_scale_factor_changed(&mut self, scale_factor: f64) {
+        self.scale_factor = scale_factor.max(1.0);
+        self.font.set_scale_factor(self.scale_factor as f32);
+        if self.phys_width > 0 && self.phys_height > 0 {
+            let (lw, lh) =
+                Self::logical_size_from_physical(self.phys_width, self.phys_height, self.scale_factor);
+            self.layout = Layout::compute_with_sidebar(lw, lh, self.ui.sidebar_visible);
+            self.resize_sessions_for_current_layout();
+        }
         self.ui.clear_selection();
         self.request_redraw();
     }
@@ -2021,14 +2051,22 @@ impl App {
                         // Shift+Enter inserts a newline in Claude Code, agy, Codex & modern TUIs
                         if sess.grid.kitty_keyboard_enabled() {
                             sess.write_bytes(b"\x1b[13;2u");
+                        } else if sess.grid.modify_other_keys_level() >= 1 {
+                            sess.write_bytes(b"\x1b[27;2;13~");
                         } else {
                             sess.write_bytes(b"\x1b\r");
                         }
                     } else if alt {
-                        sess.write_bytes(b"\x1b\r");
+                        if sess.grid.kitty_keyboard_enabled() {
+                            sess.write_bytes(b"\x1b[13;3u");
+                        } else {
+                            sess.write_bytes(b"\x1b\r");
+                        }
                     } else if ctrl {
                         if sess.grid.kitty_keyboard_enabled() {
                             sess.write_bytes(b"\x1b[13;5u");
+                        } else if sess.grid.modify_other_keys_level() >= 1 {
+                            sess.write_bytes(b"\x1b[27;5;13~");
                         } else {
                             sess.write_bytes(b"\n");
                         }
@@ -2224,6 +2262,9 @@ impl App {
         if let Ok(mut buffer) = surface.buffer_mut() {
             render_app(
                 &mut buffer,
+                self.phys_width,
+                self.phys_height,
+                self.scale_factor as f32,
                 &self.layout,
                 &mut self.font,
                 &self.theme,
@@ -2265,11 +2306,16 @@ impl ApplicationHandler<()> for App {
         let mut surface =
             Surface::new(&context, window.clone()).expect("failed to create softbuffer surface");
 
+        self.scale_factor = window.scale_factor().max(1.0);
+        self.font.set_scale_factor(self.scale_factor as f32);
         let size = window.inner_size();
         if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+            self.phys_width = size.width;
+            self.phys_height = size.height;
             let _ = surface.resize(w, h);
-            self.layout =
-                Layout::compute_with_sidebar(size.width, size.height, self.ui.sidebar_visible);
+            let (lw, lh) =
+                Self::logical_size_from_physical(size.width, size.height, self.scale_factor);
+            self.layout = Layout::compute_with_sidebar(lw, lh, self.ui.sidebar_visible);
             self.resize_sessions_for_current_layout();
         }
 
@@ -2289,7 +2335,13 @@ impl ApplicationHandler<()> for App {
             if sess_changed && self.ui.search.open {
                 self.refresh_search();
             }
-            self.request_redraw();
+            let in_sync = self
+                .sessions
+                .active()
+                .is_some_and(|s| s.grid.is_sync_output());
+            if !in_sync || plugin_changed || ports_changed || updates_changed {
+                self.request_redraw();
+            }
         }
     }
 
@@ -2301,9 +2353,16 @@ impl ApplicationHandler<()> for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => self.handle_resize(size.width, size.height),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.handle_scale_factor_changed(scale_factor);
+            }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_pos = (position.x.max(0.0) as u32, position.y.max(0.0) as u32);
+                let s = self.scale_factor.max(1.0);
+                self.cursor_pos = (
+                    (position.x / s).max(0.0) as u32,
+                    (position.y / s).max(0.0) as u32,
+                );
                 if self.ui.selecting {
                     let active_vp = self.active_pane_rect();
                     if let Some(cell) = Layout::pixel_to_cell_in(
@@ -2339,9 +2398,10 @@ impl ApplicationHandler<()> for App {
                 ..
             } => self.handle_mouse_up(),
             WindowEvent::MouseWheel { delta, .. } => {
+                let s = self.scale_factor.max(1.0);
                 let lines: i32 = match delta {
                     MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i32,
-                    MouseScrollDelta::PixelDelta(pos) => (pos.y / 16.0).round() as i32,
+                    MouseScrollDelta::PixelDelta(pos) => ((pos.y / s) / 16.0).round() as i32,
                 };
                 if lines == 0 {
                     return;

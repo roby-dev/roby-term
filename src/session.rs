@@ -201,6 +201,9 @@ impl Session {
             match self.rx.try_recv() {
                 Ok(chunk) => {
                     self.grid.feed(&chunk);
+                    for resp in self.grid.take_responses() {
+                        self.write_bytes(&resp);
+                    }
                     changed = true;
                 }
                 Err(TryRecvError::Empty) => break,

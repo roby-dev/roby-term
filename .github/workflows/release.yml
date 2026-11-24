@@ -19,10 +19,12 @@ jobs:
         include:
           - os: windows-latest
             target_name: windows-x64
+            rust_target: x86_64-pc-windows-msvc
             bin_name: roby-term.exe
             artifact_name: roby-term-windows-x64.exe
           - os: macos-latest
             target_name: macos-arm64
+            rust_target: aarch64-apple-darwin
             bin_name: roby-term
             artifact_name: roby-term-macos-arm64
 
@@ -32,24 +34,76 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - name: Run unit tests
         run: cargo test
 
       - name: Build release binary
-        run: cargo build --release
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: cargo build --release --target ${{ matrix.rust_target }}
 
-      - name: Prepare release asset
+      - name: Prepare release assets
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.bin_name }}" "dist/${{ matrix.artifact_name }}"
+          BIN_PATH="target/${{ matrix.rust_target }}/release/${{ matrix.bin_name }}"
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            codesign --force --sign - "$BIN_PATH"
+            cp "$BIN_PATH" "dist/${{ matrix.artifact_name }}"
+
+            VERSION="${GITHUB_REF_NAME#v}"
+            [[ -z "$VERSION" || "$VERSION" == "$GITHUB_REF_NAME" ]] && VERSION="0.0.0"
+
+            APP_DIR="dist/dmg-stage/Roby-Term.app"
+            mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+            cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/roby-term"
+            chmod +x "$APP_DIR/Contents/MacOS/roby-term"
+
+            cat > "$APP_DIR/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key>
+            <string>en</string>
+            <key>CFBundleExecutable</key>
+            <string>roby-term</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.robydev.roby-term</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleName</key>
+            <string>Roby-Term</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>12.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+            codesign --force --deep --sign - "$APP_DIR"
+            ln -s /Applications dist/dmg-stage/Applications
+            hdiutil create -volname "Roby-Term" -srcfolder dist/dmg-stage -ov -format UDZO "dist/Roby-Term-macos-arm64.dmg"
+            rm -rf dist/dmg-stage
+          else
+            cp "$BIN_PATH" "dist/${{ matrix.artifact_name }}"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/${{ matrix.artifact_name }}
+          name: ${{ matrix.target_name }}
+          path: dist/*
 
   release:
     name: Publish GitHub Release

@@ -54,7 +54,10 @@ pub struct TerminalGrid {
     mouse_tracking: bool,
     sgr_mouse: bool,
     bracketed_paste: bool,
-    kitty_keyboard_depth: u8,
+    sync_output: bool,
+    kitty_keyboard_stack: Vec<u8>,
+    modify_other_keys: u8,
+    pending_responses: Vec<Vec<u8>>,
     scroll_top: usize,
     scroll_bottom: usize,
     last_printed_char: char,
@@ -99,7 +102,10 @@ impl TerminalGrid {
             mouse_tracking: false,
             sgr_mouse: false,
             bracketed_paste: false,
-            kitty_keyboard_depth: 0,
+            sync_output: false,
+            kitty_keyboard_stack: Vec::new(),
+            modify_other_keys: 0,
+            pending_responses: Vec::new(),
             scroll_top: 0,
             scroll_bottom: rows - 1,
             last_printed_char: ' ',
@@ -127,7 +133,7 @@ impl TerminalGrid {
     /// Returns true when the running process has activated a TUI protocol
     /// (alt-screen, mouse tracking, or Kitty keyboard protocol).
     pub fn is_tui_active(&self) -> bool {
-        self.alt_screen || self.mouse_tracking || self.kitty_keyboard_depth > 0
+        self.alt_screen || self.mouse_tracking || self.kitty_keyboard_enabled()
     }
 
     pub fn mouse_tracking_enabled(&self) -> bool {
@@ -142,9 +148,30 @@ impl TerminalGrid {
         self.bracketed_paste
     }
 
+    /// Returns true while the running app is inside a synchronized output frame (`CSI ? 2026 h`).
+    pub fn is_sync_output(&self) -> bool {
+        self.sync_output
+    }
+
+    /// Returns the active Kitty keyboard protocol flags (0 when not active).
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        self.kitty_keyboard_stack.last().copied().unwrap_or(0)
+    }
+
     /// Returns true when the running app enabled the Kitty keyboard protocol (`CSI > flags u`).
     pub fn kitty_keyboard_enabled(&self) -> bool {
-        self.kitty_keyboard_depth > 0
+        !self.kitty_keyboard_stack.is_empty()
+    }
+
+    /// Returns the active xterm `modifyOtherKeys` level (`CSI > 4 ; level m`), 0 when disabled.
+    pub fn modify_other_keys_level(&self) -> u8 {
+        self.modify_other_keys
+    }
+
+    /// Drains any pending terminal query responses (e.g. Kitty keyboard `CSI ? u`, DA1, DSR)
+    /// that must be written back to the PTY.
+    pub fn take_responses(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending_responses)
     }
 
     pub fn scrollback_len(&self) -> usize {
@@ -546,15 +573,105 @@ impl TerminalGrid {
             self.mouse_tracking = false;
             self.sgr_mouse = false;
             self.bracketed_paste = false;
-            self.kitty_keyboard_depth = 0;
+            self.sync_output = false;
+            self.kitty_keyboard_stack.clear();
+            self.modify_other_keys = 0;
         }
     }
 }
 
+/// Returns the terminal column width of a Unicode scalar value (0 = combining/invisible,
+/// 2 = wide emoji/CJK, 1 = normal). Keeps cursor columns in sync with modern inline TUIs.
+fn char_display_width(c: char) -> usize {
+    let cp = c as u32;
+    if cp < 0x20 || cp == 0x7F || cp == 0x00AD {
+        return 0;
+    }
+    if matches!(
+        cp,
+        0x0300..=0x036F
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0x20D0..=0x20FF
+            | 0xFE00..=0xFE0F
+            | 0xFE20..=0xFE2F
+            | 0xFEFF
+            | 0xE0100..=0xE01EF
+    ) {
+        return 0;
+    }
+    if matches!(
+        cp,
+        0x1100..=0x115F
+            | 0x231A..=0x231B
+            | 0x2329..=0x232A
+            | 0x23E9..=0x23F3
+            | 0x23F8..=0x23FA
+            | 0x25FD..=0x25FE
+            | 0x2614..=0x2615
+            | 0x2648..=0x2653
+            | 0x267F
+            | 0x2693
+            | 0x26A1
+            | 0x26AA..=0x26AB
+            | 0x26BD..=0x26BE
+            | 0x26C4..=0x26C5
+            | 0x26CE
+            | 0x26D4
+            | 0x26EA
+            | 0x26F2..=0x26F3
+            | 0x26F5
+            | 0x26FA
+            | 0x26FD
+            | 0x2705
+            | 0x270A..=0x270B
+            | 0x2728
+            | 0x274C
+            | 0x274E
+            | 0x2753..=0x2755
+            | 0x2757
+            | 0x2795..=0x2797
+            | 0x27B0
+            | 0x27BF
+            | 0x2B1B..=0x2B1C
+            | 0x2B50
+            | 0x2B55
+            | 0x2E80..=0x303E
+            | 0x3040..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1FAFF
+            | 0x20000..=0x3FFFD
+    ) {
+        return 2;
+    }
+    1
+}
+
 impl Perform for TerminalGrid {
     fn print(&mut self, c: char) {
+        let width = char_display_width(c);
+        if width == 0 {
+            return;
+        }
         self.last_printed_char = c;
-        if self.cursor_col >= self.cols {
+        if width == 2 && self.cursor_col + 1 >= self.cols {
+            if self.cursor_col < self.cols {
+                let blank = Cell::blank(self.default_fg, self.cur_bg);
+                if let Some(row) = self.cells.get_mut(self.cursor_row) {
+                    row[self.cursor_col] = blank;
+                }
+            }
+            self.cursor_col = 0;
+            self.newline();
+        } else if self.cursor_col >= self.cols {
             self.cursor_col = 0;
             self.newline();
         }
@@ -570,8 +687,20 @@ impl Perform for TerminalGrid {
             if let Some(slot) = row.get_mut(self.cursor_col) {
                 *slot = cell;
             }
+            if width == 2 {
+                if let Some(cont) = row.get_mut(self.cursor_col + 1) {
+                    *cont = Cell {
+                        ch: '\0',
+                        fg: self.cur_fg,
+                        bg: self.cur_bg,
+                        bold: self.cur_bold,
+                        underline: self.cur_underline,
+                        inverse: self.cur_inverse,
+                    };
+                }
+            }
         }
-        self.cursor_col += 1;
+        self.cursor_col += width;
     }
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
@@ -598,7 +727,10 @@ impl Perform for TerminalGrid {
         match byte {
             b'\r' => self.cursor_col = 0,
             b'\n' | 0x0b | 0x0c => self.newline(),
-            0x08 => self.cursor_col = self.cursor_col.saturating_sub(1),
+            0x08 => {
+                // In VT100 pending-wrap state (`cursor_col == cols`), clamp to last column first
+                self.cursor_col = self.cursor_col.min(self.cols - 1).saturating_sub(1);
+            }
             b'\t' => {
                 let next_tab = ((self.cursor_col / 8) + 1) * 8;
                 self.cursor_col = next_tab.min(self.cols - 1);
@@ -626,6 +758,12 @@ impl Perform for TerminalGrid {
 
         let is_private = intermediates.contains(&b'?');
         if is_private {
+            if action == 'u' {
+                // Kitty keyboard protocol query (`CSI ? u`): reply with active flags
+                let resp = format!("\x1b[?{}u", self.kitty_keyboard_flags());
+                self.pending_responses.push(resp.into_bytes());
+                return;
+            }
             for sub in params.iter() {
                 let mode = sub.first().copied().unwrap_or(0) as usize;
                 match mode {
@@ -652,20 +790,57 @@ impl Perform for TerminalGrid {
                         'l' => self.bracketed_paste = false,
                         _ => {}
                     },
+                    2026 => match action {
+                        'h' => self.sync_output = true,
+                        'l' => self.sync_output = false,
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
             return;
         }
 
-        // Kitty keyboard protocol push/pop (`CSI > flags u` / `CSI < count u`)
+        // Kitty keyboard protocol push/pop/set (`CSI > flags u` / `CSI < count u` / `CSI = flags ; mode u`)
         if action == 'u' && intermediates.contains(&b'>') {
-            self.kitty_keyboard_depth = self.kitty_keyboard_depth.saturating_add(1);
+            let flags = raw_param(0).min(u8::MAX as usize) as u8;
+            if self.kitty_keyboard_stack.len() < 16 {
+                self.kitty_keyboard_stack.push(flags);
+            }
             return;
         }
         if action == 'u' && intermediates.contains(&b'<') {
-            let pop = param(0, 1).min(u8::MAX as usize) as u8;
-            self.kitty_keyboard_depth = self.kitty_keyboard_depth.saturating_sub(pop);
+            let pop = param(0, 1);
+            for _ in 0..pop {
+                if self.kitty_keyboard_stack.pop().is_none() {
+                    break;
+                }
+            }
+            return;
+        }
+        if action == 'u' && intermediates.contains(&b'=') {
+            let flags = raw_param(0).min(u8::MAX as usize) as u8;
+            let mode = param(1, 1);
+            if let Some(top) = self.kitty_keyboard_stack.last_mut() {
+                match mode {
+                    2 => *top |= flags,
+                    3 => *top &= !flags,
+                    _ => *top = flags,
+                }
+            } else if flags != 0 {
+                self.kitty_keyboard_stack.push(flags);
+            }
+            return;
+        }
+        // xterm modifyOtherKeys (`CSI > 4 ; level m` / `CSI > 4 m`)
+        if action == 'm' && intermediates.contains(&b'>') {
+            if raw_param(0) == 4 {
+                self.modify_other_keys = if params.len() >= 2 {
+                    raw_param(1).min(u8::MAX as usize) as u8
+                } else {
+                    0
+                };
+            }
             return;
         }
         if !intermediates.is_empty() {
@@ -674,10 +849,28 @@ impl Perform for TerminalGrid {
 
         match action {
             'm' => self.apply_sgr(params),
+            'c' => {
+                // DA1 — Primary Device Attributes (used as sentinel after Kitty keyboard `CSI ? u` probes)
+                if raw_param(0) == 0 {
+                    self.pending_responses.push(b"\x1b[?62;22c".to_vec());
+                }
+            }
+            'n' => {
+                // DSR — Device Status Report (`CSI 6 n` -> cursor position)
+                if raw_param(0) == 6 {
+                    let resp = format!("\x1b[{};{}R", self.cursor_row + 1, self.cursor_col + 1);
+                    self.pending_responses.push(resp.into_bytes());
+                }
+            }
             'A' => self.cursor_row = self.cursor_row.saturating_sub(param(0, 1)),
             'B' => self.cursor_row = (self.cursor_row + param(0, 1)).min(self.rows - 1),
             'C' => self.cursor_col = (self.cursor_col + param(0, 1)).min(self.cols - 1),
-            'D' => self.cursor_col = self.cursor_col.saturating_sub(param(0, 1)),
+            'D' => {
+                self.cursor_col = self
+                    .cursor_col
+                    .min(self.cols - 1)
+                    .saturating_sub(param(0, 1));
+            }
             'E' => {
                 // CNL — Cursor Next Line
                 self.cursor_row = (self.cursor_row + param(0, 1)).min(self.rows - 1);
@@ -1230,12 +1423,39 @@ mod tests {
         grid.feed(b"\x1b[3;1H-\x1b[4b");
         assert_eq!(row_text(&grid, 2), "-----");
 
-        // Kitty keyboard protocol push/pop (`CSI > 1 u` / `CSI < 1 u`)
+        // Kitty keyboard protocol query/push/pop (`CSI ? u`, `CSI > 1 u`, `CSI < 1 u`)
         assert!(!grid.kitty_keyboard_enabled());
+        grid.feed(b"\x1b[?u\x1b[c");
+        assert_eq!(
+            grid.take_responses(),
+            vec![b"\x1b[?0u".to_vec(), b"\x1b[?62;22c".to_vec()]
+        );
         grid.feed(b"\x1b[>1u");
         assert!(grid.kitty_keyboard_enabled());
+        assert_eq!(grid.kitty_keyboard_flags(), 1);
+        grid.feed(b"\x1b[?u");
+        assert_eq!(grid.take_responses(), vec![b"\x1b[?1u".to_vec()]);
         grid.feed(b"\x1b[<1u");
         assert!(!grid.kitty_keyboard_enabled());
+
+        // xterm modifyOtherKeys (`CSI > 4 ; 2 m` / `CSI > 4 m`)
+        assert_eq!(grid.modify_other_keys_level(), 0);
+        grid.feed(b"\x1b[>4;2m");
+        assert_eq!(grid.modify_other_keys_level(), 2);
+        grid.feed(b"\x1b[>4m");
+        assert_eq!(grid.modify_other_keys_level(), 0);
+
+        // Synchronized output (`?2026h` / `?2026l`)
+        assert!(!grid.is_sync_output());
+        grid.feed(b"\x1b[?2026h");
+        assert!(grid.is_sync_output());
+        grid.feed(b"\x1b[?2026l");
+        assert!(!grid.is_sync_output());
+
+        // Zero-width variation selector does not advance cursor; wide emoji advances 2 cells
+        let mut g_uni = TerminalGrid::new(10, 2, fg, bg);
+        g_uni.feed("a\u{fe0f}\u{2728}b".as_bytes());
+        assert_eq!(g_uni.cursor(), (0, 4)); // 'a'(1) + FE0F(0) + '✨'(2) + 'b'(1) = 4
 
         // Bracketed paste (`?2004h` / `?2004l`)
         assert!(!grid.bracketed_paste_enabled());
