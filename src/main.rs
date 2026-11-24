@@ -2054,19 +2054,41 @@ impl App {
         if sess.effective_passthrough() {
             sess.scroll_offset = 0;
             self.ui.clear_selection();
-            if ctrl {
+            let alt = self.modifiers.alt_key();
+            if ctrl && !alt {
                 if let Key::Character(s) = &event.logical_key {
                     if let Some(ch) = s.chars().next() {
                         let lower = ch.to_ascii_lowercase();
                         if lower.is_ascii_lowercase() {
                             let ctrl_byte = (lower as u8) - b'a' + 1;
                             sess.write_bytes(&[ctrl_byte]);
+                            self.request_redraw();
                             return;
                         }
                     }
                 }
             }
-            let alt = self.modifiers.alt_key();
+            if alt && !ctrl {
+                // On Windows/Linux, Alt (without Ctrl/AltGr) is always a Meta shortcut.
+                // On macOS, only treat Option as Meta when no composed symbol text was produced.
+                let use_alt_meta = !cfg!(target_os = "macos") || event.text.is_none();
+                if use_alt_meta {
+                    if let Key::Character(s) = &event.logical_key {
+                        if let Some(ch) = s.chars().next() {
+                            if ch.is_ascii_graphic() {
+                                let seq = encode_passthrough_alt_char(
+                                    ch,
+                                    shift,
+                                    sess.grid.kitty_keyboard_enabled(),
+                                );
+                                sess.write_bytes(&seq);
+                                self.request_redraw();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
             match &event.logical_key {
                 Key::Named(NamedKey::Enter) => {
                     if shift {
@@ -2096,7 +2118,6 @@ impl App {
                         sess.write_bytes(b"\r");
                     }
                 }
-                Key::Named(NamedKey::Backspace) => sess.write_bytes(&[0x7f]),
                 Key::Named(NamedKey::Tab) => {
                     if shift {
                         // BackTab / Shift+Tab (used by Claude Code, agy & TUIs to switch modes)
@@ -2106,15 +2127,15 @@ impl App {
                     }
                 }
                 Key::Named(NamedKey::Escape) => sess.write_bytes(&[0x1b]),
-                Key::Named(NamedKey::ArrowUp) => sess.write_bytes(b"\x1b[A"),
-                Key::Named(NamedKey::ArrowDown) => sess.write_bytes(b"\x1b[B"),
-                Key::Named(NamedKey::ArrowRight) => sess.write_bytes(b"\x1b[C"),
-                Key::Named(NamedKey::ArrowLeft) => sess.write_bytes(b"\x1b[D"),
-                Key::Named(NamedKey::Home) => sess.write_bytes(b"\x1b[H"),
-                Key::Named(NamedKey::End) => sess.write_bytes(b"\x1b[F"),
-                Key::Named(NamedKey::PageUp) => sess.write_bytes(b"\x1b[5~"),
-                Key::Named(NamedKey::PageDown) => sess.write_bytes(b"\x1b[6~"),
-                Key::Named(NamedKey::Delete) => sess.write_bytes(b"\x1b[3~"),
+                Key::Named(named) => {
+                    if let Some(seq) =
+                        encode_passthrough_nav_key(*named, alt && !ctrl, ctrl && !alt)
+                    {
+                        sess.write_bytes(seq);
+                    } else if let Some(text) = &event.text {
+                        sess.write_bytes(text.as_bytes());
+                    }
+                }
                 _ => {
                     if let Some(text) = &event.text {
                         sess.write_bytes(text.as_bytes());
@@ -2534,6 +2555,77 @@ fn allows_unshifted_primary_shortcut(passthrough: bool, primary_is_cmd: bool, sh
     !passthrough || primary_is_cmd || shift
 }
 
+/// Encodes `Alt+<char>` for passthrough PTY input (Meta ESC-prefix or Kitty keyboard protocol).
+fn encode_passthrough_alt_char(ch: char, shift: bool, kitty_keyboard: bool) -> Vec<u8> {
+    if kitty_keyboard {
+        let base = if ch.is_ascii_alphabetic() {
+            ch.to_ascii_lowercase() as u32
+        } else {
+            ch as u32
+        };
+        let modifier = if shift { 4 } else { 3 };
+        format!("\x1b[{base};{modifier}u").into_bytes()
+    } else {
+        let out_ch = if shift && ch.is_ascii_lowercase() {
+            ch.to_ascii_uppercase()
+        } else {
+            ch
+        };
+        let mut buf = Vec::with_capacity(1 + out_ch.len_utf8());
+        buf.push(0x1b);
+        let mut tmp = [0u8; 4];
+        buf.extend_from_slice(out_ch.encode_utf8(&mut tmp).as_bytes());
+        buf
+    }
+}
+
+/// Encodes navigation/editing named keys with optional `Alt` or `Ctrl` modifiers for PTY input.
+fn encode_passthrough_nav_key(key: NamedKey, alt: bool, ctrl: bool) -> Option<&'static [u8]> {
+    match key {
+        NamedKey::Backspace => Some(if alt { b"\x1b\x7f" } else { b"\x7f" }),
+        NamedKey::ArrowUp => Some(if alt {
+            b"\x1b[1;3A"
+        } else if ctrl {
+            b"\x1b[1;5A"
+        } else {
+            b"\x1b[A"
+        }),
+        NamedKey::ArrowDown => Some(if alt {
+            b"\x1b[1;3B"
+        } else if ctrl {
+            b"\x1b[1;5B"
+        } else {
+            b"\x1b[B"
+        }),
+        NamedKey::ArrowRight => Some(if alt {
+            b"\x1b[1;3C"
+        } else if ctrl {
+            b"\x1b[1;5C"
+        } else {
+            b"\x1b[C"
+        }),
+        NamedKey::ArrowLeft => Some(if alt {
+            b"\x1b[1;3D"
+        } else if ctrl {
+            b"\x1b[1;5D"
+        } else {
+            b"\x1b[D"
+        }),
+        NamedKey::Home => Some(if ctrl { b"\x1b[1;5H" } else { b"\x1b[H" }),
+        NamedKey::End => Some(if ctrl { b"\x1b[1;5F" } else { b"\x1b[F" }),
+        NamedKey::PageUp => Some(b"\x1b[5~"),
+        NamedKey::PageDown => Some(b"\x1b[6~"),
+        NamedKey::Delete => Some(if alt {
+            b"\x1b[3;3~"
+        } else if ctrl {
+            b"\x1b[3;5~"
+        } else {
+            b"\x1b[3~"
+        }),
+        _ => None,
+    }
+}
+
 fn main() {
     let event_loop = EventLoop::<()>::with_user_event()
         .build()
@@ -2628,5 +2720,38 @@ mod tests {
         assert!(!allows_unshifted_primary_shortcut(true, false, false));
         // Windows/Linux passthrough with Shift (Ctrl+Shift+*): allowed for app shortcuts
         assert!(allows_unshifted_primary_shortcut(true, false, true));
+    }
+
+    #[test]
+    fn passthrough_alt_char_encodes_meta_and_kitty_sequences() {
+        assert_eq!(encode_passthrough_alt_char('m', false, false), b"\x1bm");
+        assert_eq!(encode_passthrough_alt_char('m', true, false), b"\x1bM");
+        assert_eq!(encode_passthrough_alt_char('m', false, true), b"\x1b[109;3u");
+        assert_eq!(encode_passthrough_alt_char('M', true, true), b"\x1b[109;4u");
+        assert_eq!(encode_passthrough_alt_char('p', false, false), b"\x1bp");
+    }
+
+    #[test]
+    fn passthrough_nav_key_encodes_alt_and_ctrl_modifiers() {
+        assert_eq!(
+            encode_passthrough_nav_key(NamedKey::Backspace, false, false),
+            Some(b"\x7f".as_slice())
+        );
+        assert_eq!(
+            encode_passthrough_nav_key(NamedKey::Backspace, true, false),
+            Some(b"\x1b\x7f".as_slice())
+        );
+        assert_eq!(
+            encode_passthrough_nav_key(NamedKey::ArrowLeft, true, false),
+            Some(b"\x1b[1;3D".as_slice())
+        );
+        assert_eq!(
+            encode_passthrough_nav_key(NamedKey::ArrowRight, false, true),
+            Some(b"\x1b[1;5C".as_slice())
+        );
+        assert_eq!(
+            encode_passthrough_nav_key(NamedKey::Delete, true, false),
+            Some(b"\x1b[3;3~".as_slice())
+        );
     }
 }
