@@ -7,6 +7,9 @@
 #[cfg_attr(unix, path = "process_unix.rs")]
 #[cfg_attr(windows, path = "process_windows.rs")]
 mod process;
+mod chat;
+
+pub use chat::{Chat, ConnectionState, MAX_PROMPT_BYTES, MAX_RESPONSE_BYTES};
 
 use serde_json::{json, Value};
 use std::{
@@ -160,6 +163,12 @@ impl Client {
         self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
         self.next_id += 1;
         Ok(id)
+    }
+    fn respond(&self, id: &Value, response: Result<Value, Value>) -> io::Result<()> {
+        self.send(match response {
+            Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+            Err(error) => json!({"jsonrpc":"2.0","id":id,"error":error}),
+        })
     }
     pub fn initialize(&mut self) -> io::Result<u64> {
         self.request("initialize", json!({"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"velt","version":env!("CARGO_PKG_VERSION")}}))
