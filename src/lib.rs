@@ -1,3 +1,4 @@
+pub mod acp;
 pub mod builtin;
 pub mod clipboard;
 pub mod complete;
