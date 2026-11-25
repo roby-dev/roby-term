@@ -62,6 +62,7 @@ pub struct TerminalGrid {
     modify_other_keys: u8,
     pending_responses: Vec<Vec<u8>>,
     reported_cwd: Option<std::path::PathBuf>,
+    screen_cleared: bool,
     scroll_top: usize,
     scroll_bottom: usize,
     last_printed_char: char,
@@ -112,6 +113,7 @@ impl TerminalGrid {
             modify_other_keys: 0,
             pending_responses: Vec::new(),
             reported_cwd: None,
+            screen_cleared: false,
             scroll_top: 0,
             scroll_bottom: rows - 1,
             last_printed_char: ' ',
@@ -184,6 +186,12 @@ impl TerminalGrid {
     /// `OSC 9;9;<path>` (ConEmu / Windows Terminal) or `OSC 7;file://host/<path>`.
     pub fn take_reported_cwd(&mut self) -> Option<std::path::PathBuf> {
         self.reported_cwd.take()
+    }
+
+    /// Returns `true` once after the screen (`CSI 2 J`) or scrollback (`CSI 3 J`) was cleared,
+    /// e.g. by `cls` / `clear`, so command blocks anchored to wiped lines can be dropped.
+    pub fn take_screen_cleared(&mut self) -> bool {
+        std::mem::take(&mut self.screen_cleared)
     }
 
     pub fn scrollback_len(&self) -> usize {
@@ -1118,9 +1126,13 @@ impl Perform for TerminalGrid {
                         for row in &mut self.cells {
                             row.fill(blank);
                         }
+                        self.screen_cleared = true;
                     }
                     3 => {
+                        // Keep absolute line numbers monotonic: cleared scrollback counts as evicted.
+                        self.evicted_lines += self.scrollback.len();
                         self.scrollback.clear();
+                        self.screen_cleared = true;
                     }
                     _ => {}
                 }
@@ -1507,6 +1519,30 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_scrollback_keeps_abs_lines_monotonic_and_flags_screen_clear() {
+        let fg = Rgb::new(220, 220, 220);
+        let bg = Rgb::new(0, 0, 0);
+        let mut grid = TerminalGrid::new(20, 3, fg, bg);
+        assert!(!grid.take_screen_cleared());
+        grid.feed(b"a\r\nb\r\nc\r\nd\r\ne");
+        let before = grid.current_abs_line();
+        assert_eq!(before, 4);
+
+        // ConPTY `cls`: home + per-line erase + clear scrollback
+        grid.feed(b"\x1b[H\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[H\x1b[3J");
+        assert!(grid.take_screen_cleared());
+        assert!(!grid.take_screen_cleared(), "flag is drained once");
+        assert!(
+            grid.current_abs_line() >= 2,
+            "cursor at row 0 must stay at/after the old screen top, got {}",
+            grid.current_abs_line()
+        );
+
+        grid.feed(b"\x1b[2J");
+        assert!(grid.take_screen_cleared());
+    }
 
     #[test]
     fn captures_shell_reported_cwd_from_osc_9_9_and_osc_7() {

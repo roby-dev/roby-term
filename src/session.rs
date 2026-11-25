@@ -209,6 +209,10 @@ impl Session {
                     if let Some(reported) = self.grid.take_reported_cwd() {
                         self.apply_reported_cwd(reported);
                     }
+                    if self.grid.take_screen_cleared() {
+                        // `cls` / `clear` wiped every line the blocks were anchored to
+                        self.blocks.clear();
+                    }
                     changed = true;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -925,6 +929,47 @@ mod tests {
 
         drop(s);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cls_drops_command_blocks_anchored_to_wiped_lines() {
+        let shells = discover_shells();
+        let Some(ps) = shells
+            .iter()
+            .find(|s| matches!(s.kind, crate::shell::ShellKind::PowerShell7 | crate::shell::ShellKind::WindowsPowerShell))
+            .cloned()
+        else {
+            return;
+        };
+        let mut s = Session::spawn_with_state(
+            0, ps, 80, 10, Rgb::new(220, 220, 220), Rgb::new(0, 0, 0), None, None, None, None,
+        )
+        .expect("spawn powershell");
+        let accent = Rgb::new(255, 255, 255);
+        let pump = |s: &mut Session, ms: u64| {
+            let deadline = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < deadline {
+                s.poll_output();
+                thread::sleep(Duration::from_millis(50));
+            }
+        };
+        pump(&mut s, 4000);
+        for i in 0..3 {
+            s.submit_command(&format!("echo line{i}"), accent);
+            pump(&mut s, 800);
+        }
+        assert_eq!(s.blocks.len(), 3);
+
+        s.submit_command("cls", accent);
+        pump(&mut s, 2500);
+        assert!(s.blocks.is_empty(), "stale Copy/Re-run badges remain: {}", s.blocks.len());
+
+        // New commands after cls get fresh, correctly anchored blocks
+        s.submit_command("echo after", accent);
+        pump(&mut s, 800);
+        assert_eq!(s.blocks.len(), 1);
+        assert!(s.block_output_text(0).unwrap().contains("after"));
     }
 
     #[test]
