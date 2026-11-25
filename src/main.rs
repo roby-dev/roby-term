@@ -2534,32 +2534,46 @@ impl ApplicationHandler<()> for App {
                 .unwrap_or((1, 1));
 
                 if let Some(sess) = self.sessions.active_mut() {
-                    if sess.grid.mouse_tracking_enabled() {
-                        // Forward mouse wheel events to TUI/agents (Claude Code, agy, vim, lazygit)
-                        let ticks = lines.unsigned_abs().clamp(1, 5);
-                        let btn = if lines > 0 { 64 } else { 65 };
-                        for _ in 0..ticks {
-                            if sess.grid.sgr_mouse_enabled() {
+                    let mode = resolve_wheel_forward_mode(
+                        sess.grid.mouse_tracking_enabled(),
+                        sess.grid.sgr_mouse_enabled(),
+                        sess.grid.is_alt_screen(),
+                        sess.grid.kitty_keyboard_enabled(),
+                    );
+                    match mode {
+                        WheelForwardMode::SgrMouse => {
+                            let ticks = lines.unsigned_abs().clamp(1, 5);
+                            let btn = if lines > 0 { 64 } else { 65 };
+                            for _ in 0..ticks {
                                 let seq = format!("\x1b[<{btn};{cell_col};{cell_row}M");
                                 sess.write_bytes(seq.as_bytes());
-                            } else {
-                                let cb = (btn as u8).saturating_add(32);
-                                let cx = (cell_col.min(223) as u8).saturating_add(32);
-                                let cy = (cell_row.min(223) as u8).saturating_add(32);
+                            }
+                        }
+                        WheelForwardMode::X10Mouse => {
+                            let ticks = lines.unsigned_abs().clamp(1, 5);
+                            let btn = if lines > 0 { 64 } else { 65 };
+                            let cb = (btn as u8).saturating_add(32);
+                            let cx = (cell_col.min(223) as u8).saturating_add(32);
+                            let cy = (cell_row.min(223) as u8).saturating_add(32);
+                            for _ in 0..ticks {
                                 sess.write_bytes(&[0x1b, b'[', b'M', cb, cx, cy]);
                             }
                         }
-                    } else if sess.grid.is_alt_screen() {
-                        // Alternate scroll mode for alt-screen apps without mouse tracking (less, man)
-                        let ticks = lines.unsigned_abs().clamp(1, 5);
-                        let seq: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
-                        for _ in 0..ticks {
-                            sess.write_bytes(seq);
+                        WheelForwardMode::AltScreenArrows => {
+                            // Alternate scroll mode for classic alt-screen pagers (less, man)
+                            let ticks = lines.unsigned_abs().clamp(1, 5);
+                            let seq: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
+                            for _ in 0..ticks {
+                                sess.write_bytes(seq);
+                            }
                         }
-                    } else if lines > 0 {
-                        sess.scroll_up(lines as usize);
-                    } else {
-                        sess.scroll_down(lines.unsigned_abs() as usize);
+                        WheelForwardMode::Scrollback => {
+                            if lines > 0 {
+                                sess.scroll_up(lines as usize);
+                            } else {
+                                sess.scroll_down(lines.unsigned_abs() as usize);
+                            }
+                        }
                     }
                     self.request_redraw();
                 }
@@ -2569,6 +2583,45 @@ impl ApplicationHandler<()> for App {
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WheelForwardMode {
+    SgrMouse,
+    X10Mouse,
+    AltScreenArrows,
+    Scrollback,
+}
+
+/// Decides how mouse wheel events should be routed for the active session.
+///
+/// On Windows, inbox ConPTY (`conhost.exe`) silently drops `CSI ? 1000/1002/1003/1006 h`
+/// when a fullscreen TUI emits them before enabling `ENABLE_VIRTUAL_TERMINAL_INPUT`
+/// (as `pi-tui` does in `beforeTerminalStart()`), yet still forwards SGR mouse wheel
+/// input (`\x1b[<64;col;rowM`) once raw mode is active. Falling back to Up/Down arrows
+/// in modern alt-screen TUIs that negotiate Kitty keyboard protocol would cycle prompt
+/// history instead of scrolling, so we emit SGR mouse wheel events for them on Windows.
+fn resolve_wheel_forward_mode(
+    mouse_tracking: bool,
+    sgr_mouse: bool,
+    alt_screen: bool,
+    kitty_keyboard: bool,
+) -> WheelForwardMode {
+    if mouse_tracking {
+        if sgr_mouse {
+            WheelForwardMode::SgrMouse
+        } else {
+            WheelForwardMode::X10Mouse
+        }
+    } else if alt_screen {
+        if cfg!(target_os = "windows") && kitty_keyboard {
+            WheelForwardMode::SgrMouse
+        } else {
+            WheelForwardMode::AltScreenArrows
+        }
+    } else {
+        WheelForwardMode::Scrollback
     }
 }
 
@@ -2981,6 +3034,34 @@ mod tests {
         assert_eq!(
             resolve_scroll_action(NamedKey::Home, true, true, true, false),
             None
+        );
+    }
+
+    #[test]
+    fn resolves_mouse_wheel_forwarding_for_tuis_and_pagers() {
+        assert_eq!(
+            resolve_wheel_forward_mode(false, false, false, false),
+            WheelForwardMode::Scrollback
+        );
+        assert_eq!(
+            resolve_wheel_forward_mode(true, true, true, true),
+            WheelForwardMode::SgrMouse
+        );
+        assert_eq!(
+            resolve_wheel_forward_mode(true, false, true, false),
+            WheelForwardMode::X10Mouse
+        );
+        // Classic alt-screen pagers (less, man) without Kitty keyboard still get Up/Down arrows
+        assert_eq!(
+            resolve_wheel_forward_mode(false, false, true, false),
+            WheelForwardMode::AltScreenArrows
+        );
+        // On Windows, alt-screen + Kitty keyboard (e.g. pi-tui when ConPTY drops ?1000h/?1006h)
+        // forwards SGR mouse wheel instead of Up/Down arrows.
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            resolve_wheel_forward_mode(false, false, true, true),
+            WheelForwardMode::SgrMouse
         );
     }
 }

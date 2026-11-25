@@ -452,6 +452,7 @@ pub fn is_interactive_command(raw_cmd: &str) -> bool {
             | "opencode"
             | "aider"
             | "gemini"
+            | "pi"
             | "vim"
             | "nvim"
             | "vi"
@@ -974,6 +975,7 @@ mod tests {
 
     #[test]
     fn detects_interactive_agents_tuis_and_bare_repls() {
+        assert!(is_interactive_command("pi"));
         assert!(is_interactive_command("agy"));
         assert!(is_interactive_command("cd app && agy"));
         assert!(is_interactive_command("agy.ps1"));

@@ -54,7 +54,7 @@ pub struct TerminalGrid {
     cur_underline: bool,
     cur_inverse: bool,
     alt_screen: bool,
-    mouse_tracking: bool,
+    mouse_tracking_modes: u8,
     sgr_mouse: bool,
     bracketed_paste: bool,
     sync_output: bool,
@@ -105,7 +105,7 @@ impl TerminalGrid {
             cur_underline: false,
             cur_inverse: false,
             alt_screen: false,
-            mouse_tracking: false,
+            mouse_tracking_modes: 0,
             sgr_mouse: false,
             bracketed_paste: false,
             sync_output: false,
@@ -141,11 +141,11 @@ impl TerminalGrid {
     /// Returns true when the running process has activated a TUI protocol
     /// (alt-screen, mouse tracking, or Kitty keyboard protocol).
     pub fn is_tui_active(&self) -> bool {
-        self.alt_screen || self.mouse_tracking || self.kitty_keyboard_enabled()
+        self.alt_screen || self.mouse_tracking_enabled() || self.kitty_keyboard_enabled()
     }
 
     pub fn mouse_tracking_enabled(&self) -> bool {
-        self.mouse_tracking
+        self.mouse_tracking_modes != 0
     }
 
     pub fn sgr_mouse_enabled(&self) -> bool {
@@ -648,7 +648,7 @@ impl TerminalGrid {
             self.scroll_top = 0;
             self.scroll_bottom = self.rows - 1;
             // Clear stale TUI protocol flags when returning to the normal shell
-            self.mouse_tracking = false;
+            self.mouse_tracking_modes = 0;
             self.sgr_mouse = false;
             self.bracketed_paste = false;
             self.sync_output = false;
@@ -890,11 +890,18 @@ impl Perform for TerminalGrid {
                         'l' => self.leave_alt_screen(),
                         _ => {}
                     },
-                    1000 | 1002 | 1003 => match action {
-                        'h' => self.mouse_tracking = true,
-                        'l' => self.mouse_tracking = false,
-                        _ => {}
-                    },
+                    1000 | 1002 | 1003 => {
+                        let bit = match mode {
+                            1000 => 1 << 0,
+                            1002 => 1 << 1,
+                            _ => 1 << 2,
+                        };
+                        match action {
+                            'h' => self.mouse_tracking_modes |= bit,
+                            'l' => self.mouse_tracking_modes &= !bit,
+                            _ => {}
+                        }
+                    }
                     1006 => match action {
                         'h' => self.sgr_mouse = true,
                         'l' => self.sgr_mouse = false,
@@ -1825,6 +1832,14 @@ mod tests {
         assert!(!grid.sgr_mouse_enabled());
         assert!(!grid.mouse_tracking_enabled());
         assert!(!grid.is_tui_active());
+
+        // Disabling one mouse tracking mode (e.g. 1003l) must not clear another active mode (1000h)
+        grid.feed(b"\x1b[?1000h\x1b[?1003h");
+        assert!(grid.mouse_tracking_enabled());
+        grid.feed(b"\x1b[?1003l");
+        assert!(grid.mouse_tracking_enabled());
+        grid.feed(b"\x1b[?1000l");
+        assert!(!grid.mouse_tracking_enabled());
     }
 
     #[test]
