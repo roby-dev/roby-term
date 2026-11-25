@@ -71,8 +71,11 @@ pub fn discover_shells() -> Vec<ShellProfile> {
     }
 }
 
+/// Wraps the PowerShell prompt so every prompt announces the real location via `OSC 9;9;<path>`
+/// (the ConEmu / Windows Terminal convention), letting Velt track cwd from the shell itself.
+/// The default prompt is also shortened to `PS <folder>>`; custom prompts are preserved.
 #[cfg(target_os = "windows")]
-const PS_SHORT_PROMPT_CMD: &str = "if ((Get-Command prompt -ErrorAction SilentlyContinue).Definition -like '*SessionState.Path.CurrentLocation*') { function prompt { $l = $executionContext.SessionState.Path.CurrentLocation.Path; $n = if ($l -eq $HOME) { '~' } else { Split-Path -Leaf $l }; if (-not $n) { $n = $l }; 'PS ' + $n + ('>' * ($nestedPromptLevel + 1)) + ' ' } }";
+const PS_SHORT_PROMPT_CMD: &str = "$global:__veltShortPrompt = (Get-Command prompt -ErrorAction SilentlyContinue).Definition -like '*SessionState.Path.CurrentLocation*'; $global:__veltPrompt = $function:prompt; function global:prompt { $loc = $executionContext.SessionState.Path.CurrentLocation; $osc = if ($loc.Provider.Name -eq 'FileSystem') { [char]27 + ']9;9;' + $loc.ProviderPath + [char]27 + '\\' } else { '' }; if ($global:__veltShortPrompt) { $l = $loc.Path; $n = if ($l -eq $HOME) { '~' } else { Split-Path -Leaf $l }; if (-not $n) { $n = $l }; $osc + 'PS ' + $n + ('>' * ($nestedPromptLevel + 1)) + ' ' } elseif ($global:__veltPrompt) { $osc + (& $global:__veltPrompt) } else { $osc + 'PS> ' } }";
 
 #[cfg(target_os = "windows")]
 fn discover_windows_shells() -> Vec<ShellProfile> {
@@ -295,8 +298,9 @@ mod tests {
             assert!(ps.args.iter().any(|a| a == "-NoExit"));
             let cmd_pos = ps.args.iter().position(|a| a == "-Command").expect("missing -Command");
             let script = ps.args.get(cmd_pos + 1).expect("missing prompt script");
-            assert!(script.contains("function prompt"));
+            assert!(script.contains("function global:prompt"));
             assert!(script.contains("Split-Path -Leaf"));
+            assert!(script.contains("']9;9;'"), "prompt must report cwd via OSC 9;9");
             assert!(!script.contains('"'), "avoid double quotes in Win32 args");
         }
     }

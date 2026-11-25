@@ -61,6 +61,7 @@ pub struct TerminalGrid {
     kitty_keyboard_stack: Vec<u8>,
     modify_other_keys: u8,
     pending_responses: Vec<Vec<u8>>,
+    reported_cwd: Option<std::path::PathBuf>,
     scroll_top: usize,
     scroll_bottom: usize,
     last_printed_char: char,
@@ -110,6 +111,7 @@ impl TerminalGrid {
             kitty_keyboard_stack: Vec::new(),
             modify_other_keys: 0,
             pending_responses: Vec::new(),
+            reported_cwd: None,
             scroll_top: 0,
             scroll_bottom: rows - 1,
             last_printed_char: ' ',
@@ -176,6 +178,12 @@ impl TerminalGrid {
     /// that must be written back to the PTY.
     pub fn take_responses(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.pending_responses)
+    }
+
+    /// Drains the latest working directory announced by the shell via
+    /// `OSC 9;9;<path>` (ConEmu / Windows Terminal) or `OSC 7;file://host/<path>`.
+    pub fn take_reported_cwd(&mut self) -> Option<std::path::PathBuf> {
+        self.reported_cwd.take()
     }
 
     pub fn scrollback_len(&self) -> usize {
@@ -798,6 +806,10 @@ impl Perform for TerminalGrid {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if let Some(cwd) = parse_cwd_osc(params) {
+            self.reported_cwd = Some(cwd);
+            return;
+        }
         if params.len() >= 2 && params[1] == b"?" {
             match params[0] {
                 b"10" => {
@@ -1440,9 +1452,90 @@ pub fn open_in_file_explorer(path: &Path) {
     }
 }
 
+/// Extracts a shell-reported working directory from `OSC 9;9;<path>` or `OSC 7;file://host/<path>`.
+fn parse_cwd_osc(params: &[&[u8]]) -> Option<std::path::PathBuf> {
+    let join_rest = |rest: &[&[u8]]| -> String {
+        rest.iter()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let raw = match params {
+        [b"9", b"9", rest @ ..] if !rest.is_empty() => {
+            join_rest(rest).trim().trim_matches('"').to_string()
+        }
+        [b"7", rest @ ..] if !rest.is_empty() => {
+            let uri = join_rest(rest);
+            let after_scheme = uri.strip_prefix("file://")?;
+            let path_start = after_scheme.find('/')?;
+            let mut path = percent_decode(&after_scheme[path_start..]);
+            // `/D:/dir` -> `D:/dir` on Windows-style URIs
+            let b = path.as_bytes();
+            if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+                path.remove(0);
+            }
+            path
+        }
+        _ => return None,
+    };
+    if raw.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(raw))
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captures_shell_reported_cwd_from_osc_9_9_and_osc_7() {
+        let fg = Rgb::new(220, 220, 220);
+        let bg = Rgb::new(0, 0, 0);
+        let mut grid = TerminalGrid::new(40, 3, fg, bg);
+        assert_eq!(grid.take_reported_cwd(), None);
+
+        grid.feed(b"\x1b]9;9;D:\\FUENTES\\remediacion-fuerzabruta\x1b\\PS remediacion-fuerzabruta> ");
+        assert_eq!(
+            grid.take_reported_cwd(),
+            Some(std::path::PathBuf::from(r"D:\FUENTES\remediacion-fuerzabruta"))
+        );
+        assert_eq!(grid.take_reported_cwd(), None, "reported cwd is drained once");
+        assert!(row_text(&grid, 0).starts_with("PS remediacion-fuerzabruta>"), "OSC must not print");
+
+        grid.feed(b"\x1b]9;9;\"C:\\Program Files\"\x07");
+        assert_eq!(grid.take_reported_cwd(), Some(std::path::PathBuf::from(r"C:\Program Files")));
+
+        grid.feed(b"\x1b]7;file://host/home/me/my%20dir\x07");
+        assert_eq!(grid.take_reported_cwd(), Some(std::path::PathBuf::from("/home/me/my dir")));
+
+        grid.feed(b"\x1b]7;file:///D:/FUENTES\x07");
+        assert_eq!(grid.take_reported_cwd(), Some(std::path::PathBuf::from("D:/FUENTES")));
+
+        // Other OSC 9 notifications are ignored
+        grid.feed(b"\x1b]9;4;1;50\x07");
+        assert_eq!(grid.take_reported_cwd(), None);
+    }
 
     fn row_text(grid: &TerminalGrid, row: usize) -> String {
         grid.visible_row(row, 0)

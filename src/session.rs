@@ -58,6 +58,7 @@ pub struct Session {
     pub has_unread_output: bool,
     pub alive: bool,
     last_was_builtin: bool,
+    shell_reports_cwd: bool,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -186,6 +187,7 @@ impl Session {
             has_unread_output: false,
             alive: true,
             last_was_builtin: false,
+            shell_reports_cwd: false,
             master: pair.master,
             writer,
             child,
@@ -203,6 +205,9 @@ impl Session {
                     self.grid.feed(&chunk);
                     for resp in self.grid.take_responses() {
                         self.write_bytes(&resp);
+                    }
+                    if let Some(reported) = self.grid.take_reported_cwd() {
+                        self.apply_reported_cwd(reported);
                     }
                     changed = true;
                 }
@@ -236,6 +241,21 @@ impl Session {
             }
         }
         changed
+    }
+
+    /// Adopts the working directory announced by the shell itself (OSC 9;9 / OSC 7).
+    /// Once the shell reports its cwd, it becomes the single source of truth and the
+    /// command-text heuristic is disabled, so header, prompt and built-ins never diverge.
+    fn apply_reported_cwd(&mut self, reported: PathBuf) {
+        let reported = strip_verbatim_prefix(reported);
+        if !reported.is_dir() {
+            return;
+        }
+        self.shell_reports_cwd = true;
+        if self.cwd != reported {
+            self.cwd = reported;
+            self.git_branch = detect_git_branch(&self.cwd);
+        }
     }
 
     /// Writes raw bytes to the PTY stdin.
@@ -298,10 +318,12 @@ impl Session {
             }
         }
 
-        if let Some(next_cwd) = maybe_update_cwd(&self.cwd, cmd) {
-            self.cwd = next_cwd;
+        if !self.shell_reports_cwd {
+            if let Some(next_cwd) = maybe_update_cwd(&self.cwd, cmd) {
+                self.cwd = next_cwd;
+            }
+            self.git_branch = detect_git_branch(&self.cwd);
         }
-        self.git_branch = detect_git_branch(&self.cwd);
         if is_interactive_command(cmd) {
             self.input.passthrough = true;
         }
@@ -853,6 +875,56 @@ mod tests {
 
         assert!(mgr.close_active());
         assert!(mgr.is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn powershell_session_tracks_real_cwd_from_shell_and_ignores_failed_cd() {
+        let shells = discover_shells();
+        let Some(ps) = shells
+            .iter()
+            .find(|s| matches!(s.kind, crate::shell::ShellKind::PowerShell7 | crate::shell::ShellKind::WindowsPowerShell))
+            .cloned()
+        else {
+            return;
+        };
+        let base = std::env::temp_dir().join(format!("velt-cwd-{}", std::process::id()));
+        let child = base.join("remediacion-fuerzabruta");
+        std::fs::create_dir_all(&child).unwrap();
+        let base = strip_verbatim_prefix(std::fs::canonicalize(&base).unwrap());
+        let child = strip_verbatim_prefix(std::fs::canonicalize(&child).unwrap());
+
+        let mut s = Session::spawn_with_state(
+            0, ps, 100, 30, Rgb::new(220, 220, 220), Rgb::new(0, 0, 0), None,
+            Some(base.clone()), None, None,
+        )
+        .expect("spawn powershell");
+        let accent = Rgb::new(255, 255, 255);
+        let wait_for = |s: &mut Session, want: &std::path::Path| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                s.poll_output();
+                if s.shell_reports_cwd && s.cwd == want {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            false
+        };
+        assert!(wait_for(&mut s, &base), "initial prompt must report cwd, got {:?}", s.cwd);
+
+        // Shell changes dir in a way the text heuristic cannot follow
+        s.submit_command("Set-Location -Path remediacion-fuerzabruta", accent);
+        assert!(wait_for(&mut s, &child), "cwd must follow the shell, got {:?}", s.cwd);
+
+        // A cd that fails in the shell must NOT move the tracked cwd
+        s.submit_command("cd remediacion-fuerzabruta\\", accent);
+        thread::sleep(Duration::from_millis(1500));
+        s.poll_output();
+        assert_eq!(s.cwd, child);
+
+        drop(s);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
