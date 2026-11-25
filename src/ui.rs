@@ -1092,6 +1092,7 @@ pub struct UiState {
     pub hovered: HitTarget,
     pub hovered_path: Option<(usize, usize, usize)>,
     pub hovered_path_label: Option<String>,
+    /// Drag endpoints as `(absolute line, column)`; alternate-screen lines are screen-local.
     pub selection_start: Option<(usize, usize)>,
     pub selection_end: Option<(usize, usize)>,
     pub selecting: bool,
@@ -2103,19 +2104,9 @@ fn render_session_pane(
                     (cell.fg, cell.bg)
                 };
 
-                if let Some(((sr, sc), (er, ec))) = sel_bounds {
-                    let in_sel = if row_idx > sr && row_idx < er {
-                        true
-                    } else if row_idx == sr && row_idx == er {
-                        col_idx >= sc && col_idx <= ec
-                    } else if row_idx == sr {
-                        col_idx >= sc
-                    } else if row_idx == er {
-                        col_idx <= ec
-                    } else {
-                        false
-                    };
-                    if in_sel {
+                if let Some((start, end)) = sel_bounds {
+                    let cell = (abs_line, col_idx);
+                    if start <= cell && cell <= end {
                         bg = sel_bg;
                     }
                 }

@@ -267,15 +267,39 @@ impl TerminalGrid {
         b: (usize, usize),
         scroll_offset: usize,
     ) -> String {
-        let (start, end) = if a <= b { (a, b) } else { (b, a) };
-        let mut lines = Vec::new();
-        for r in start.0..=end.0 {
-            let Some(cells) = self.visible_row(r, scroll_offset) else {
-                continue;
+        let (start, end) = (a.min(b), a.max(b));
+        let rows = (start.0..=end.0)
+            .filter_map(|r| self.visible_row(r, scroll_offset).map(|cells| (r, cells)));
+        Self::extract_selection_rows(start, end, rows)
+    }
+
+    /// Extracts a selection anchored to absolute lines, limited to retained rows.
+    /// On the alternate screen the anchors are local to that screen.
+    pub fn extract_abs_selection(&self, a: (usize, usize), b: (usize, usize)) -> String {
+        let (start, end) = (a.min(b), a.max(b));
+        let first = self.screen_row_to_abs_line(0, self.scrollback.len());
+        let last = self.screen_row_to_abs_line(self.rows - 1, 0);
+        let rows = (start.0.max(first)..=end.0.min(last)).filter_map(|line| {
+            let cells = if self.alt_screen {
+                self.visible_row(line, 0)
+            } else {
+                self.row_at_abs_line(line)
             };
+            cells.map(|cells| (line, cells))
+        });
+        Self::extract_selection_rows(start, end, rows)
+    }
+
+    fn extract_selection_rows<'a>(
+        start: (usize, usize),
+        end: (usize, usize),
+        rows: impl Iterator<Item = (usize, &'a [Cell])>,
+    ) -> String {
+        let mut lines = Vec::new();
+        for (r, cells) in rows {
             let c0 = if r == start.0 { start.1.min(cells.len()) } else { 0 };
             let c1 = if r == end.0 {
-                (end.1 + 1).min(cells.len())
+                end.1.saturating_add(1).min(cells.len())
             } else {
                 cells.len()
             };
@@ -1681,6 +1705,36 @@ mod tests {
 
         let sel = grid.extract_selection((0, 0), (1, 4), 0);
         assert_eq!(sel, "alpha beta\ngamma");
+    }
+
+    #[test]
+    fn screen_coordinate_selection_still_uses_scroll_offset() {
+        let fg = Rgb::new(255, 255, 255);
+        let mut grid = TerminalGrid::new(10, 2, fg, Rgb::new(0, 0, 0));
+        grid.feed(b"first\r\nsecond\r\nthird");
+        assert_eq!(grid.extract_selection((1, 2), (0, 2), 1), "rst\nsec");
+    }
+
+    #[test]
+    fn absolute_selection_copies_only_retained_rows_after_eviction() {
+        let fg = Rgb::new(255, 255, 255);
+        let mut grid = TerminalGrid::with_scrollback(10, 2, fg, Rgb::new(0, 0, 0), 1);
+        grid.feed(b"first\r\nsecond\r\nthird");
+        let start = (grid.screen_row_to_abs_line(0, 1), 2);
+        let end = (grid.screen_row_to_abs_line(0, 0), 2);
+        grid.feed(b"\r\nfourth");
+
+        assert_eq!(grid.extract_abs_selection(start, end), "sec");
+        assert_eq!(grid.extract_abs_selection(start, (start.0, 4)), "");
+    }
+
+    #[test]
+    fn absolute_selection_copies_alternate_screen_not_main_scrollback() {
+        let fg = Rgb::new(255, 255, 255);
+        let mut grid = TerminalGrid::new(10, 2, fg, Rgb::new(0, 0, 0));
+        grid.feed(b"first\r\nsecond\r\nthird\x1b[?1049halt text");
+        let line = grid.screen_row_to_abs_line(0, grid.scrollback_len());
+        assert_eq!(grid.extract_abs_selection((line, 0), (line, 2)), "alt");
     }
 
     #[test]

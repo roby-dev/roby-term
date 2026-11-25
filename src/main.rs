@@ -16,7 +16,9 @@ use my_warp::ports::{kill_process, list_listening_ports, ListeningPort};
 use my_warp::session::SessionManager;
 use my_warp::shell::{default_shell, discover_shells, ShellProfile};
 use my_warp::snippets::SnippetStore;
-use my_warp::terminal::{detect_link_at_col, open_link, open_url_in_browser, LinkTarget};
+use my_warp::terminal::{
+    detect_link_at_col, open_link, open_url_in_browser, LinkTarget, TerminalGrid,
+};
 use my_warp::theme::{Theme, UserIdentity};
 use my_warp::ui::{
     build_app_icon_rgba, discover_system_mono_fonts, render_app, FontRenderer, HitTarget, Layout,
@@ -1285,11 +1287,13 @@ impl App {
                     }
                 }
                 let active_vp = self.active_pane_rect();
-                if let Some(cell) =
-                    Layout::pixel_to_cell_in(active_vp, px, py, self.font.cell_w, self.font.cell_h)
-                {
-                    self.ui.selection_start = Some(cell);
-                    self.ui.selection_end = Some(cell);
+                if let (Some(sess), Some((row, col))) = (
+                    self.sessions.active(),
+                    Layout::pixel_to_cell_in(active_vp, px, py, self.font.cell_w, self.font.cell_h),
+                ) {
+                    let anchor = (sess.grid.screen_row_to_abs_line(row, sess.scroll_offset), col);
+                    self.ui.selection_start = Some(anchor);
+                    self.ui.selection_end = Some(anchor);
                     self.ui.selecting = true;
                 }
             }
@@ -1314,7 +1318,7 @@ impl App {
                 // Auto-copy drag selection to clipboard so copying inside Claude Code / agy
                 // never risks sending Ctrl+C (SIGINT) to the running agent.
                 if let Some(sess) = self.sessions.active() {
-                    let text = sess.grid.extract_selection(a, b, sess.scroll_offset);
+                    let text = sess.grid.extract_abs_selection(a, b);
                     if copy_text(&text) {
                         self.ui.toast = Some("Copied selection to clipboard!".to_string());
                     }
@@ -1968,7 +1972,7 @@ impl App {
                     if let (Some(a), Some(b)) = (self.ui.selection_start, self.ui.selection_end) {
                         if a != b {
                             if let Some(sess) = self.sessions.active() {
-                                let text = sess.grid.extract_selection(a, b, sess.scroll_offset);
+                                let text = sess.grid.extract_abs_selection(a, b);
                                 if copy_text(&text) {
                                     self.ui.toast =
                                         Some("Copied selection to clipboard!".to_string());
@@ -2480,15 +2484,20 @@ impl ApplicationHandler<()> for App {
                 );
                 if self.ui.selecting {
                     let active_vp = self.active_pane_rect();
-                    if let Some(cell) = Layout::pixel_to_cell_in(
+                    let pointer_cell = Layout::pixel_to_cell_in(
                         active_vp,
                         self.cursor_pos.0,
                         self.cursor_pos.1,
                         self.font.cell_w,
                         self.font.cell_h,
-                    ) {
-                        if self.ui.selection_end != Some(cell) {
-                            self.ui.selection_end = Some(cell);
+                    );
+                    if let Some(sess) = self.sessions.active() {
+                        if update_drag_selection(
+                            &mut self.ui,
+                            &sess.grid,
+                            sess.scroll_offset,
+                            pointer_cell,
+                        ) {
                             self.request_redraw();
                         }
                     }
@@ -2521,17 +2530,15 @@ impl ApplicationHandler<()> for App {
                 if lines == 0 {
                     return;
                 }
-                self.ui.clear_selection();
                 let active_vp = self.active_pane_rect();
-                let (cell_row, cell_col) = Layout::pixel_to_cell_in(
+                let pointer_cell = Layout::pixel_to_cell_in(
                     active_vp,
                     self.cursor_pos.0,
                     self.cursor_pos.1,
                     self.font.cell_w,
                     self.font.cell_h,
-                )
-                .map(|(r, c)| (r + 1, c + 1))
-                .unwrap_or((1, 1));
+                );
+                let (cell_row, cell_col) = pointer_cell.map_or((1, 1), |(r, c)| (r + 1, c + 1));
 
                 if let Some(sess) = self.sessions.active_mut() {
                     let mode = resolve_wheel_forward_mode(
@@ -2575,7 +2582,16 @@ impl ApplicationHandler<()> for App {
                             }
                         }
                     }
+                    update_wheel_selection(
+                        &mut self.ui,
+                        mode,
+                        &sess.grid,
+                        sess.scroll_offset,
+                        pointer_cell,
+                    );
                     self.request_redraw();
+                } else {
+                    self.ui.clear_selection();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(event),
@@ -2592,6 +2608,40 @@ enum WheelForwardMode {
     X10Mouse,
     AltScreenArrows,
     Scrollback,
+}
+
+fn update_drag_selection(
+    ui: &mut UiState,
+    grid: &TerminalGrid,
+    scroll_offset: usize,
+    pointer_cell: Option<(usize, usize)>,
+) -> bool {
+    if !ui.selecting {
+        return false;
+    }
+    let Some((row, col)) = pointer_cell else {
+        return false;
+    };
+    let end = Some((grid.screen_row_to_abs_line(row, scroll_offset), col));
+    if ui.selection_end == end {
+        return false;
+    }
+    ui.selection_end = end;
+    true
+}
+
+fn update_wheel_selection(
+    ui: &mut UiState,
+    mode: WheelForwardMode,
+    grid: &TerminalGrid,
+    scroll_offset: usize,
+    pointer_cell: Option<(usize, usize)>,
+) {
+    if mode == WheelForwardMode::Scrollback {
+        update_drag_selection(ui, grid, scroll_offset, pointer_cell);
+    } else {
+        ui.clear_selection();
+    }
 }
 
 /// Decides how mouse wheel events should be routed for the active session.
@@ -3035,6 +3085,64 @@ mod tests {
             resolve_scroll_action(NamedKey::Home, true, true, true, false),
             None
         );
+    }
+
+    #[test]
+    fn wheel_scrollback_preserves_selected_text_and_extends_active_drag() {
+        use my_warp::theme::Rgb;
+        let fg = Rgb::new(255, 255, 255);
+        let mut grid = TerminalGrid::new(10, 3, fg, Rgb::new(0, 0, 0));
+        grid.feed(b"first\r\nsecond\r\nthird\r\nfourth\r\nfifth");
+        let oldest = grid.scrollback_len();
+        let pointer_cell = Some((0, 2));
+        let mut ui = UiState::new(&UserConfig::default(), fg);
+        let selected_line = grid.screen_row_to_abs_line(1, oldest);
+        ui.selection_start = Some((selected_line, 1));
+        ui.selection_end = Some((selected_line, 3));
+        let copied_text = |ui: &UiState| {
+            grid.extract_abs_selection(ui.selection_start.unwrap(), ui.selection_end.unwrap())
+        };
+
+        // A released selection keeps its exact text, even off screen in the live view.
+        for offset in [0, oldest] {
+            update_wheel_selection(&mut ui, WheelForwardMode::Scrollback, &grid, offset, pointer_cell);
+            assert!(!ui.selecting);
+            assert_eq!(ui.selection_start, Some((1, 1)));
+            assert_eq!(ui.selection_end, Some((1, 3)));
+            assert_eq!(copied_text(&ui), "eco");
+        }
+
+        // Scrolling in either direction moves only the end under a stationary pointer.
+        ui.selecting = true;
+        for (offset, end_line, text) in [(0, 2, "econd\nthi"), (oldest, 0, "rst\nse")] {
+            update_wheel_selection(&mut ui, WheelForwardMode::Scrollback, &grid, offset, pointer_cell);
+            assert!(ui.selecting);
+            assert_eq!(ui.selection_start, Some((1, 1)));
+            assert_eq!(ui.selection_end, Some((end_line, 2)));
+            assert_eq!(copied_text(&ui), text);
+        }
+    }
+
+    #[test]
+    fn wheel_forwarding_still_clears_terminal_selection() {
+        use my_warp::theme::Rgb;
+        let fg = Rgb::new(255, 255, 255);
+        let grid = TerminalGrid::new(10, 3, fg, Rgb::new(0, 0, 0));
+        let mut ui = UiState::new(&UserConfig::default(), fg);
+        for mode in [
+            WheelForwardMode::SgrMouse,
+            WheelForwardMode::X10Mouse,
+            WheelForwardMode::AltScreenArrows,
+        ] {
+            ui.selection_start = Some((0, 0));
+            ui.selection_end = Some((0, 1));
+            ui.selecting = true;
+            update_wheel_selection(&mut ui, mode, &grid, 0, Some((0, 1)));
+            assert_eq!(
+                (ui.selection_start, ui.selection_end, ui.selecting),
+                (None, None, false)
+            );
+        }
     }
 
     #[test]
