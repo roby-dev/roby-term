@@ -48,6 +48,49 @@ impl Agent {
             Self::Codex => ("codex-acp", &[]),
         }
     }
+
+    pub fn resolve_command(self) -> (String, Vec<String>) {
+        #[cfg(windows)]
+        if self == Self::Codex {
+            if let Some(path) = std::env::var_os("PATH") {
+                let dirs: Vec<_> = std::env::split_paths(&path).collect();
+                if let Some(resolved) = resolve_codex_in_paths(&dirs) {
+                    return resolved;
+                }
+            }
+        }
+        let (program, args) = self.command();
+        (program.to_owned(), args.iter().map(|s| (*s).to_owned()).collect())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn resolve_codex_in_paths(dirs: &[std::path::PathBuf]) -> Option<(String, Vec<String>)> {
+    for dir in dirs {
+        let exe = dir.join("codex-acp.exe");
+        if exe.is_file() {
+            return Some((exe.to_string_lossy().into_owned(), Vec::new()));
+        }
+    }
+    let rel_scripts = [
+        ["node_modules", "@agentclientprotocol", "codex-acp", "dist", "index.js"],
+        ["node_modules", "@zed-industries", "codex-acp", "dist", "index.js"],
+    ];
+    for dir in dirs {
+        for rel in &rel_scripts {
+            let script = rel.iter().fold(dir.clone(), |acc, part| acc.join(part));
+            if script.is_file() {
+                let node = std::iter::once(dir)
+                    .chain(dirs.iter())
+                    .map(|d| d.join("node.exe"))
+                    .find(|p| p.is_file())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "node.exe".to_owned());
+                return Some((node, vec![script.to_string_lossy().into_owned()]));
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,5 +381,64 @@ impl Client {
             "session/prompt",
             json!({"sessionId":session,"prompt":[{"type":"text","text":text}]}),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_codex_in_paths;
+    use std::{fs, process, time::{SystemTime, UNIX_EPOCH}};
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("velt-acp-res-{}-{}-{nanos}", process::id(), tag));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolves_native_codex_exe_before_npm_script() {
+        let dir = temp_dir("exe");
+        let script_dir = dir
+            .join("node_modules")
+            .join("@agentclientprotocol")
+            .join("codex-acp")
+            .join("dist");
+        fs::create_dir_all(&script_dir).unwrap();
+        fs::write(script_dir.join("index.js"), "").unwrap();
+        let exe = dir.join("codex-acp.exe");
+        fs::write(&exe, "").unwrap();
+
+        let got = resolve_codex_in_paths(&[dir.clone()]).unwrap();
+        assert_eq!(got.0, exe.to_string_lossy());
+        assert!(got.1.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolves_npm_codex_acp_script_with_node_exe() {
+        let dir = temp_dir("npm");
+        let script_dir = dir
+            .join("node_modules")
+            .join("@agentclientprotocol")
+            .join("codex-acp")
+            .join("dist");
+        fs::create_dir_all(&script_dir).unwrap();
+        let script = script_dir.join("index.js");
+        fs::write(&script, "").unwrap();
+        let node = dir.join("node.exe");
+        fs::write(&node, "").unwrap();
+
+        let got = resolve_codex_in_paths(&[dir.clone()]).unwrap();
+        assert_eq!(got.0, node.to_string_lossy());
+        assert_eq!(got.1, vec![script.to_string_lossy().into_owned()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn returns_none_when_codex_acp_is_absent() {
+        let dir = temp_dir("none");
+        assert!(resolve_codex_in_paths(&[dir.clone()]).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

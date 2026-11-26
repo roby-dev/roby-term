@@ -78,8 +78,9 @@ impl Chat {
 
     /// Start the selected adapter. `wake` must post a non-blocking notice to call `poll`.
     pub fn start(&mut self, agent: Agent, cwd: &Path, wake: impl Fn() + Send + Sync + 'static) -> io::Result<()> {
-        let (program, args) = agent.command();
-        self.start_command(program, args, cwd, wake)
+        let (program, args) = agent.resolve_command();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.start_command(&program, &arg_refs, cwd, wake)
     }
 
     /// Like `start`, with a native executable and literal arguments (never a shell).
