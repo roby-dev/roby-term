@@ -1,6 +1,9 @@
 use crate::theme::{ansi_256_color, Rgb};
 use std::collections::VecDeque;
+use std::ffi::OsStr;
+use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "windows"))]
 use std::process::Command;
 use vte::{Params, Parser, Perform};
 
@@ -1213,6 +1216,16 @@ pub enum LinkTarget {
     Url(String),
 }
 
+impl LinkTarget {
+    pub fn directory_to_open(&self) -> Option<&Path> {
+        match self {
+            Self::Path { resolved, is_file: true } => resolved.parent(),
+            Self::Path { resolved, is_file: false } => Some(resolved.as_path()),
+            Self::Url(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedLink {
     pub col_start: usize,
@@ -1222,49 +1235,19 @@ pub struct DetectedLink {
 
 /// Detects either an HTTP/HTTPS URL or an existing filesystem path under `col`.
 pub fn detect_link_at_col(row: &[Cell], col: usize, cwd: &Path) -> Option<DetectedLink> {
-    if col >= row.len() {
-        return None;
-    }
-    let is_delim = |c: char| {
-        c.is_whitespace()
-            || matches!(
-                c,
-                '"' | '\'' | '`' | '<' | '>' | '|' | '(' | ')' | '[' | ']' | '{' | '}' | '│' | '┃'
-            )
-    };
-    if is_delim(row[col].ch) {
-        return None;
-    }
-
-    let mut start = col;
-    while start > 0 && !is_delim(row[start - 1].ch) {
-        start -= 1;
-    }
-    let mut end = col + 1;
-    while end < row.len() && !is_delim(row[end].ch) {
-        end += 1;
-    }
-
-    let raw: String = row[start..end]
-        .iter()
-        .filter(|c| c.ch != '\0')
-        .map(|c| c.ch)
-        .collect();
-    let trimmed = raw.trim_end_matches([',', ';', '.']);
-
-    // 1. Check HTTP / HTTPS URL first
-    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
-        if trimmed.len() > 8 {
-            let effective_len = trimmed.chars().count();
+    if let Some((start, end)) = link_token_span(row, col) {
+        let raw = link_text(&row[start..end]);
+        let url = raw.trim_end_matches([',', ';', '.']);
+        let col_end = end - (raw.len() - url.len());
+        if col < col_end && url.len() > 8 && is_safe_browser_url(url) {
             return Some(DetectedLink {
                 col_start: start,
-                col_end: (start + effective_len).min(end),
-                target: LinkTarget::Url(trimmed.to_string()),
+                col_end,
+                target: LinkTarget::Url(url.to_string()),
             });
         }
     }
 
-    // 2. Fall back to existing filesystem path
     detect_path_at_col(row, col, cwd).map(|p| DetectedLink {
         col_start: p.col_start,
         col_end: p.col_end,
@@ -1275,11 +1258,24 @@ pub fn detect_link_at_col(row: &[Cell], col: usize, cwd: &Path) -> Option<Detect
     })
 }
 
-/// Opens a detected link: Explorer/Finder for paths, default browser for URLs.
-pub fn open_link(target: &LinkTarget) {
+/// Opens the directory for a path link or the browser for a URL.
+pub fn open_link(target: &LinkTarget) -> io::Result<()> {
     match target {
-        LinkTarget::Path { resolved, .. } => open_in_file_explorer(resolved),
-        LinkTarget::Url(url) => open_url_in_browser(url),
+        LinkTarget::Path { .. } => {
+            let directory = target.directory_to_open().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
+            })?;
+            let directory = crate::complete::strip_verbatim_prefix(directory.canonicalize()?);
+            if !directory.metadata()?.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "expected a directory",
+                ));
+            }
+            open_with_system(directory.as_os_str())
+        }
+        LinkTarget::Url(url) if is_safe_browser_url(url) => open_with_system(OsStr::new(url)),
+        LinkTarget::Url(_) => Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid URL")),
     }
 }
 
@@ -1291,12 +1287,14 @@ pub fn is_safe_browser_url(url: &str) -> bool {
 }
 
 pub fn open_url_in_browser(url: &str) {
-    if !is_safe_browser_url(url) {
-        return;
+    if is_safe_browser_url(url) {
+        let _ = open_with_system(OsStr::new(url));
     }
+}
+
+fn open_with_system(target: &OsStr) -> io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
         use std::ptr;
 
@@ -1313,8 +1311,8 @@ pub fn open_url_in_browser(url: &str) {
         }
 
         let op: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
-        let target: Vec<u16> = OsStr::new(url).encode_wide().chain(Some(0)).collect();
-        unsafe {
+        let target: Vec<u16> = target.encode_wide().chain(Some(0)).collect();
+        let result = unsafe {
             ShellExecuteW(
                 ptr::null_mut(),
                 op.as_ptr(),
@@ -1322,16 +1320,20 @@ pub fn open_url_in_browser(url: &str) {
                 ptr::null(),
                 ptr::null(),
                 1, // SW_SHOWNORMAL
-            );
+            )
+        };
+        if result <= 32 {
+            return Err(io::Error::other(format!("Windows ShellExecute error {result}")));
         }
+        Ok(())
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("open").arg(url).spawn();
+        Command::new("open").arg(target).spawn().map(|_| ())
     }
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
-        let _ = Command::new("xdg-open").arg(url).spawn();
+        Command::new("xdg-open").arg(target).spawn().map(|_| ())
     }
 }
 
@@ -1346,9 +1348,37 @@ pub struct DetectedPath {
 
 /// Detects an existing file or directory path under `col` on a terminal row.
 pub fn detect_path_at_col(row: &[Cell], col: usize, cwd: &Path) -> Option<DetectedPath> {
-    if col >= row.len() {
-        return None;
+    row.get(col)?;
+    if let Some((start, end)) = quoted_path_span(row, col) {
+        return detect_path_in_span(row, col, start, end, cwd);
     }
+    let (start, end) = link_token_span(row, col)?;
+    detect_path_in_span(row, col, start, end, cwd)
+}
+
+fn quoted_path_span(row: &[Cell], col: usize) -> Option<(usize, usize)> {
+    let mut opening = None;
+    for (index, cell) in row.iter().enumerate() {
+        match opening {
+            Some((start, quote)) if cell.ch == quote => {
+                if start < col && col < index {
+                    return Some((start + 1, index));
+                }
+                opening = None;
+            }
+            None if matches!(cell.ch, '"' | '\'' | '`') => {
+                // An apostrophe between letters belongs to a word, such as "doesn't".
+                if cell.ch != '\'' || index == 0 || !row[index - 1].ch.is_alphanumeric() {
+                    opening = Some((index, cell.ch));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn link_token_span(row: &[Cell], col: usize) -> Option<(usize, usize)> {
     let is_delim = |c: char| {
         c.is_whitespace()
             || matches!(
@@ -1356,7 +1386,7 @@ pub fn detect_path_at_col(row: &[Cell], col: usize, cwd: &Path) -> Option<Detect
                 '"' | '\'' | '`' | '<' | '>' | '|' | '(' | ')' | '[' | ']' | '{' | '}' | '│' | '┃'
             )
     };
-    if is_delim(row[col].ch) {
+    if is_delim(row.get(col)?.ch) {
         return None;
     }
 
@@ -1368,36 +1398,38 @@ pub fn detect_path_at_col(row: &[Cell], col: usize, cwd: &Path) -> Option<Detect
     while end < row.len() && !is_delim(row[end].ch) {
         end += 1;
     }
+    Some((start, end))
+}
 
-    let raw: String = row[start..end]
+fn link_text(cells: &[Cell]) -> String {
+    cells
         .iter()
         .filter(|c| c.ch != '\0')
         .map(|c| c.ch)
-        .collect();
-    let trimmed_end = raw.trim_end_matches([',', ';', '.']);
-    let mut candidate_str = trimmed_end;
+        .collect()
+}
 
-    // Strip optional `:line` or `:line:col` suffix (e.g. `src/main.rs:42:10`)
-    if let Some((path_part, rest)) = strip_line_col_suffix(candidate_str) {
-        if !rest.is_empty() {
-            candidate_str = path_part;
-        }
-    }
+fn detect_path_in_span(
+    row: &[Cell],
+    col: usize,
+    start: usize,
+    end: usize,
+    cwd: &Path,
+) -> Option<DetectedPath> {
+    let raw = link_text(&row[start..end]);
+    let trimmed = raw.trim_end_matches([',', ';', '.']);
+    let path = strip_line_col_suffix(trimmed).map_or(trimmed, |(path, _)| path);
+    let col_end = end - (raw.len() - trimmed.len());
 
-    if !looks_like_fs_path(candidate_str) && !looks_like_local_filename(candidate_str) {
+    if col >= col_end || (!looks_like_fs_path(path) && !looks_like_local_filename(path)) {
         return None;
     }
-
-    let resolved = resolve_candidate_path(candidate_str, cwd)?;
-    if !resolved.exists() {
-        return None;
-    }
-
-    let effective_len = candidate_str.chars().count();
+    let resolved = resolve_candidate_path(path, cwd)?;
+    let metadata = resolved.metadata().ok()?;
     Some(DetectedPath {
         col_start: start,
-        col_end: (start + effective_len).min(end),
-        is_file: resolved.is_file(),
+        col_end,
+        is_file: metadata.is_file(),
         resolved,
     })
 }
@@ -1424,12 +1456,9 @@ fn looks_like_fs_path(s: &str) -> bool {
 }
 
 fn looks_like_local_filename(s: &str) -> bool {
-    s.len() >= 3
-        && s.contains('.')
-        && !s.starts_with('.')
-        && !s.ends_with('.')
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    s.chars().any(char::is_alphanumeric)
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | ' '))
 }
 
 fn strip_line_col_suffix(s: &str) -> Option<(&str, &str)> {
@@ -1461,37 +1490,6 @@ fn resolve_candidate_path(candidate: &str, cwd: &Path) -> Option<PathBuf> {
         Some(p)
     } else {
         Some(cwd.join(p))
-    }
-}
-
-/// Opens a directory in Windows Explorer / macOS Finder, or reveals a file inside its folder.
-pub fn open_in_file_explorer(path: &Path) {
-    #[cfg(target_os = "windows")]
-    {
-        if path.is_file() {
-            let _ = Command::new("explorer.exe")
-                .arg(format!("/select,{}", path.display()))
-                .spawn();
-        } else {
-            let _ = Command::new("explorer.exe").arg(path).spawn();
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if path.is_file() {
-            let _ = Command::new("open").arg("-R").arg(path).spawn();
-        } else {
-            let _ = Command::new("open").arg(path).spawn();
-        }
-    }
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    {
-        let target = if path.is_file() {
-            path.parent().unwrap_or(path)
-        } else {
-            path
-        };
-        let _ = Command::new("xdg-open").arg(target).spawn();
     }
 }
 
@@ -1676,6 +1674,59 @@ mod tests {
         assert!(detect_path_at_col(row, 0, &dir).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_quoted_paths_and_diagnostic_suffixes() {
+        let cwd = std::env::temp_dir().join(format!("velt-link-test-{}", std::process::id()));
+        let dir = cwd.join("folder (test)");
+        let file = dir.join("notes.txt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, "test").unwrap();
+        std::fs::write(cwd.join("README"), "test").unwrap();
+
+        let fg = Rgb::new(255, 255, 255);
+        let bg = Rgb::new(0, 0, 0);
+        let mut grid = TerminalGrid::new(160, 5, fg, bg);
+        let diagnostic = "folder (test)/notes.txt:42:3";
+        let output = format!("\"{}\"\r\n`{diagnostic}`\r\nREADME", dir.display());
+        grid.feed(output.as_bytes());
+
+        let row = grid.visible_row(0, 0).unwrap();
+        let space = output.find(" (test)").unwrap();
+        let link = detect_link_at_col(row, output[..space].chars().count(), &cwd).unwrap();
+        assert_eq!(link.target.directory_to_open(), Some(dir.as_path()));
+        assert_eq!(
+            link.target,
+            LinkTarget::Path {
+                resolved: dir,
+                is_file: false,
+            }
+        );
+        assert!(detect_link_at_col(row, 0, &cwd).is_none());
+
+        let row = grid.visible_row(1, 0).unwrap();
+        let link = detect_link_at_col(row, diagnostic.len(), &cwd).unwrap();
+        assert_eq!((link.col_start, link.col_end), (1, diagnostic.len() + 1));
+        assert_eq!(link.target.directory_to_open(), file.parent());
+        assert_eq!(
+            link.target,
+            LinkTarget::Path {
+                resolved: file,
+                is_file: true,
+            }
+        );
+
+        let row = grid.visible_row(2, 0).unwrap();
+        let link = detect_link_at_col(row, 0, &cwd).unwrap();
+        assert_eq!(
+            link.target,
+            LinkTarget::Path {
+                resolved: cwd.join("README"),
+                is_file: true,
+            }
+        );
+        std::fs::remove_dir_all(&cwd).unwrap();
     }
 
     #[test]

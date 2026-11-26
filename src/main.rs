@@ -17,7 +17,7 @@ use my_warp::session::SessionManager;
 use my_warp::shell::{default_shell, discover_shells, ShellProfile};
 use my_warp::snippets::SnippetStore;
 use my_warp::terminal::{
-    detect_link_at_col, open_link, open_url_in_browser, LinkTarget, TerminalGrid,
+    detect_link_at_col, open_link, open_url_in_browser, DetectedLink, LinkTarget, TerminalGrid,
 };
 use my_warp::theme::{Theme, UserIdentity};
 use my_warp::ui::{
@@ -75,7 +75,6 @@ struct App {
     phys_height: u32,
     modifiers: ModifiersState,
     cursor_pos: (u32, u32),
-    hovered_link_target: Option<LinkTarget>,
     last_session_click: Option<(usize, Instant)>,
 }
 
@@ -154,7 +153,6 @@ impl App {
             phys_height: 720,
             modifiers: ModifiersState::empty(),
             cursor_pos: (0, 0),
-            hovered_link_target: None,
             last_session_click: None,
         };
         app.refresh_plugins_async();
@@ -666,47 +664,39 @@ impl App {
         )
     }
 
-    fn update_hovered_link(&mut self) -> bool {
+    fn terminal_link_at_cursor(&self) -> Option<(usize, (usize, usize), DetectedLink)> {
+        let (row, col) = Layout::pixel_to_cell_in(
+            self.active_pane_rect(),
+            self.cursor_pos.0,
+            self.cursor_pos.1,
+            self.font.cell_w,
+            self.font.cell_h,
+        )?;
+        let sess = self.sessions.active()?;
+        let cells = sess.grid.visible_row(row, sess.scroll_offset)?;
+        let link = detect_link_at_col(cells, col, &sess.cwd)?;
+        let abs_line = sess.grid.screen_row_to_abs_line(row, sess.scroll_offset);
+        Some((row, (abs_line, col), link))
+    }
+
+    fn update_hovered_link(&mut self, hit: HitTarget) -> bool {
         let mut next_span = None;
         let mut next_label = None;
-        let mut next_target = None;
-
-        let active_vp = self.active_pane_rect();
-        if !self.ui.settings.open
-            && !self.ui.palette.open
-            && !self.ui.history_modal.open
-            && !self.ui.ports.open
-            && !self.ui.search.open
-            && !self.ui.selecting
-        {
-            if let Some((row, col)) = Layout::pixel_to_cell_in(
-                active_vp,
-                self.cursor_pos.0,
-                self.cursor_pos.1,
-                self.font.cell_w,
-                self.font.cell_h,
-            ) {
-                if let Some(sess) = self.sessions.active() {
-                    if let Some(cells) = sess.grid.visible_row(row, sess.scroll_offset) {
-                        if let Some(det) = detect_link_at_col(cells, col, &sess.cwd) {
-                            next_span = Some((row, det.col_start, det.col_end));
-                            next_label = Some(match &det.target {
-                                LinkTarget::Url(u) => format!("Click to open URL: {u}"),
-                                LinkTarget::Path { resolved, .. } => {
-                                    format!("Click to open in Explorer: {}", resolved.display())
-                                }
-                            });
-                            next_target = Some(det.target);
-                        }
-                    }
-                }
+        if hit == HitTarget::TerminalViewport {
+            if let Some((row, _, link)) = self.terminal_link_at_cursor() {
+                next_span = Some((row, link.col_start, link.col_end));
+                next_label = match link.target {
+                    LinkTarget::Url(url) => Some(format!("Click to open URL: {url}")),
+                    path => path
+                        .directory_to_open()
+                        .map(|folder| format!("Click to open folder: {}", folder.display())),
+                };
             }
         }
 
-        let changed = self.ui.hovered_path != next_span;
+        let changed = self.ui.hovered_path != next_span || self.ui.hovered_path_label != next_label;
         self.ui.hovered_path = next_span;
         self.ui.hovered_path_label = next_label;
-        self.hovered_link_target = next_target;
         changed
     }
 
@@ -1276,14 +1266,10 @@ impl App {
                     if left_vp.contains(px, py) && self.sessions.active_index() != left_idx {
                         self.sessions.select(left_idx);
                         self.ui.clear_selection();
-                        self.request_redraw();
-                        return;
                     } else if right_vp.contains(px, py) && self.sessions.active_index() != right_idx
                     {
                         self.sessions.select(right_idx);
                         self.ui.clear_selection();
-                        self.request_redraw();
-                        return;
                     }
                 }
                 let active_vp = self.active_pane_rect();
@@ -1325,8 +1311,16 @@ impl App {
                 }
             } else {
                 self.ui.clear_selection();
-                if let Some(ref target) = self.hovered_link_target {
-                    open_link(target);
+                let (px, py) = self.cursor_pos;
+                let (suggestions, _) = self.current_suggestions();
+                if self.hit_test_all(px, py, suggestions.len()) == HitTarget::TerminalViewport {
+                    if let Some((_, cell, link)) = self.terminal_link_at_cursor() {
+                        if cell == a {
+                            if let Err(err) = open_link(&link.target) {
+                                self.ui.toast = Some(format!("Could not open link: {err}"));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2505,7 +2499,7 @@ impl ApplicationHandler<()> for App {
                 }
                 let (suggestions, _) = self.current_suggestions();
                 let hit = self.hit_test_all(self.cursor_pos.0, self.cursor_pos.1, suggestions.len());
-                let link_changed = self.update_hovered_link();
+                let link_changed = self.update_hovered_link(hit);
                 if hit != self.ui.hovered || link_changed {
                     self.ui.hovered = hit;
                     self.request_redraw();
@@ -2589,6 +2583,15 @@ impl ApplicationHandler<()> for App {
                         sess.scroll_offset,
                         pointer_cell,
                     );
+                    if !self.ui.selecting {
+                        let (suggestions, _) = self.current_suggestions();
+                        let hit = self.hit_test_all(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            suggestions.len(),
+                        );
+                        self.update_hovered_link(hit);
+                    }
                     self.request_redraw();
                 } else {
                     self.ui.clear_selection();

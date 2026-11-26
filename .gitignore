@@ -30,4 +30,5 @@ Desktop.ini
 .env.*
 
 # Local agent workflow notes
+/.atl/
 /odd/
