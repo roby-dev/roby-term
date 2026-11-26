@@ -52,6 +52,7 @@ pub struct Session {
     pub git_branch: Option<String>,
     pub grid: TerminalGrid,
     pub input: InputBar,
+    pub acp: crate::acp::AcpSessionState,
     pub blocks: Vec<CommandBlock>,
     next_block_id: usize,
     pub scroll_offset: usize,
@@ -181,6 +182,7 @@ impl Session {
             git_branch,
             grid,
             input: InputBar::new(),
+            acp: crate::acp::AcpSessionState::default(),
             blocks: Vec::new(),
             next_block_id: 1,
             scroll_offset: 0,
@@ -604,6 +606,10 @@ impl SessionManager {
 
     pub fn sessions(&self) -> &[Session] {
         &self.sessions
+    }
+
+    pub fn sessions_mut(&mut self) -> &mut [Session] {
+        &mut self.sessions
     }
 
     pub fn active_index(&self) -> usize {

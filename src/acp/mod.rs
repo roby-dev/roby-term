@@ -8,9 +8,12 @@
 #[cfg_attr(windows, path = "process_windows.rs")]
 mod process;
 mod chat;
+pub mod markdown;
 
 pub use chat::{Chat, ConnectionState, MAX_PROMPT_BYTES, MAX_RESPONSE_BYTES};
+pub use markdown::{parse_markdown, MdLine, MdLineKind};
 
+use crate::input::InputBar;
 use serde_json::{json, Value};
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
@@ -20,18 +23,122 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Agent {
+    #[default]
     Antigravity,
     Codex,
 }
 
 impl Agent {
+    pub const ALL: [Self; 2] = [Self::Antigravity, Self::Codex];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Antigravity => "Antigravity",
+            Self::Codex => "Codex",
+        }
+    }
+
     pub fn command(self) -> (&'static str, &'static [&'static str]) {
         match self {
             Self::Antigravity => ("agy", &["acp"]),
             Self::Codex => ("codex-acp", &[]),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpTurn {
+    pub prompt: String,
+    pub response: String,
+    pub truncated: bool,
+}
+
+const MAX_ACP_TURNS: usize = 50;
+
+/// Per-session ACP panel state. Creating it starts no threads or subprocesses.
+#[derive(Default)]
+pub struct AcpSessionState {
+    pub open: bool,
+    pub agent: Agent,
+    pub chat: Chat,
+    pub input: InputBar,
+    pub turns: Vec<AcpTurn>,
+    pub pending_prompt: Option<String>,
+    pub scroll: usize,
+}
+
+impl AcpSessionState {
+    pub fn status_label(&self) -> &'static str {
+        match self.chat.connection() {
+            ConnectionState::Disconnected => "Desconectado",
+            ConnectionState::Connecting => "Conectando",
+            ConnectionState::Active => "Activo",
+            ConnectionState::Error(_) => "Error",
+        }
+    }
+
+    pub fn error_message(&self) -> Option<&str> {
+        match self.chat.connection() {
+            ConnectionState::Error(msg) => Some(msg),
+            _ => None,
+        }
+    }
+
+    /// Advances ACP events without doing work when the panel is closed and disconnected.
+    /// Returns `(changed, has_more)`.
+    pub fn poll(&mut self) -> (bool, bool) {
+        if !self.open && matches!(self.chat.connection(), ConnectionState::Disconnected) {
+            return (false, false);
+        }
+        let prev_status = self.status_label();
+        let prev_err = self.error_message().map(str::to_owned);
+        let prev_resp_len = self.chat.response().len();
+        let was_pending = self.chat.is_prompt_pending();
+
+        let has_more = self.chat.poll();
+
+        if was_pending && !self.chat.is_prompt_pending() {
+            if let Some(prompt) = self.pending_prompt.take() {
+                let response = self.chat.response().to_owned();
+                if !response.is_empty() || matches!(self.chat.connection(), ConnectionState::Active) {
+                    if self.turns.len() >= MAX_ACP_TURNS {
+                        self.turns.remove(0);
+                    }
+                    self.turns.push(AcpTurn {
+                        prompt,
+                        response,
+                        truncated: self.chat.response_truncated(),
+                    });
+                    self.scroll = 0;
+                }
+            }
+        }
+
+        let changed = prev_status != self.status_label()
+            || prev_err.as_deref() != self.error_message()
+            || prev_resp_len != self.chat.response().len()
+            || was_pending != self.chat.is_prompt_pending();
+        (changed, has_more)
+    }
+
+    pub fn submit_prompt(&mut self) -> Result<(), String> {
+        let text = self.input.text().trim().to_owned();
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.chat.prompt(&text).map_err(|err| err.to_string())?;
+        self.pending_prompt = Some(text);
+        self.input.clear();
+        self.scroll = 0;
+        Ok(())
+    }
+
+    pub fn deactivate(&mut self) {
+        self.open = false;
+        self.pending_prompt = None;
+        self.chat.stop();
     }
 }
 

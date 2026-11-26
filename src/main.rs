@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use my_warp::acp::Agent;
 use my_warp::clipboard::{copy_text, paste_text};
 use my_warp::complete::{
     complete_input, is_completing_path, longest_common_prefix, strip_verbatim_prefix,
@@ -507,6 +508,228 @@ impl App {
         }
     }
 
+    fn is_acp_open(&self) -> bool {
+        self.sessions.active().is_some_and(|s| s.acp.open)
+    }
+
+    fn recompute_layout(&mut self) {
+        if !self.is_acp_open() {
+            self.ui.acp_focused = false;
+            self.ui.acp_dropdown_open = false;
+        }
+        self.layout = Layout::compute_with_options(
+            self.layout.width,
+            self.layout.height,
+            self.ui.sidebar_visible,
+            self.is_acp_open(),
+        );
+        self.resize_sessions_for_current_layout();
+    }
+
+    fn toggle_acp(&mut self) {
+        self.ui.picker_open = false;
+        self.ui.settings.open = false;
+        self.ui.palette.open = false;
+        self.ui.history_modal.open = false;
+        self.ui.ports.open = false;
+        self.ui.search.open = false;
+        self.ui.acp_dropdown_open = false;
+        let Some(sess) = self.sessions.active_mut() else {
+            return;
+        };
+        if sess.acp.open {
+            sess.acp.deactivate();
+            self.ui.acp_focused = false;
+        } else {
+            sess.acp.open = true;
+            let wake_proxy = self.proxy.clone();
+            let wake = move || {
+                let _ = wake_proxy.send_event(());
+            };
+            let agent = sess.acp.agent;
+            let cwd = sess.cwd.clone();
+            if let Err(err) = sess.acp.chat.start(agent, &cwd, wake) {
+                self.ui.toast = Some(format!("ACP launch failed: {err}"));
+            }
+            self.ui.acp_focused = true;
+        }
+        self.recompute_layout();
+    }
+
+    fn select_acp_agent(&mut self, idx: usize) {
+        let Some(&agent) = Agent::ALL.get(idx) else {
+            return;
+        };
+        self.ui.acp_dropdown_open = false;
+        let Some(sess) = self.sessions.active_mut() else {
+            return;
+        };
+        let changed = sess.acp.agent != agent;
+        sess.acp.agent = agent;
+        if sess.acp.open && changed {
+            sess.acp.chat.stop();
+            sess.acp.pending_prompt = None;
+            let wake_proxy = self.proxy.clone();
+            let wake = move || {
+                let _ = wake_proxy.send_event(());
+            };
+            let cwd = sess.cwd.clone();
+            if let Err(err) = sess.acp.chat.start(agent, &cwd, wake) {
+                self.ui.toast = Some(format!("ACP launch failed: {err}"));
+            }
+        }
+    }
+
+    fn submit_acp_prompt(&mut self) {
+        let Some(sess) = self.sessions.active_mut() else {
+            return;
+        };
+        if let Err(err) = sess.acp.submit_prompt() {
+            self.ui.toast = Some(err);
+        }
+    }
+
+    fn poll_acp_sessions(&mut self) -> (bool, bool) {
+        let active_idx = self.sessions.active_index();
+        let mut any_changed = false;
+        let mut any_more = false;
+        for (idx, sess) in self.sessions.sessions_mut().iter_mut().enumerate() {
+            let (changed, more) = sess.acp.poll();
+            if changed && idx == active_idx {
+                any_changed = true;
+            }
+            any_more |= more;
+        }
+        (any_changed, any_more)
+    }
+
+    fn handle_acp_key(&mut self, event: &KeyEvent) -> bool {
+        if !self.is_acp_open() || (!self.ui.acp_focused && !self.ui.acp_dropdown_open) {
+            return false;
+        }
+        let primary = self.primary_modifier();
+        let shift = self.modifiers.shift_key();
+
+        if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+            if self.ui.acp_dropdown_open {
+                self.ui.acp_dropdown_open = false;
+            } else {
+                self.ui.acp_focused = false;
+            }
+            self.request_redraw();
+            return true;
+        }
+
+        if primary {
+            if let Key::Character(s) = &event.logical_key {
+                if s.eq_ignore_ascii_case("a") {
+                    if let Some(sess) = self.sessions.active_mut() {
+                        sess.acp.input.select_all();
+                        self.request_redraw();
+                    }
+                    return true;
+                }
+                if s.eq_ignore_ascii_case("c") {
+                    if let Some(sess) = self.sessions.active() {
+                        if let Some(sel) = sess.acp.input.selected_text() {
+                            if copy_text(sel) {
+                                self.ui.toast = Some("Copied ACP input selection!".to_string());
+                            }
+                        }
+                    }
+                    self.request_redraw();
+                    return true;
+                }
+                if s.eq_ignore_ascii_case("v") {
+                    if let Some(clip) = paste_text() {
+                        if let Some(sess) = self.sessions.active_mut() {
+                            let single_line =
+                                clip.replace("\r\n", " ").replace(['\r', '\n'], " ");
+                            sess.acp.input.insert_str(&single_line);
+                        }
+                    }
+                    self.request_redraw();
+                    return true;
+                }
+                if s.eq_ignore_ascii_case("u") {
+                    if let Some(sess) = self.sessions.active_mut() {
+                        sess.acp.input.clear();
+                    }
+                    self.request_redraw();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        match &event.logical_key {
+            Key::Named(NamedKey::Enter) if !shift => {
+                self.ui.acp_dropdown_open = false;
+                self.submit_acp_prompt();
+            }
+            Key::Named(NamedKey::PageUp) => {
+                if let Some(sess) = self.sessions.active_mut() {
+                    sess.acp.scroll = sess.acp.scroll.saturating_add(6);
+                }
+            }
+            Key::Named(NamedKey::PageDown) => {
+                if let Some(sess) = self.sessions.active_mut() {
+                    sess.acp.scroll = sess.acp.scroll.saturating_sub(6);
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(sess) = self.sessions.active_mut() {
+                    sess.acp.input.backspace();
+                }
+            }
+            Key::Named(NamedKey::Delete) => {
+                if let Some(sess) = self.sessions.active_mut() {
+                    sess.acp.input.delete();
+                }
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                if let Some(sess) = self.sessions.active_mut() {
+                    sess.acp.input.move_left_with_select(shift);
+                }
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                if let Some(sess) = self.sessions.active_mut() {
+                    sess.acp.input.move_right_with_select(shift);
+                }
+            }
+            Key::Named(NamedKey::Home) => {
+                if let Some(sess) = self.sessions.active_mut() {
+                    sess.acp.input.move_home_with_select(shift);
+                }
+            }
+            Key::Named(NamedKey::End) => {
+                if let Some(sess) = self.sessions.active_mut() {
+                    sess.acp.input.move_end_with_select(shift);
+                }
+            }
+            Key::Named(NamedKey::Space) => {
+                if let Some(sess) = self.sessions.active_mut() {
+                    sess.acp.input.insert_char(' ');
+                }
+            }
+            _ => {
+                if self.allows_text_input() {
+                    if let Some(text) = &event.text {
+                        if let Some(sess) = self.sessions.active_mut() {
+                            for ch in text.chars() {
+                                if !ch.is_control() {
+                                    sess.acp.input.insert_char(ch);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.request_redraw();
+        true
+    }
+
     fn toggle_split(&mut self) {
         let shell = self
             .sessions
@@ -595,6 +818,61 @@ impl App {
             }
             if self.layout.search_bar_rect().contains(px, py) {
                 return HitTarget::None;
+            }
+        }
+
+        if !self.ui.settings.open
+            && !self.ui.palette.open
+            && !self.ui.history_modal.open
+            && !self.ui.ports.open
+            && self.is_acp_open()
+        {
+            if self.ui.acp_dropdown_open {
+                if let Some(drop_r) = self.layout.acp_dropdown_panel(Agent::ALL.len()) {
+                    if drop_r.contains(px, py) {
+                        for i in 0..Agent::ALL.len() {
+                            if self
+                                .layout
+                                .acp_agent_option_rect(i)
+                                .is_some_and(|r| r.contains(px, py))
+                            {
+                                return HitTarget::AcpAgentOption(i);
+                            }
+                        }
+                        return HitTarget::AcpPanel;
+                    }
+                }
+            }
+            if self.layout.acp_panel.is_some_and(|p| p.contains(px, py)) {
+                if self
+                    .layout
+                    .acp_close_rect()
+                    .is_some_and(|r| r.contains(px, py))
+                {
+                    return HitTarget::AcpClose;
+                }
+                if self
+                    .layout
+                    .acp_agent_selector_rect()
+                    .is_some_and(|r| r.contains(px, py))
+                {
+                    return HitTarget::AcpAgentSelector;
+                }
+                if self
+                    .layout
+                    .acp_send_rect()
+                    .is_some_and(|r| r.contains(px, py))
+                {
+                    return HitTarget::AcpSend;
+                }
+                if self
+                    .layout
+                    .acp_input_rect()
+                    .is_some_and(|r| r.contains(px, py))
+                {
+                    return HitTarget::AcpInput;
+                }
+                return HitTarget::AcpPanel;
             }
         }
 
@@ -909,7 +1187,12 @@ impl App {
         self.phys_width = width;
         self.phys_height = height;
         let (lw, lh) = Self::logical_size_from_physical(width, height, self.scale_factor);
-        self.layout = Layout::compute_with_sidebar(lw, lh, self.ui.sidebar_visible);
+        self.layout = Layout::compute_with_options(
+            lw,
+            lh,
+            self.ui.sidebar_visible,
+            self.is_acp_open(),
+        );
         if let Some(ref mut surface) = self.surface {
             if let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
                 let _ = surface.resize(w, h);
@@ -926,7 +1209,12 @@ impl App {
         if self.phys_width > 0 && self.phys_height > 0 {
             let (lw, lh) =
                 Self::logical_size_from_physical(self.phys_width, self.phys_height, self.scale_factor);
-            self.layout = Layout::compute_with_sidebar(lw, lh, self.ui.sidebar_visible);
+            self.layout = Layout::compute_with_options(
+            lw,
+            lh,
+            self.ui.sidebar_visible,
+            self.is_acp_open(),
+        );
             self.resize_sessions_for_current_layout();
         }
         self.ui.clear_selection();
@@ -985,12 +1273,7 @@ impl App {
             self.ui.picker_open = false;
             self.ui.renaming_session = None;
         }
-        self.layout = Layout::compute_with_sidebar(
-            self.layout.width,
-            self.layout.height,
-            self.ui.sidebar_visible,
-        );
-        self.resize_sessions_for_current_layout();
+        self.recompute_layout();
     }
 
     fn handle_mouse_down(&mut self) {
@@ -1043,6 +1326,7 @@ impl App {
                 self.ui.picker_open = false;
                 let recent = self.history.recent_commands(200);
                 if self.sessions.duplicate_active(&recent).is_ok() {
+                    self.recompute_layout();
                     self.ui.toast = Some("Duplicated session in same folder!".to_string());
                     self.save_workspace_state();
                 }
@@ -1206,6 +1490,7 @@ impl App {
                         if let Some(sess) = self.sessions.active_mut() {
                             sess.input.seed_history(self.history.recent_commands(200));
                         }
+                        self.recompute_layout();
                     }
                 }
             }
@@ -1221,6 +1506,7 @@ impl App {
                 );
                 self.last_session_click = Some((idx, now));
                 self.sessions.select(idx);
+                self.recompute_layout();
                 if is_double_click {
                     if let Some(title) = self.sessions.get(idx).map(|s| s.title.clone()) {
                         let mut edit = InputBar::new();
@@ -1239,11 +1525,8 @@ impl App {
                 self.ui.renaming_session = None;
                 self.ui.suggestion_selected = 0;
                 self.ui.clear_selection();
-                let was_split = self.sessions.is_split();
                 self.sessions.close(idx);
-                if was_split && !self.sessions.is_split() {
-                    self.resize_sessions_for_current_layout();
-                }
+                self.recompute_layout();
                 if self.ui.search.open {
                     self.refresh_search();
                 }
@@ -1257,9 +1540,36 @@ impl App {
                     sess.input.passthrough = !sess.input.passthrough;
                 }
             }
+            HitTarget::AcpToggle => {
+                self.toggle_acp();
+            }
+            HitTarget::AcpClose => {
+                if self.is_acp_open() {
+                    self.toggle_acp();
+                }
+            }
+            HitTarget::AcpAgentSelector => {
+                self.ui.acp_dropdown_open = !self.ui.acp_dropdown_open;
+                self.ui.acp_focused = true;
+            }
+            HitTarget::AcpAgentOption(idx) => {
+                self.select_acp_agent(idx);
+                self.ui.acp_focused = true;
+            }
+            HitTarget::AcpSend => {
+                self.ui.acp_dropdown_open = false;
+                self.ui.acp_focused = true;
+                self.submit_acp_prompt();
+            }
+            HitTarget::AcpInput | HitTarget::AcpPanel => {
+                self.ui.acp_dropdown_open = false;
+                self.ui.acp_focused = true;
+            }
             HitTarget::TerminalViewport => {
                 self.ui.picker_open = false;
                 self.ui.palette.open = false;
+                self.ui.acp_focused = false;
+                self.ui.acp_dropdown_open = false;
                 // In split mode, clicking either pane focuses it first
                 if let Some((left_idx, right_idx)) = self.sessions.split_panes() {
                     let (left_vp, right_vp) = self.layout.split_viewports();
@@ -1285,6 +1595,8 @@ impl App {
             }
             _ => {
                 self.ui.picker_open = false;
+                self.ui.acp_focused = false;
+                self.ui.acp_dropdown_open = false;
                 self.ui.clear_selection();
                 if self.ui.settings.open {
                     self.ui.settings.focused_field = None;
@@ -1768,6 +2080,7 @@ impl App {
                             if let Some(sess) = self.sessions.active_mut() {
                                 sess.input.seed_history(self.history.recent_commands(200));
                             }
+                            self.recompute_layout();
                             self.save_workspace_state();
                         }
                     }
@@ -1900,6 +2213,10 @@ impl App {
             }
         }
 
+        if self.handle_acp_key(&event) {
+            return;
+        }
+
         // Global shortcuts
         if primary {
             match &event.logical_key {
@@ -2001,6 +2318,7 @@ impl App {
                     self.ui.picker_open = false;
                     let recent = self.history.recent_commands(200);
                     if self.sessions.duplicate_active(&recent).is_ok() {
+                        self.recompute_layout();
                         self.ui.toast = Some("Duplicated session in same folder!".to_string());
                         self.save_workspace_state();
                     }
@@ -2019,11 +2337,8 @@ impl App {
                     return;
                 }
                 Key::Character(s) if allow_unshifted_shortcut && s.eq_ignore_ascii_case("w") => {
-                    let was_split = self.sessions.is_split();
                     self.sessions.close_active();
-                    if was_split && !self.sessions.is_split() {
-                        self.resize_sessions_for_current_layout();
-                    }
+                    self.recompute_layout();
                     self.ui.suggestion_selected = 0;
                     self.ui.clear_selection();
                     self.request_redraw();
@@ -2038,6 +2353,7 @@ impl App {
                 }
                 Key::Named(NamedKey::Tab) => {
                     self.sessions.select_next();
+                    self.recompute_layout();
                     self.ui.suggestion_selected = 0;
                     self.ui.clear_selection();
                     self.request_redraw();
@@ -2047,6 +2363,7 @@ impl App {
                     if let Some(digit) = s.chars().next().and_then(|c| c.to_digit(10)) {
                         if (1..=9).contains(&digit) {
                             self.sessions.select((digit - 1) as usize);
+                            self.recompute_layout();
                             self.ui.suggestion_selected = 0;
                             self.ui.clear_selection();
                             self.request_redraw();
@@ -2362,6 +2679,10 @@ impl App {
 
     fn redraw(&mut self) {
         self.sessions.poll_all();
+        let (_, acp_more) = self.poll_acp_sessions();
+        if acp_more {
+            let _ = self.proxy.send_event(());
+        }
         self.poll_plugin_usage();
         self.poll_ports();
         self.poll_updates();
@@ -2428,7 +2749,12 @@ impl ApplicationHandler<()> for App {
             let _ = surface.resize(w, h);
             let (lw, lh) =
                 Self::logical_size_from_physical(size.width, size.height, self.scale_factor);
-            self.layout = Layout::compute_with_sidebar(lw, lh, self.ui.sidebar_visible);
+            self.layout = Layout::compute_with_options(
+            lw,
+            lh,
+            self.ui.sidebar_visible,
+            self.is_acp_open(),
+        );
             self.resize_sessions_for_current_layout();
         }
 
@@ -2441,10 +2767,14 @@ impl ApplicationHandler<()> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
         let sess_changed = self.sessions.poll_all();
+        let (acp_changed, acp_more) = self.poll_acp_sessions();
+        if acp_more {
+            let _ = self.proxy.send_event(());
+        }
         let plugin_changed = self.poll_plugin_usage();
         let ports_changed = self.poll_ports();
         let updates_changed = self.poll_updates();
-        if sess_changed || plugin_changed || ports_changed || updates_changed {
+        if sess_changed || acp_changed || plugin_changed || ports_changed || updates_changed {
             if sess_changed && self.ui.search.open {
                 self.refresh_search();
             }
@@ -2452,7 +2782,7 @@ impl ApplicationHandler<()> for App {
                 .sessions
                 .active()
                 .is_some_and(|s| s.grid.is_sync_output());
-            if !in_sync || plugin_changed || ports_changed || updates_changed {
+            if !in_sync || acp_changed || plugin_changed || ports_changed || updates_changed {
                 self.request_redraw();
             }
         }
@@ -2522,6 +2852,23 @@ impl ApplicationHandler<()> for App {
                     MouseScrollDelta::PixelDelta(pos) => ((pos.y / s) / 16.0).round() as i32,
                 };
                 if lines == 0 {
+                    return;
+                }
+                if self.is_acp_open()
+                    && self
+                        .layout
+                        .acp_panel
+                        .is_some_and(|p| p.contains(self.cursor_pos.0, self.cursor_pos.1))
+                {
+                    if let Some(sess) = self.sessions.active_mut() {
+                        if lines > 0 {
+                            sess.acp.scroll = sess.acp.scroll.saturating_add(lines as usize);
+                        } else {
+                            sess.acp.scroll =
+                                sess.acp.scroll.saturating_sub(lines.unsigned_abs() as usize);
+                        }
+                        self.request_redraw();
+                    }
                     return;
                 }
                 let active_vp = self.active_pane_rect();

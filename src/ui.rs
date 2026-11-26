@@ -1,3 +1,4 @@
+use crate::acp::{parse_markdown, AcpSessionState, Agent, ConnectionState, MdLineKind};
 use crate::complete::{abbreviate_path, CompletionItem, CompletionKind};
 use crate::config::{format_hex_color, parse_hex_color, UserConfig, PRESET_ACCENTS, THEME_PRESETS};
 use crate::history::HistoryStore;
@@ -136,6 +137,13 @@ pub enum HitTarget {
     SettingsCheckUpdate,
     UpdateAction,
     UsageCardRefresh,
+    AcpToggle,
+    AcpClose,
+    AcpAgentSelector,
+    AcpAgentOption(usize),
+    AcpPanel,
+    AcpInput,
+    AcpSend,
     TerminalViewport,
     InputBar,
     None,
@@ -152,12 +160,14 @@ pub struct Layout {
     pub snippets_btn: Rect,
     pub ports_btn: Rect,
     pub split_btn: Rect,
+    pub acp_btn: Rect,
     pub new_session_btn: Rect,
     pub dup_session_btn: Rect,
     pub header: Rect,
     pub passthrough_pill: Rect,
     pub viewport: Rect,
     pub input_bar: Rect,
+    pub acp_panel: Option<Rect>,
 }
 
 impl Layout {
@@ -166,6 +176,15 @@ impl Layout {
     }
 
     pub fn compute_with_sidebar(width: u32, height: u32, sidebar_visible: bool) -> Self {
+        Self::compute_with_options(width, height, sidebar_visible, false)
+    }
+
+    pub fn compute_with_options(
+        width: u32,
+        height: u32,
+        sidebar_visible: bool,
+        acp_open: bool,
+    ) -> Self {
         let sidebar_w = if sidebar_visible {
             SIDEBAR_WIDTH.min(width / 2)
         } else {
@@ -224,13 +243,42 @@ impl Layout {
             split_w,
             btn_h,
         );
+        let acp_w_btn = 58;
+        let acp_btn = Rect::new(
+            split_btn.x.saturating_sub(acp_w_btn + 6),
+            7,
+            acp_w_btn,
+            btn_h,
+        );
         let pill_w = 104;
         let passthrough_pill = Rect::new(
-            split_btn.x.saturating_sub(pill_w + 6),
+            acp_btn.x.saturating_sub(pill_w + 6),
             7,
             pill_w,
             btn_h,
         );
+
+        let (term_w, acp_panel) = if acp_open && main_w > 0 {
+            let panel_w = if main_w >= 460 {
+                (main_w * 38 / 100)
+                    .clamp(280, 440)
+                    .min(main_w.saturating_sub(180))
+            } else {
+                main_w / 2
+            };
+            let tw = main_w.saturating_sub(panel_w + 1);
+            (
+                tw,
+                Some(Rect::new(
+                    main_x + tw + 1,
+                    header_h,
+                    panel_w,
+                    viewport_h + input_h,
+                )),
+            )
+        } else {
+            (main_w, None)
+        };
 
         Self {
             width,
@@ -242,12 +290,14 @@ impl Layout {
             snippets_btn,
             ports_btn,
             split_btn,
+            acp_btn,
             new_session_btn,
             dup_session_btn,
             header: Rect::new(main_x, 0, main_w, header_h),
             passthrough_pill,
-            viewport: Rect::new(main_x, header_h, main_w, viewport_h),
-            input_bar: Rect::new(main_x, header_h + viewport_h, main_w, input_h),
+            viewport: Rect::new(main_x, header_h, term_w, viewport_h),
+            input_bar: Rect::new(main_x, header_h + viewport_h, term_w, input_h),
+            acp_panel,
         }
     }
 
@@ -533,6 +583,65 @@ impl Layout {
         Rect::new(r.x + r.w.saturating_sub(24), r.y + 4, 20, 20)
     }
 
+    pub fn acp_header_rect(&self) -> Option<Rect> {
+        let p = self.acp_panel?;
+        Some(Rect::new(p.x, p.y, p.w, 36.min(p.h)))
+    }
+
+    pub fn acp_close_rect(&self) -> Option<Rect> {
+        let h = self.acp_header_rect()?;
+        Some(Rect::new(h.x + h.w.saturating_sub(28), h.y + 7, 20, 22))
+    }
+
+    pub fn acp_agent_selector_rect(&self) -> Option<Rect> {
+        let h = self.acp_header_rect()?;
+        Some(Rect::new(h.x + 10, h.y + 6, 118.min(h.w.saturating_sub(48)), 24))
+    }
+
+    pub fn acp_dropdown_panel(&self, count: usize) -> Option<Rect> {
+        let sel = self.acp_agent_selector_rect()?;
+        let h = (count as u32) * 26 + 8;
+        Some(Rect::new(sel.x, sel.y + sel.h + 4, sel.w.max(132), h))
+    }
+
+    pub fn acp_agent_option_rect(&self, idx: usize) -> Option<Rect> {
+        let panel = self.acp_dropdown_panel(Agent::ALL.len())?;
+        Some(Rect::new(
+            panel.x + 4,
+            panel.y + 4 + (idx as u32) * 26,
+            panel.w.saturating_sub(8),
+            24,
+        ))
+    }
+
+    pub fn acp_input_rect(&self) -> Option<Rect> {
+        let p = self.acp_panel?;
+        let send_w = 56u32;
+        let bar_h = 34u32;
+        let y = p.y + p.h.saturating_sub(bar_h + 8);
+        let w = p.w.saturating_sub(20 + send_w + 6);
+        Some(Rect::new(p.x + 10, y, w, bar_h))
+    }
+
+    pub fn acp_send_rect(&self) -> Option<Rect> {
+        let inp = self.acp_input_rect()?;
+        Some(Rect::new(inp.x + inp.w + 6, inp.y, 56, inp.h))
+    }
+
+    pub fn acp_messages_rect(&self) -> Option<Rect> {
+        let p = self.acp_panel?;
+        let h = self.acp_header_rect()?;
+        let inp = self.acp_input_rect()?;
+        let top = h.y + h.h + 4;
+        let bottom = inp.y.saturating_sub(6);
+        Some(Rect::new(
+            p.x + 8,
+            top,
+            p.w.saturating_sub(16),
+            bottom.saturating_sub(top),
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn hit_test(
         &self,
@@ -637,6 +746,9 @@ impl Layout {
         }
         if self.split_btn.contains(px, py) {
             return HitTarget::SplitToggle;
+        }
+        if self.acp_btn.contains(px, py) {
+            return HitTarget::AcpToggle;
         }
         if self.sidebar.w > 0 {
             if self.new_session_btn.contains(px, py) {
@@ -1106,6 +1218,8 @@ pub struct UiState {
     pub ports: PortsUiState,
     pub settings: SettingsUiState,
     pub update_status: UpdateStatus,
+    pub acp_focused: bool,
+    pub acp_dropdown_open: bool,
 }
 
 impl UiState {
@@ -1130,6 +1244,8 @@ impl UiState {
             ports: PortsUiState::default(),
             settings: SettingsUiState::from_config(cfg, active_accent),
             update_status: UpdateStatus::Idle,
+            acp_focused: false,
+            acp_dropdown_open: false,
         }
     }
 
@@ -1491,7 +1607,36 @@ pub fn render_app(
         theme.border,
     );
 
-    // Top-right header action buttons: [Split] [Ports] [Snippets] [Settings]
+    // Top-right header action buttons: [ACP] [Split] [Ports] [Snippets] [Settings]
+    let acp_active = sessions.active().is_some_and(|s| s.acp.open);
+    let acp_dot_color = sessions
+        .active()
+        .map(|s| acp_status_color(&s.acp, theme))
+        .unwrap_or(theme.fg_muted);
+    let acp_bg = if acp_active || ui.hovered == HitTarget::AcpToggle {
+        theme.bg_sidebar_active
+    } else {
+        theme.bg_sidebar_hover
+    };
+    canvas.fill_rect(layout.acp_btn, acp_bg);
+    canvas.stroke_rect(
+        layout.acp_btn,
+        if acp_active { user.accent } else { theme.border },
+    );
+    canvas.fill_rect(
+        Rect::new(layout.acp_btn.x + 7, layout.acp_btn.y + 9, 6, 6),
+        acp_dot_color,
+    );
+    font.draw_text(
+        &mut canvas,
+        (layout.acp_btn.x + 17) as i32,
+        (layout.acp_btn.y + 5) as i32,
+        FONT_SIZE_SMALL,
+        if acp_active { user.accent } else { theme.fg_primary },
+        "ACP",
+        (layout.acp_btn.x + layout.acp_btn.w - 4) as i32,
+    );
+
     let split_active = sessions.is_split();
     let split_bg = if split_active || ui.hovered == HitTarget::SplitToggle {
         theme.bg_sidebar_active
@@ -1939,6 +2084,22 @@ pub fn render_app(
             "No active sessions. Click '+ New Session' or press Ctrl+T to open a shell.",
             (layout.viewport.x + layout.viewport.w - 16) as i32,
         );
+    }
+
+    // 11b. Optional ACP agent side panel
+    if let (Some(panel), Some(active)) = (layout.acp_panel, sessions.active()) {
+        if active.acp.open {
+            render_acp_panel(
+                &mut canvas,
+                layout,
+                panel,
+                &active.acp,
+                font,
+                theme,
+                user,
+                ui,
+            );
+        }
     }
 
     // 12. Floating Search bar (Ctrl+F)
@@ -3111,6 +3272,513 @@ fn render_history_modal(
     }
 }
 
+fn acp_status_color(acp: &AcpSessionState, theme: &Theme) -> Rgb {
+    match acp.chat.connection() {
+        ConnectionState::Disconnected => theme.fg_muted,
+        ConnectionState::Connecting => theme.syntax.flag,
+        ConnectionState::Active => theme.syntax.string_literal,
+        ConnectionState::Error(_) => theme.danger,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AcpRowKind {
+    UserPrompt,
+    Heading,
+    Body,
+    Bullet,
+    Quote,
+    CodeHeader,
+    Code,
+    Muted,
+    Error,
+}
+
+struct AcpRow {
+    kind: AcpRowKind,
+    text: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_acp_panel(
+    canvas: &mut Canvas<'_>,
+    layout: &Layout,
+    panel: Rect,
+    acp: &AcpSessionState,
+    font: &mut FontRenderer,
+    theme: &Theme,
+    user: &UserIdentity,
+    ui: &UiState,
+) {
+    // Left divider + panel background
+    canvas.fill_rect(
+        Rect::new(panel.x.saturating_sub(1), panel.y, 1, panel.h),
+        theme.border,
+    );
+    canvas.fill_rect(panel, theme.bg_sidebar);
+
+    if let Some(hdr) = layout.acp_header_rect() {
+        canvas.fill_rect(hdr, theme.bg_header);
+        canvas.fill_rect(
+            Rect::new(hdr.x, hdr.y + hdr.h.saturating_sub(1), hdr.w, 1),
+            theme.border,
+        );
+    }
+
+    if let Some(sel_r) = layout.acp_agent_selector_rect() {
+        let sel_bg = if ui.acp_dropdown_open || ui.hovered == HitTarget::AcpAgentSelector {
+            theme.bg_sidebar_active
+        } else {
+            theme.bg_input
+        };
+        canvas.fill_rect(sel_r, sel_bg);
+        canvas.stroke_rect(
+            sel_r,
+            if ui.acp_dropdown_open {
+                user.accent
+            } else {
+                theme.border
+            },
+        );
+        let label = format!("{} v", acp.agent.label());
+        font.draw_text(
+            canvas,
+            (sel_r.x + 8) as i32,
+            (sel_r.y + 5) as i32,
+            FONT_SIZE_SMALL,
+            theme.fg_primary,
+            &label,
+            (sel_r.x + sel_r.w - 6) as i32,
+        );
+
+        let status_color = acp_status_color(acp, theme);
+        let status_x = sel_r.x + sel_r.w + 10;
+        let close_x = layout
+            .acp_close_rect()
+            .map(|c| c.x)
+            .unwrap_or(panel.x + panel.w - 28);
+        if status_x + 24 < close_x {
+            canvas.fill_rect(Rect::new(status_x, sel_r.y + 9, 6, 6), status_color);
+            font.draw_text(
+                canvas,
+                (status_x + 10) as i32,
+                (sel_r.y + 5) as i32,
+                FONT_SIZE_SMALL,
+                status_color,
+                acp.status_label(),
+                (close_x.saturating_sub(4)) as i32,
+            );
+        }
+    }
+
+    if let Some(close_r) = layout.acp_close_rect() {
+        font.draw_text(
+            canvas,
+            (close_r.x + 6) as i32,
+            (close_r.y + 2) as i32,
+            FONT_SIZE_UI,
+            if ui.hovered == HitTarget::AcpClose {
+                theme.danger
+            } else {
+                theme.fg_muted
+            },
+            "x",
+            (close_r.x + close_r.w) as i32,
+        );
+    }
+
+    if let Some(msg_r) = layout.acp_messages_rect() {
+        let char_w = font.measure_text("M", FONT_SIZE_SMALL).max(6);
+        let max_cols = ((msg_r.w.saturating_sub(18)) / char_w).max(12) as usize;
+        let mut rows: Vec<AcpRow> = Vec::new();
+
+        let has_error = matches!(acp.chat.connection(), ConnectionState::Error(_));
+        if acp.turns.is_empty()
+            && acp.pending_prompt.is_none()
+            && acp.chat.response().is_empty()
+            && !has_error
+        {
+            for line in crate::acp::markdown::wrap_text(
+                "ACP local agent mode (OAuth via CLI, no API keys).",
+                max_cols,
+            ) {
+                rows.push(AcpRow {
+                    kind: AcpRowKind::Muted,
+                    text: line,
+                });
+            }
+            for line in crate::acp::markdown::wrap_text(
+                "Type a prompt below and press Enter to start.",
+                max_cols,
+            ) {
+                rows.push(AcpRow {
+                    kind: AcpRowKind::Muted,
+                    text: line,
+                });
+            }
+        } else {
+            for turn in &acp.turns {
+                push_prompt_rows(&mut rows, &turn.prompt, max_cols);
+                push_markdown_rows(&mut rows, &turn.response, max_cols);
+                if turn.truncated {
+                    rows.push(AcpRow {
+                        kind: AcpRowKind::Muted,
+                        text: "[response truncated at 64 KiB]".to_string(),
+                    });
+                }
+                rows.push(AcpRow {
+                    kind: AcpRowKind::Body,
+                    text: String::new(),
+                });
+            }
+            if let Some(pending) = &acp.pending_prompt {
+                push_prompt_rows(&mut rows, pending, max_cols);
+                if !acp.chat.response().is_empty() {
+                    push_markdown_rows(&mut rows, acp.chat.response(), max_cols);
+                    if acp.chat.response_truncated() {
+                        rows.push(AcpRow {
+                            kind: AcpRowKind::Muted,
+                            text: "[response truncated at 64 KiB]".to_string(),
+                        });
+                    }
+                } else if acp.chat.is_prompt_pending() {
+                    rows.push(AcpRow {
+                        kind: AcpRowKind::Muted,
+                        text: "Thinking...".to_string(),
+                    });
+                }
+            }
+        }
+
+        if let ConnectionState::Error(err) = acp.chat.connection() {
+            if !rows.is_empty() {
+                rows.push(AcpRow {
+                    kind: AcpRowKind::Body,
+                    text: String::new(),
+                });
+            }
+            for part in crate::acp::markdown::wrap_text(err, max_cols) {
+                rows.push(AcpRow {
+                    kind: AcpRowKind::Error,
+                    text: part,
+                });
+            }
+        }
+
+        let line_h = 18u32;
+        let visible_rows = (msg_r.h / line_h).max(1) as usize;
+        let max_scroll = rows.len().saturating_sub(visible_rows);
+        let scroll = acp.scroll.min(max_scroll);
+        let start = rows.len().saturating_sub(visible_rows + scroll);
+        let end = (start + visible_rows).min(rows.len());
+        let max_x = (msg_r.x + msg_r.w - 4) as i32;
+
+        for (i, row) in rows[start..end].iter().enumerate() {
+            let y = msg_r.y + (i as u32) * line_h;
+            match row.kind {
+                AcpRowKind::UserPrompt => {
+                    canvas.fill_rect(Rect::new(msg_r.x, y, 2, line_h), user.accent);
+                    font.draw_text(
+                        canvas,
+                        (msg_r.x + 8) as i32,
+                        (y + 2) as i32,
+                        FONT_SIZE_SMALL,
+                        user.accent,
+                        &row.text,
+                        max_x,
+                    );
+                }
+                AcpRowKind::Heading => {
+                    font.draw_text(
+                        canvas,
+                        (msg_r.x + 4) as i32,
+                        (y + 2) as i32,
+                        FONT_SIZE_UI,
+                        user.accent,
+                        &row.text,
+                        max_x,
+                    );
+                }
+                AcpRowKind::Bullet => {
+                    font.draw_text(
+                        canvas,
+                        (msg_r.x + 6) as i32,
+                        (y + 2) as i32,
+                        FONT_SIZE_SMALL,
+                        theme.fg_primary,
+                        &row.text,
+                        max_x,
+                    );
+                }
+                AcpRowKind::Quote => {
+                    font.draw_text(
+                        canvas,
+                        (msg_r.x + 6) as i32,
+                        (y + 2) as i32,
+                        FONT_SIZE_SMALL,
+                        theme.fg_muted,
+                        &row.text,
+                        max_x,
+                    );
+                }
+                AcpRowKind::CodeHeader => {
+                    canvas.fill_rect(
+                        Rect::new(msg_r.x + 2, y, msg_r.w.saturating_sub(4), line_h),
+                        theme.bg_header,
+                    );
+                    canvas.fill_rect(Rect::new(msg_r.x + 2, y, 2, line_h), theme.syntax.flag);
+                    font.draw_text(
+                        canvas,
+                        (msg_r.x + 10) as i32,
+                        (y + 2) as i32,
+                        FONT_SIZE_SMALL,
+                        theme.syntax.flag,
+                        &row.text,
+                        max_x,
+                    );
+                }
+                AcpRowKind::Code => {
+                    canvas.fill_rect(
+                        Rect::new(msg_r.x + 2, y, msg_r.w.saturating_sub(4), line_h),
+                        theme.bg_terminal,
+                    );
+                    canvas.fill_rect(Rect::new(msg_r.x + 2, y, 2, line_h), user.accent);
+                    font.draw_text(
+                        canvas,
+                        (msg_r.x + 10) as i32,
+                        (y + 2) as i32,
+                        FONT_SIZE_SMALL,
+                        theme.syntax.string_literal,
+                        &row.text,
+                        max_x,
+                    );
+                }
+                AcpRowKind::Muted => {
+                    font.draw_text(
+                        canvas,
+                        (msg_r.x + 4) as i32,
+                        (y + 2) as i32,
+                        FONT_SIZE_SMALL,
+                        theme.fg_muted,
+                        &row.text,
+                        max_x,
+                    );
+                }
+                AcpRowKind::Error => {
+                    canvas.fill_rect(
+                        Rect::new(msg_r.x + 2, y, msg_r.w.saturating_sub(4), line_h),
+                        theme.danger.lerp(theme.bg_sidebar, 210),
+                    );
+                    font.draw_text(
+                        canvas,
+                        (msg_r.x + 8) as i32,
+                        (y + 2) as i32,
+                        FONT_SIZE_SMALL,
+                        theme.danger,
+                        &row.text,
+                        max_x,
+                    );
+                }
+                AcpRowKind::Body => {
+                    if !row.text.is_empty() {
+                        font.draw_text(
+                            canvas,
+                            (msg_r.x + 4) as i32,
+                            (y + 2) as i32,
+                            FONT_SIZE_SMALL,
+                            theme.fg_primary,
+                            &row.text,
+                            max_x,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(inp_r) = layout.acp_input_rect() {
+        canvas.fill_rect(inp_r, theme.bg_input);
+        canvas.stroke_rect(
+            inp_r,
+            if ui.acp_focused {
+                user.accent
+            } else {
+                theme.border
+            },
+        );
+
+        let text = acp.input.text();
+        let text_x = (inp_r.x + 8) as i32;
+        let text_y = (inp_r.y + 9) as i32;
+        let inp_max_x = (inp_r.x + inp_r.w - 8) as i32;
+
+        if text.is_empty() {
+            font.draw_text(
+                canvas,
+                text_x,
+                text_y,
+                FONT_SIZE_SMALL,
+                theme.fg_muted,
+                "Message ACP agent...",
+                inp_max_x,
+            );
+            if ui.acp_focused {
+                canvas.fill_rect(Rect::new(inp_r.x + 8, inp_r.y + 7, 2, 18), user.accent);
+            }
+        } else {
+            let cursor_char = acp.input.cursor_char_index();
+            let avail_w = inp_r.w.saturating_sub(18);
+            let mut view_start_char = 0usize;
+            let chars: Vec<char> = text.chars().collect();
+            while view_start_char < cursor_char {
+                let slice: String = chars[view_start_char..cursor_char].iter().collect();
+                if font.measure_text(&slice, FONT_SIZE_SMALL) <= avail_w {
+                    break;
+                }
+                view_start_char += 1;
+            }
+            let visible_text: String = chars[view_start_char..].iter().collect();
+
+            if let Some((sel_a, sel_b)) = acp.input.selected_char_range() {
+                if sel_b > view_start_char {
+                    let s0 = sel_a.saturating_sub(view_start_char);
+                    let s1 = sel_b.saturating_sub(view_start_char);
+                    let before: String =
+                        chars[view_start_char..view_start_char + s0].iter().collect();
+                    let span: String =
+                        chars[view_start_char + s0..view_start_char + s1].iter().collect();
+                    let x0 = text_x + font.measure_text(&before, FONT_SIZE_SMALL) as i32;
+                    let sw = font.measure_text(&span, FONT_SIZE_SMALL).max(4);
+                    let max_w = (inp_max_x - x0).max(0) as u32;
+                    if max_w > 0 {
+                        canvas.fill_rect(
+                            Rect::new(x0.max(0) as u32, inp_r.y + 6, sw.min(max_w), 20),
+                            user.accent.lerp(theme.bg_input, 160),
+                        );
+                    }
+                }
+            }
+
+            font.draw_text(
+                canvas,
+                text_x,
+                text_y,
+                FONT_SIZE_SMALL,
+                theme.fg_primary,
+                &visible_text,
+                inp_max_x,
+            );
+
+            if ui.acp_focused {
+                let prefix: String = chars[view_start_char..cursor_char].iter().collect();
+                let caret_x = (text_x + font.measure_text(&prefix, FONT_SIZE_SMALL) as i32)
+                    .min(inp_max_x - 2);
+                if caret_x >= 0 {
+                    canvas.fill_rect(Rect::new(caret_x as u32, inp_r.y + 7, 2, 18), user.accent);
+                }
+            }
+        }
+    }
+
+    if let Some(send_r) = layout.acp_send_rect() {
+        let can_send = matches!(acp.chat.connection(), ConnectionState::Active)
+            && !acp.chat.is_prompt_pending()
+            && !acp.input.text().trim().is_empty();
+        let bg = if can_send && ui.hovered == HitTarget::AcpSend {
+            user.accent.lerp(theme.bg_input, 120)
+        } else if can_send {
+            user.accent.lerp(theme.bg_input, 170)
+        } else {
+            theme.bg_sidebar_hover
+        };
+        canvas.fill_rect(send_r, bg);
+        canvas.stroke_rect(
+            send_r,
+            if can_send { user.accent } else { theme.border },
+        );
+        font.draw_text(
+            canvas,
+            (send_r.x + 12) as i32,
+            (send_r.y + 9) as i32,
+            FONT_SIZE_SMALL,
+            if can_send {
+                theme.fg_primary
+            } else {
+                theme.fg_muted
+            },
+            if acp.chat.is_prompt_pending() {
+                "..."
+            } else {
+                "Send"
+            },
+            (send_r.x + send_r.w - 4) as i32,
+        );
+    }
+
+    if ui.acp_dropdown_open {
+        if let Some(drop_r) = layout.acp_dropdown_panel(Agent::ALL.len()) {
+            canvas.fill_rect(drop_r, theme.bg_header);
+            canvas.stroke_rect(drop_r, user.accent);
+            for (i, ag) in Agent::ALL.iter().enumerate() {
+                if let Some(opt_r) = layout.acp_agent_option_rect(i) {
+                    let is_sel = *ag == acp.agent;
+                    let is_hov = ui.hovered == HitTarget::AcpAgentOption(i);
+                    if is_sel {
+                        canvas.fill_rect(opt_r, theme.bg_sidebar_active);
+                        canvas.fill_rect(Rect::new(opt_r.x, opt_r.y, 3, opt_r.h), user.accent);
+                    } else if is_hov {
+                        canvas.fill_rect(opt_r, theme.bg_sidebar_hover);
+                    }
+                    font.draw_text(
+                        canvas,
+                        (opt_r.x + 10) as i32,
+                        (opt_r.y + 5) as i32,
+                        FONT_SIZE_SMALL,
+                        if is_sel {
+                            user.accent
+                        } else {
+                            theme.fg_primary
+                        },
+                        ag.label(),
+                        (opt_r.x + opt_r.w - 6) as i32,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn push_prompt_rows(rows: &mut Vec<AcpRow>, prompt: &str, max_cols: usize) {
+    let inner = max_cols.saturating_sub(2).max(6);
+    for (idx, part) in crate::acp::markdown::wrap_text(prompt, inner)
+        .into_iter()
+        .enumerate()
+    {
+        let prefix = if idx == 0 { "> " } else { "  " };
+        rows.push(AcpRow {
+            kind: AcpRowKind::UserPrompt,
+            text: format!("{prefix}{part}"),
+        });
+    }
+}
+
+fn push_markdown_rows(rows: &mut Vec<AcpRow>, raw: &str, max_cols: usize) {
+    for md in parse_markdown(raw, max_cols) {
+        let kind = match md.kind {
+            MdLineKind::Heading => AcpRowKind::Heading,
+            MdLineKind::Body => AcpRowKind::Body,
+            MdLineKind::Bullet => AcpRowKind::Bullet,
+            MdLineKind::Quote => AcpRowKind::Quote,
+            MdLineKind::CodeHeader => AcpRowKind::CodeHeader,
+            MdLineKind::Code => AcpRowKind::Code,
+        };
+        rows.push(AcpRow {
+            kind,
+            text: md.text,
+        });
+    }
+}
+
 /// Procedurally generates a crisp 32x32 RGBA app icon (`>_` inside a rounded dark frame).
 /// Zero image-decoding dependencies; used for both window taskbar icon and `.exe` resource.
 pub fn build_app_icon_rgba(accent: Rgb) -> Vec<u8> {
@@ -3303,5 +3971,37 @@ mod tests {
         let mut canvas = Canvas::new_scaled(&mut pixels, 10, 10, 1.0);
         let alpha = vec![255u8; 4 * 4];
         canvas.blit_alpha(0, 0, 4, 4, &alpha, Rgb::new(0xFF, 0xFF, 0xFF), 10);
+    }
+
+    #[test]
+    fn layout_supports_optional_acp_panel_and_toggle_hit_target() {
+        let closed = Layout::compute_with_options(1120, 720, true, false);
+        assert!(closed.acp_panel.is_none());
+        assert_eq!(
+            closed.hit_test(
+                closed.acp_btn.x + 10,
+                closed.acp_btn.y + 5,
+                1,
+                1,
+                false,
+                0,
+                false
+            ),
+            HitTarget::AcpToggle
+        );
+        assert!(closed.passthrough_pill.x + closed.passthrough_pill.w < closed.acp_btn.x);
+        assert!(closed.acp_btn.x + closed.acp_btn.w < closed.split_btn.x);
+
+        let open = Layout::compute_with_options(1120, 720, true, true);
+        let panel = open.acp_panel.expect("acp panel should exist when open");
+        assert!(open.viewport.w < closed.viewport.w);
+        assert_eq!(open.viewport.w + 1 + panel.w, closed.viewport.w);
+        assert_eq!(open.input_bar.w, open.viewport.w);
+        assert!(open.acp_header_rect().is_some());
+        assert!(open.acp_close_rect().is_some());
+        assert!(open.acp_agent_selector_rect().is_some());
+        assert!(open.acp_messages_rect().is_some());
+        assert!(open.acp_input_rect().is_some());
+        assert!(open.acp_send_rect().is_some());
     }
 }
