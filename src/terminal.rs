@@ -362,6 +362,27 @@ impl TerminalGrid {
         lines.join("\n")
     }
 
+    /// Returns up to the last `max_lines` clean text lines (ANSI stripped, no `\0` continuations).
+    pub fn last_clean_lines(&self, max_lines: usize) -> Vec<String> {
+        if max_lines == 0 {
+            return Vec::new();
+        }
+        let mut lines = Vec::with_capacity(self.scrollback.len() + self.cells.len());
+        for row in self.scrollback.iter().chain(self.cells.iter()) {
+            let s: String = row
+                .iter()
+                .filter(|c| c.ch != '\0' && (!c.ch.is_control() || c.ch == '\t'))
+                .map(|c| c.ch)
+                .collect();
+            lines.push(s.trim_end().to_string());
+        }
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        let start = lines.len().saturating_sub(max_lines);
+        lines.split_off(start)
+    }
+
     /// Searches scrollback + active screen case-insensitively for `query`.
     pub fn search_matches(&self, query: &str) -> Vec<SearchMatch> {
         let q = query.trim();
@@ -2021,5 +2042,27 @@ mod tests {
         assert_eq!(row[1].ch, 'Y');
         assert_eq!(row[1].bg, bg);
         assert!(!row[1].dim);
+    }
+
+    #[test]
+    fn last_clean_lines_strips_ansi_and_caps_tail() {
+        let fg = Rgb::new(220, 220, 220);
+        let bg = Rgb::new(10, 10, 10);
+        let mut grid = TerminalGrid::new(32, 3, fg, bg);
+        grid.feed("\x1b[31merr one\x1b[0m\r\n\x1b[32mok ✨ two\x1b[0m\r\nline three\r\nline four\r\n".as_bytes());
+        assert_eq!(
+            grid.last_clean_lines(2),
+            vec!["line three".to_string(), "line four".to_string()]
+        );
+        assert_eq!(
+            grid.last_clean_lines(10),
+            vec![
+                "err one".to_string(),
+                "ok ✨ two".to_string(),
+                "line three".to_string(),
+                "line four".to_string(),
+            ]
+        );
+        assert!(grid.last_clean_lines(0).is_empty());
     }
 }

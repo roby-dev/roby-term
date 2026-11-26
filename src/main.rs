@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use my_warp::acp::Agent;
+use my_warp::acp::{Agent, DEFAULT_CONTEXT_LINES};
 use my_warp::clipboard::{copy_text, paste_text};
 use my_warp::complete::{
     complete_input, is_completing_path, longest_common_prefix, strip_verbatim_prefix,
@@ -584,7 +584,14 @@ impl App {
         let Some(sess) = self.sessions.active_mut() else {
             return;
         };
-        if let Err(err) = sess.acp.submit_prompt() {
+        let res = if sess.acp.include_context {
+            let lines = sess.grid.last_clean_lines(DEFAULT_CONTEXT_LINES);
+            let cwd = sess.cwd.clone();
+            sess.acp.submit_prompt_with_context(&cwd, &lines)
+        } else {
+            sess.acp.submit_prompt()
+        };
+        if let Err(err) = res {
             self.ui.toast = Some(err);
         }
     }
@@ -857,6 +864,33 @@ impl App {
                     .is_some_and(|r| r.contains(px, py))
                 {
                     return HitTarget::AcpAgentSelector;
+                }
+                if self
+                    .sessions
+                    .active()
+                    .is_some_and(|s| s.acp.chat.pending_permission().is_some())
+                {
+                    if self
+                        .layout
+                        .acp_permission_approve_rect()
+                        .is_some_and(|r| r.contains(px, py))
+                    {
+                        return HitTarget::AcpPermissionApprove;
+                    }
+                    if self
+                        .layout
+                        .acp_permission_reject_rect()
+                        .is_some_and(|r| r.contains(px, py))
+                    {
+                        return HitTarget::AcpPermissionReject;
+                    }
+                }
+                if self
+                    .layout
+                    .acp_context_bar_rect()
+                    .is_some_and(|r| r.contains(px, py))
+                {
+                    return HitTarget::AcpContextToggle;
                 }
                 if self
                     .layout
@@ -1560,6 +1594,31 @@ impl App {
                 self.ui.acp_dropdown_open = false;
                 self.ui.acp_focused = true;
                 self.submit_acp_prompt();
+            }
+            HitTarget::AcpContextToggle => {
+                if let Some(sess) = self.sessions.active_mut() {
+                    sess.acp.include_context = !sess.acp.include_context;
+                }
+                self.ui.acp_dropdown_open = false;
+                self.ui.acp_focused = true;
+            }
+            HitTarget::AcpPermissionApprove => {
+                if let Some(sess) = self.sessions.active_mut() {
+                    if let Err(err) = sess.acp.approve_permission() {
+                        self.ui.toast = Some(err);
+                    }
+                }
+                self.ui.acp_dropdown_open = false;
+                self.ui.acp_focused = true;
+            }
+            HitTarget::AcpPermissionReject => {
+                if let Some(sess) = self.sessions.active_mut() {
+                    if let Err(err) = sess.acp.reject_permission() {
+                        self.ui.toast = Some(err);
+                    }
+                }
+                self.ui.acp_dropdown_open = false;
+                self.ui.acp_focused = true;
             }
             HitTarget::AcpInput | HitTarget::AcpPanel => {
                 self.ui.acp_dropdown_open = false;

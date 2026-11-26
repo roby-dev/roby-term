@@ -2,6 +2,7 @@
 use super::{Agent, Client, Event};
 use serde_json::{json, Value};
 use std::{
+    collections::VecDeque,
     io,
     path::{Path, PathBuf},
     sync::{mpsc, Arc},
@@ -12,6 +13,7 @@ use std::{
 pub const MAX_PROMPT_BYTES: usize = 16 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_ERROR_BYTES: usize = 512;
+const MAX_PENDING_PERMISSIONS: usize = 16;
 const POLL_BUDGET: usize = 32;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -20,6 +22,15 @@ pub enum ConnectionState<'a> {
     Connecting,
     Active,
     Error(&'a str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPermission {
+    pub title: String,
+    pub detail: Option<String>,
+    pub allow_option_id: Option<String>,
+    pub reject_option_id: Option<String>,
+    request_id: Value,
 }
 
 #[derive(Default)]
@@ -52,6 +63,7 @@ struct Response {
 pub struct Chat {
     link: Link,
     response: Response,
+    pending_permissions: VecDeque<PendingPermission>,
 }
 
 impl Chat {
@@ -99,6 +111,7 @@ impl Chat {
         })?;
         self.link = Link::Launching { ready, cwd: cwd.to_owned(), _pending: pending };
         self.response = Response::default();
+        self.pending_permissions.clear();
         Ok(())
     }
 
@@ -107,6 +120,7 @@ impl Chat {
     pub fn stop(&mut self) {
         self.link = Link::Off;
         self.response = Response::default();
+        self.pending_permissions.clear();
     }
 
     /// Enqueue one nonblank prompt while active and idle. A rejected submission
@@ -139,6 +153,47 @@ impl Chat {
         self.response.truncated
     }
 
+    pub fn pending_permission(&self) -> Option<&PendingPermission> {
+        self.pending_permissions.front()
+    }
+
+    pub fn pending_permission_count(&self) -> usize {
+        self.pending_permissions.len()
+    }
+
+    /// Responds to the frontmost permission request with an allow option, or cancels if none exists.
+    pub fn approve_permission(&mut self) -> io::Result<bool> {
+        let Link::Open(client, _) = &self.link else {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "ACP chat is not active"));
+        };
+        let Some(perm) = self.pending_permissions.pop_front() else {
+            return Ok(false);
+        };
+        if let Some(option_id) = perm.allow_option_id {
+            client.respond(&perm.request_id, Ok(json!({"outcome":{"outcome":"selected","optionId": option_id}})))?;
+            Ok(true)
+        } else {
+            client.respond(&perm.request_id, Ok(json!({"outcome":{"outcome":"cancelled"}})))?;
+            Ok(false)
+        }
+    }
+
+    /// Responds to the frontmost permission request with a reject option, or cancels if none exists.
+    pub fn reject_permission(&mut self) -> io::Result<bool> {
+        let Link::Open(client, _) = &self.link else {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "ACP chat is not active"));
+        };
+        let Some(perm) = self.pending_permissions.pop_front() else {
+            return Ok(false);
+        };
+        let reply = match perm.reject_option_id {
+            Some(option_id) => json!({"outcome":{"outcome":"selected","optionId": option_id}}),
+            None => json!({"outcome":{"outcome":"cancelled"}}),
+        };
+        client.respond(&perm.request_id, Ok(reply))?;
+        Ok(true)
+    }
+
     /// Advance launch and handle up to 32 queued items without blocking. `true`
     /// means the budget was exhausted: schedule another poll before going idle.
     pub fn poll(&mut self) -> bool {
@@ -148,6 +203,7 @@ impl Chat {
                 Ok(false) => return false,
                 Err(error) => {
                     self.link = Link::Failed(prefix(&error, MAX_ERROR_BYTES).to_owned());
+                    self.pending_permissions.clear();
                     return false;
                 }
             }
@@ -167,7 +223,9 @@ impl Chat {
                 Err(mpsc::TryRecvError::Disconnected) => return Err("ACP launch worker stopped".into()),
             },
             Link::Open(client, phase) => match client.recv_timeout(Duration::ZERO) {
-                Ok(Event::Message(frame)) => phase.handle(client, &mut self.response, &frame)?,
+                Ok(Event::Message(frame)) => {
+                    phase.handle(client, &mut self.response, &mut self.pending_permissions, &frame)?;
+                }
                 Ok(Event::Error(error)) => return Err(error),
                 Ok(Event::Closed) | Err(mpsc::RecvTimeoutError::Disconnected) => return Err("ACP agent disconnected".into()),
                 Err(mpsc::RecvTimeoutError::Timeout) => return Ok(false),
@@ -179,16 +237,36 @@ impl Chat {
 }
 
 impl Phase {
-    fn handle(&mut self, client: &mut Client, response: &mut Response, frame: &Value) -> Result<(), String> {
+    fn handle(
+        &mut self,
+        client: &mut Client,
+        response: &mut Response,
+        pending_permissions: &mut VecDeque<PendingPermission>,
+        frame: &Value,
+    ) -> Result<(), String> {
         if let Some(method) = frame.get("method").and_then(Value::as_str) {
             if let Some(id) = frame.get("id") {
                 if id.is_string() || id.is_number() || id.is_null() {
-                    // T2 offers no filesystem/terminal bridge, even for a matching session.
-                    let reply = match method {
-                        "session/request_permission" => Ok(json!({"outcome":{"outcome":"cancelled"}})),
-                        _ => Err(json!({"code":-32601,"message":"Method not found"})),
-                    };
-                    client.respond(id, reply).map_err(send_error)?;
+                    if method == "session/request_permission" {
+                        let params = &frame["params"];
+                        if let Self::Active { session, .. } = self {
+                            if params["sessionId"].as_str() == Some(session.as_str())
+                                && pending_permissions.len() < MAX_PENDING_PERMISSIONS
+                            {
+                                if let Some(perm) = parse_permission(id.clone(), params) {
+                                    pending_permissions.push_back(perm);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        client
+                            .respond(id, Ok(json!({"outcome":{"outcome":"cancelled"}})))
+                            .map_err(send_error)?;
+                    } else {
+                        client
+                            .respond(id, Err(json!({"code":-32601,"message":"Method not found"})))
+                            .map_err(send_error)?;
+                    }
                 }
             } else if method == "session/update" {
                 let params = &frame["params"];
@@ -245,6 +323,63 @@ impl Phase {
         }
         Ok(())
     }
+}
+
+fn parse_permission(request_id: Value, params: &Value) -> Option<PendingPermission> {
+    let options = params.get("options").and_then(Value::as_array)?;
+    let allow_option_id = pick_option_id(options, &["allow_once", "allow_always"], "allow");
+    let reject_option_id = pick_option_id(options, &["reject_once", "reject_always"], "reject");
+    if allow_option_id.is_none() && reject_option_id.is_none() {
+        return None;
+    }
+
+    let tool = &params["toolCall"];
+    let raw_title = tool["title"]
+        .as_str()
+        .or_else(|| tool["kind"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Agent permission request");
+    let title = prefix(raw_title, 160).to_owned();
+
+    let raw_input = &tool["rawInput"];
+    let raw_detail = raw_input["command"]
+        .as_str()
+        .or_else(|| raw_input["path"].as_str())
+        .or_else(|| raw_input["cmd"].as_str())
+        .or_else(|| raw_input.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let detail = raw_detail.map(|d| prefix(d, 200).to_owned());
+
+    Some(PendingPermission {
+        title,
+        detail,
+        allow_option_id,
+        reject_option_id,
+        request_id,
+    })
+}
+
+fn pick_option_id(options: &[Value], preferred_kinds: &[&str], prefix_kind: &str) -> Option<String> {
+    for want in preferred_kinds {
+        if let Some(id) = options.iter().find_map(|opt| {
+            (opt["kind"].as_str() == Some(*want))
+                .then(|| opt["optionId"].as_str())
+                .flatten()
+                .filter(|id| !id.is_empty())
+        }) {
+            return Some(id.to_owned());
+        }
+    }
+    options.iter().find_map(|opt| {
+        opt["kind"]
+            .as_str()
+            .filter(|k| k.starts_with(prefix_kind))
+            .and_then(|_| opt["optionId"].as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 fn prefix(text: &str, bytes: usize) -> &str {

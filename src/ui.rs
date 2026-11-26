@@ -144,6 +144,9 @@ pub enum HitTarget {
     AcpPanel,
     AcpInput,
     AcpSend,
+    AcpContextToggle,
+    AcpPermissionApprove,
+    AcpPermissionReject,
     TerminalViewport,
     InputBar,
     None,
@@ -628,12 +631,40 @@ impl Layout {
         Some(Rect::new(inp.x + inp.w + 6, inp.y, 56, inp.h))
     }
 
+    pub fn acp_context_bar_rect(&self) -> Option<Rect> {
+        let p = self.acp_panel?;
+        let inp = self.acp_input_rect()?;
+        let h = 24u32;
+        Some(Rect::new(
+            p.x + 10,
+            inp.y.saturating_sub(h + 6),
+            p.w.saturating_sub(20),
+            h,
+        ))
+    }
+
+    pub fn acp_permission_card_rect(&self) -> Option<Rect> {
+        let ctx = self.acp_context_bar_rect()?;
+        let h = 76u32;
+        Some(Rect::new(ctx.x, ctx.y.saturating_sub(h + 6), ctx.w, h))
+    }
+
+    pub fn acp_permission_approve_rect(&self) -> Option<Rect> {
+        let card = self.acp_permission_card_rect()?;
+        Some(Rect::new(card.x + 8, card.y + card.h.saturating_sub(28), 82, 22))
+    }
+
+    pub fn acp_permission_reject_rect(&self) -> Option<Rect> {
+        let approve = self.acp_permission_approve_rect()?;
+        Some(Rect::new(approve.x + approve.w + 8, approve.y, 82, 22))
+    }
+
     pub fn acp_messages_rect(&self) -> Option<Rect> {
         let p = self.acp_panel?;
         let h = self.acp_header_rect()?;
-        let inp = self.acp_input_rect()?;
+        let ctx = self.acp_context_bar_rect()?;
         let top = h.y + h.h + 4;
-        let bottom = inp.y.saturating_sub(6);
+        let bottom = ctx.y.saturating_sub(6);
         Some(Rect::new(
             p.x + 8,
             top,
@@ -3387,7 +3418,12 @@ fn render_acp_panel(
         );
     }
 
-    if let Some(msg_r) = layout.acp_messages_rect() {
+    if let Some(mut msg_r) = layout.acp_messages_rect() {
+        if acp.chat.pending_permission().is_some() {
+            if let Some(card_r) = layout.acp_permission_card_rect() {
+                msg_r.h = card_r.y.saturating_sub(msg_r.y + 6);
+            }
+        }
         let char_w = font.measure_text("M", FONT_SIZE_SMALL).max(6);
         let max_cols = ((msg_r.w.saturating_sub(18)) / char_w).max(12) as usize;
         let mut rows: Vec<AcpRow> = Vec::new();
@@ -3594,6 +3630,101 @@ fn render_acp_panel(
                 }
             }
         }
+    }
+
+    if let Some(perm) = acp.chat.pending_permission() {
+        if let Some(card_r) = layout.acp_permission_card_rect() {
+            canvas.fill_rect(card_r, theme.bg_header);
+            canvas.stroke_rect(card_r, theme.syntax.flag);
+            canvas.fill_rect(Rect::new(card_r.x, card_r.y, card_r.w, 2), theme.syntax.flag);
+            let card_max_x = (card_r.x + card_r.w - 8) as i32;
+            font.draw_text(
+                canvas,
+                (card_r.x + 8) as i32,
+                (card_r.y + 7) as i32,
+                FONT_SIZE_SMALL,
+                theme.fg_primary,
+                &perm.title,
+                card_max_x,
+            );
+            if let Some(detail) = &perm.detail {
+                font.draw_text(
+                    canvas,
+                    (card_r.x + 8) as i32,
+                    (card_r.y + 24) as i32,
+                    FONT_SIZE_SMALL,
+                    theme.fg_muted,
+                    detail,
+                    card_max_x,
+                );
+            }
+            if let Some(app_r) = layout.acp_permission_approve_rect() {
+                let app_bg = if ui.hovered == HitTarget::AcpPermissionApprove {
+                    theme.syntax.string_literal.lerp(theme.bg_header, 140)
+                } else {
+                    theme.syntax.string_literal.lerp(theme.bg_header, 195)
+                };
+                canvas.fill_rect(app_r, app_bg);
+                canvas.stroke_rect(app_r, theme.syntax.string_literal);
+                font.draw_text(
+                    canvas,
+                    (app_r.x + 14) as i32,
+                    (app_r.y + 4) as i32,
+                    FONT_SIZE_SMALL,
+                    theme.syntax.string_literal,
+                    "Aprobar",
+                    (app_r.x + app_r.w - 4) as i32,
+                );
+            }
+            if let Some(rej_r) = layout.acp_permission_reject_rect() {
+                let rej_bg = if ui.hovered == HitTarget::AcpPermissionReject {
+                    theme.danger.lerp(theme.bg_header, 140)
+                } else {
+                    theme.danger.lerp(theme.bg_header, 195)
+                };
+                canvas.fill_rect(rej_r, rej_bg);
+                canvas.stroke_rect(rej_r, theme.danger);
+                font.draw_text(
+                    canvas,
+                    (rej_r.x + 12) as i32,
+                    (rej_r.y + 4) as i32,
+                    FONT_SIZE_SMALL,
+                    theme.danger,
+                    "Rechazar",
+                    (rej_r.x + rej_r.w - 4) as i32,
+                );
+            }
+        }
+    }
+
+    if let Some(ctx_r) = layout.acp_context_bar_rect() {
+        let on = acp.include_context;
+        let bg = if ui.hovered == HitTarget::AcpContextToggle {
+            theme.bg_sidebar_active
+        } else if on {
+            user.accent.lerp(theme.bg_sidebar, 210)
+        } else {
+            theme.bg_input
+        };
+        canvas.fill_rect(ctx_r, bg);
+        canvas.stroke_rect(
+            ctx_r,
+            if on { user.accent } else { theme.border },
+        );
+        let label = if on {
+            "[x] Contexto PTY (cwd + 40 líneas)"
+        } else {
+            "[ ] Contexto PTY (cwd + 40 líneas)"
+        };
+        font.draw_text(
+            canvas,
+            (ctx_r.x + 8) as i32,
+            (ctx_r.y + 5) as i32,
+            FONT_SIZE_SMALL,
+            if on { user.accent } else { theme.fg_muted },
+            label,
+            (ctx_r.x + ctx_r.w - 6) as i32,
+        );
     }
 
     if let Some(inp_r) = layout.acp_input_rect() {
@@ -4001,7 +4132,17 @@ mod tests {
         assert!(open.acp_close_rect().is_some());
         assert!(open.acp_agent_selector_rect().is_some());
         assert!(open.acp_messages_rect().is_some());
+        assert!(open.acp_context_bar_rect().is_some());
+        assert!(open.acp_permission_card_rect().is_some());
+        assert!(open.acp_permission_approve_rect().is_some());
+        assert!(open.acp_permission_reject_rect().is_some());
         assert!(open.acp_input_rect().is_some());
         assert!(open.acp_send_rect().is_some());
+        let ctx_r = open.acp_context_bar_rect().unwrap();
+        let card_r = open.acp_permission_card_rect().unwrap();
+        let app_r = open.acp_permission_approve_rect().unwrap();
+        let rej_r = open.acp_permission_reject_rect().unwrap();
+        assert!(card_r.y + card_r.h <= ctx_r.y);
+        assert!(app_r.x + app_r.w <= rej_r.x);
     }
 }

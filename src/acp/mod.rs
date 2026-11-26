@@ -10,8 +10,10 @@ mod process;
 mod chat;
 pub mod markdown;
 
-pub use chat::{Chat, ConnectionState, MAX_PROMPT_BYTES, MAX_RESPONSE_BYTES};
+pub use chat::{Chat, ConnectionState, PendingPermission, MAX_PROMPT_BYTES, MAX_RESPONSE_BYTES};
 pub use markdown::{parse_markdown, MdLine, MdLineKind};
+
+pub const DEFAULT_CONTEXT_LINES: usize = 40;
 
 use crate::input::InputBar;
 use serde_json::{json, Value};
@@ -62,11 +64,30 @@ const MAX_ACP_TURNS: usize = 50;
 pub struct AcpSessionState {
     pub open: bool,
     pub agent: Agent,
+    pub include_context: bool,
     pub chat: Chat,
     pub input: InputBar,
     pub turns: Vec<AcpTurn>,
     pub pending_prompt: Option<String>,
     pub scroll: usize,
+}
+
+pub fn format_prompt_with_context(prompt: &str, cwd: &Path, clean_lines: &[String]) -> String {
+    let header = format!("[Terminal context]\ncwd: {}\n", cwd.display());
+    let footer = format!("\n{prompt}");
+    if header.len() + footer.len() > MAX_PROMPT_BYTES {
+        return prompt.to_owned();
+    }
+    if !clean_lines.is_empty() {
+        for start in 0..clean_lines.len() {
+            let body = clean_lines[start..].join("\n");
+            let candidate = format!("{header}last_lines:\n```\n{body}\n```{footer}");
+            if candidate.len() <= MAX_PROMPT_BYTES {
+                return candidate;
+            }
+        }
+    }
+    format!("{header}{footer}")
 }
 
 impl AcpSessionState {
@@ -96,6 +117,8 @@ impl AcpSessionState {
         let prev_err = self.error_message().map(str::to_owned);
         let prev_resp_len = self.chat.response().len();
         let was_pending = self.chat.is_prompt_pending();
+        let prev_perm_count = self.chat.pending_permission_count();
+        let prev_perm_title = self.chat.pending_permission().map(|p| p.title.clone());
 
         let has_more = self.chat.poll();
 
@@ -119,7 +142,9 @@ impl AcpSessionState {
         let changed = prev_status != self.status_label()
             || prev_err.as_deref() != self.error_message()
             || prev_resp_len != self.chat.response().len()
-            || was_pending != self.chat.is_prompt_pending();
+            || was_pending != self.chat.is_prompt_pending()
+            || prev_perm_count != self.chat.pending_permission_count()
+            || prev_perm_title.as_deref() != self.chat.pending_permission().map(|p| p.title.as_str());
         (changed, has_more)
     }
 
@@ -133,6 +158,31 @@ impl AcpSessionState {
         self.input.clear();
         self.scroll = 0;
         Ok(())
+    }
+
+    pub fn submit_prompt_with_context(&mut self, cwd: &Path, clean_lines: &[String]) -> Result<(), String> {
+        let raw = self.input.text().trim().to_owned();
+        if raw.is_empty() {
+            return Ok(());
+        }
+        let payload = if raw.len() <= MAX_PROMPT_BYTES && self.include_context {
+            format_prompt_with_context(&raw, cwd, clean_lines)
+        } else {
+            raw.clone()
+        };
+        self.chat.prompt(&payload).map_err(|err| err.to_string())?;
+        self.pending_prompt = Some(raw);
+        self.input.clear();
+        self.scroll = 0;
+        Ok(())
+    }
+
+    pub fn approve_permission(&mut self) -> Result<(), String> {
+        self.chat.approve_permission().map(|_| ()).map_err(|err| err.to_string())
+    }
+
+    pub fn reject_permission(&mut self) -> Result<(), String> {
+        self.chat.reject_permission().map(|_| ()).map_err(|err| err.to_string())
     }
 
     pub fn deactivate(&mut self) {
