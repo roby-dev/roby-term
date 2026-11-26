@@ -145,8 +145,11 @@ pub enum HitTarget {
     AcpInput,
     AcpSend,
     AcpContextToggle,
+    AcpAutoToggle,
     AcpPermissionApprove,
     AcpPermissionReject,
+    ResizeSidebar,
+    ResizeAcp,
     TerminalViewport,
     InputBar,
     None,
@@ -188,8 +191,21 @@ impl Layout {
         sidebar_visible: bool,
         acp_open: bool,
     ) -> Self {
+        Self::compute_with_sizes(width, height, sidebar_visible, SIDEBAR_WIDTH, acp_open, None)
+    }
+
+    pub fn compute_with_sizes(
+        width: u32,
+        height: u32,
+        sidebar_visible: bool,
+        sidebar_width: u32,
+        acp_open: bool,
+        acp_width: Option<u32>,
+    ) -> Self {
         let sidebar_w = if sidebar_visible {
-            SIDEBAR_WIDTH.min(width / 2)
+            let max_sw = (width / 2).max(120).min(width);
+            let min_sw = 150.min(max_sw);
+            sidebar_width.clamp(min_sw, max_sw)
         } else {
             0
         };
@@ -262,7 +278,11 @@ impl Layout {
         );
 
         let (term_w, acp_panel) = if acp_open && main_w > 0 {
-            let panel_w = if main_w >= 460 {
+            let panel_w = if let Some(custom) = acp_width {
+                let max_aw = main_w.saturating_sub(180).max(main_w / 2);
+                let min_aw = 220.min(max_aw);
+                custom.clamp(min_aw, max_aw)
+            } else if main_w >= 460 {
                 (main_w * 38 / 100)
                     .clamp(280, 440)
                     .min(main_w.saturating_sub(180))
@@ -635,18 +655,38 @@ impl Layout {
         let p = self.acp_panel?;
         let inp = self.acp_input_rect()?;
         let h = 24u32;
+        let auto_w = 82u32;
+        let w = p.w.saturating_sub(20 + auto_w + 6);
+        Some(Rect::new(p.x + 10, inp.y.saturating_sub(h + 6), w, h))
+    }
+
+    pub fn acp_auto_toggle_rect(&self) -> Option<Rect> {
+        let ctx = self.acp_context_bar_rect()?;
+        Some(Rect::new(ctx.x + ctx.w + 6, ctx.y, 82, ctx.h))
+    }
+
+    pub fn acp_permission_card_rect(&self) -> Option<Rect> {
+        let p = self.acp_panel?;
+        let ctx = self.acp_context_bar_rect()?;
+        let h = 76u32;
         Some(Rect::new(
             p.x + 10,
-            inp.y.saturating_sub(h + 6),
+            ctx.y.saturating_sub(h + 6),
             p.w.saturating_sub(20),
             h,
         ))
     }
 
-    pub fn acp_permission_card_rect(&self) -> Option<Rect> {
-        let ctx = self.acp_context_bar_rect()?;
-        let h = 76u32;
-        Some(Rect::new(ctx.x, ctx.y.saturating_sub(h + 6), ctx.w, h))
+    pub fn sidebar_divider_rect(&self) -> Option<Rect> {
+        if self.sidebar.w == 0 {
+            return None;
+        }
+        Some(Rect::new(self.sidebar.w.saturating_sub(3), 0, 7, self.height))
+    }
+
+    pub fn acp_divider_rect(&self) -> Option<Rect> {
+        let p = self.acp_panel?;
+        Some(Rect::new(p.x.saturating_sub(4), p.y, 7, p.h))
     }
 
     pub fn acp_permission_approve_rect(&self) -> Option<Rect> {
@@ -1228,6 +1268,12 @@ impl Default for HistoryModalUiState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeHandle {
+    Sidebar,
+    AcpPanel,
+}
+
 pub struct UiState {
     pub sidebar_visible: bool,
     pub picker_open: bool,
@@ -1251,6 +1297,9 @@ pub struct UiState {
     pub update_status: UpdateStatus,
     pub acp_focused: bool,
     pub acp_dropdown_open: bool,
+    pub sidebar_width: u32,
+    pub acp_width: Option<u32>,
+    pub resizing: Option<ResizeHandle>,
 }
 
 impl UiState {
@@ -1277,6 +1326,9 @@ impl UiState {
             update_status: UpdateStatus::Idle,
             acp_focused: false,
             acp_dropdown_open: false,
+            sidebar_width: SIDEBAR_WIDTH,
+            acp_width: None,
+            resizing: None,
         }
     }
 
@@ -1320,9 +1372,16 @@ pub fn render_app(
     if layout.sidebar.w > 0 {
     // 1. Sidebar background + divider
     canvas.fill_rect(layout.sidebar, theme.bg_sidebar);
+    let sb_div_active =
+        ui.hovered == HitTarget::ResizeSidebar || ui.resizing == Some(ResizeHandle::Sidebar);
     canvas.fill_rect(
-        Rect::new(layout.sidebar.w.saturating_sub(1), 0, 1, layout.height),
-        theme.border,
+        Rect::new(
+            layout.sidebar.w.saturating_sub(if sb_div_active { 2 } else { 1 }),
+            0,
+            if sb_div_active { 2 } else { 1 },
+            layout.height,
+        ),
+        if sb_div_active { user.accent } else { theme.border },
     );
 
     // 2. User identity card (user-differentiated color)
@@ -3342,9 +3401,16 @@ fn render_acp_panel(
     ui: &UiState,
 ) {
     // Left divider + panel background
+    let acp_div_active =
+        ui.hovered == HitTarget::ResizeAcp || ui.resizing == Some(ResizeHandle::AcpPanel);
     canvas.fill_rect(
-        Rect::new(panel.x.saturating_sub(1), panel.y, 1, panel.h),
-        theme.border,
+        Rect::new(
+            panel.x.saturating_sub(if acp_div_active { 2 } else { 1 }),
+            panel.y,
+            if acp_div_active { 2 } else { 1 },
+            panel.h,
+        ),
+        if acp_div_active { user.accent } else { theme.border },
     );
     canvas.fill_rect(panel, theme.bg_sidebar);
 
@@ -3724,6 +3790,31 @@ fn render_acp_panel(
             if on { user.accent } else { theme.fg_muted },
             label,
             (ctx_r.x + ctx_r.w - 6) as i32,
+        );
+    }
+
+    if let Some(auto_r) = layout.acp_auto_toggle_rect() {
+        let auto_on = acp.auto_approve;
+        let bg = if ui.hovered == HitTarget::AcpAutoToggle {
+            theme.bg_sidebar_active
+        } else if auto_on {
+            theme.syntax.flag.lerp(theme.bg_sidebar, 200)
+        } else {
+            theme.bg_input
+        };
+        canvas.fill_rect(auto_r, bg);
+        canvas.stroke_rect(
+            auto_r,
+            if auto_on { theme.syntax.flag } else { theme.border },
+        );
+        font.draw_text(
+            canvas,
+            (auto_r.x + 8) as i32,
+            (auto_r.y + 5) as i32,
+            FONT_SIZE_SMALL,
+            if auto_on { theme.syntax.flag } else { theme.fg_muted },
+            if auto_on { "[x] Auto" } else { "[ ] Auto" },
+            (auto_r.x + auto_r.w - 4) as i32,
         );
     }
 
@@ -4133,16 +4224,29 @@ mod tests {
         assert!(open.acp_agent_selector_rect().is_some());
         assert!(open.acp_messages_rect().is_some());
         assert!(open.acp_context_bar_rect().is_some());
+        assert!(open.acp_auto_toggle_rect().is_some());
         assert!(open.acp_permission_card_rect().is_some());
         assert!(open.acp_permission_approve_rect().is_some());
         assert!(open.acp_permission_reject_rect().is_some());
         assert!(open.acp_input_rect().is_some());
         assert!(open.acp_send_rect().is_some());
         let ctx_r = open.acp_context_bar_rect().unwrap();
+        let auto_r = open.acp_auto_toggle_rect().unwrap();
         let card_r = open.acp_permission_card_rect().unwrap();
         let app_r = open.acp_permission_approve_rect().unwrap();
         let rej_r = open.acp_permission_reject_rect().unwrap();
+        assert!(ctx_r.x + ctx_r.w < auto_r.x);
         assert!(card_r.y + card_r.h <= ctx_r.y);
         assert!(app_r.x + app_r.w <= rej_r.x);
+
+        let custom = Layout::compute_with_sizes(1200, 800, true, 300, true, Some(480));
+        assert_eq!(custom.sidebar.w, 300);
+        assert_eq!(custom.acp_panel.unwrap().w, 480);
+        assert!(custom.sidebar_divider_rect().is_some());
+        assert!(custom.acp_divider_rect().is_some());
+
+        let clamped = Layout::compute_with_sizes(1000, 700, true, 900, true, Some(20));
+        assert_eq!(clamped.sidebar.w, 500);
+        assert_eq!(clamped.acp_panel.unwrap().w, 220);
     }
 }

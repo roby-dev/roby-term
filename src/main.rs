@@ -23,7 +23,7 @@ use my_warp::terminal::{
 use my_warp::theme::{Theme, UserIdentity};
 use my_warp::ui::{
     build_app_icon_rgba, discover_system_mono_fonts, render_app, FontRenderer, HitTarget, Layout,
-    Rect, SettingsField, SystemFont, UiState,
+    Rect, ResizeHandle, SettingsField, SystemFont, UiState,
 };
 use my_warp::updater::{
     check_latest_release, cleanup_old_binary, download_and_install_update, relaunch_exe,
@@ -42,7 +42,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Icon, Window, WindowId};
+use winit::window::{CursorIcon, Icon, Window, WindowId};
 
 const MAX_VISIBLE_SUGGESTIONS: usize = 8;
 
@@ -516,12 +516,17 @@ impl App {
         if !self.is_acp_open() {
             self.ui.acp_focused = false;
             self.ui.acp_dropdown_open = false;
+            if self.ui.resizing == Some(ResizeHandle::AcpPanel) {
+                self.ui.resizing = None;
+            }
         }
-        self.layout = Layout::compute_with_options(
+        self.layout = Layout::compute_with_sizes(
             self.layout.width,
             self.layout.height,
             self.ui.sidebar_visible,
+            self.ui.sidebar_width,
             self.is_acp_open(),
+            self.ui.acp_width,
         );
         self.resize_sessions_for_current_layout();
     }
@@ -832,6 +837,29 @@ impl App {
             && !self.ui.palette.open
             && !self.ui.history_modal.open
             && !self.ui.ports.open
+        {
+            if self.is_acp_open()
+                && self
+                    .layout
+                    .acp_divider_rect()
+                    .is_some_and(|r| r.contains(px, py))
+            {
+                return HitTarget::ResizeAcp;
+            }
+            if !self.ui.picker_open
+                && self
+                    .layout
+                    .sidebar_divider_rect()
+                    .is_some_and(|r| r.contains(px, py))
+            {
+                return HitTarget::ResizeSidebar;
+            }
+        }
+
+        if !self.ui.settings.open
+            && !self.ui.palette.open
+            && !self.ui.history_modal.open
+            && !self.ui.ports.open
             && self.is_acp_open()
         {
             if self.ui.acp_dropdown_open {
@@ -891,6 +919,13 @@ impl App {
                     .is_some_and(|r| r.contains(px, py))
                 {
                     return HitTarget::AcpContextToggle;
+                }
+                if self
+                    .layout
+                    .acp_auto_toggle_rect()
+                    .is_some_and(|r| r.contains(px, py))
+                {
+                    return HitTarget::AcpAutoToggle;
                 }
                 if self
                     .layout
@@ -1221,11 +1256,13 @@ impl App {
         self.phys_width = width;
         self.phys_height = height;
         let (lw, lh) = Self::logical_size_from_physical(width, height, self.scale_factor);
-        self.layout = Layout::compute_with_options(
+        self.layout = Layout::compute_with_sizes(
             lw,
             lh,
             self.ui.sidebar_visible,
+            self.ui.sidebar_width,
             self.is_acp_open(),
+            self.ui.acp_width,
         );
         if let Some(ref mut surface) = self.surface {
             if let (Some(w), Some(h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
@@ -1243,11 +1280,13 @@ impl App {
         if self.phys_width > 0 && self.phys_height > 0 {
             let (lw, lh) =
                 Self::logical_size_from_physical(self.phys_width, self.phys_height, self.scale_factor);
-            self.layout = Layout::compute_with_options(
+            self.layout = Layout::compute_with_sizes(
             lw,
             lh,
             self.ui.sidebar_visible,
+            self.ui.sidebar_width,
             self.is_acp_open(),
+            self.ui.acp_width,
         );
             self.resize_sessions_for_current_layout();
         }
@@ -1602,6 +1641,22 @@ impl App {
                 self.ui.acp_dropdown_open = false;
                 self.ui.acp_focused = true;
             }
+            HitTarget::AcpAutoToggle => {
+                if let Some(sess) = self.sessions.active_mut() {
+                    sess.acp.auto_approve = !sess.acp.auto_approve;
+                    if sess.acp.auto_approve {
+                        sess.acp.drain_auto_permissions();
+                    }
+                }
+                self.ui.acp_dropdown_open = false;
+                self.ui.acp_focused = true;
+            }
+            HitTarget::ResizeSidebar => {
+                self.ui.resizing = Some(ResizeHandle::Sidebar);
+            }
+            HitTarget::ResizeAcp => {
+                self.ui.resizing = Some(ResizeHandle::AcpPanel);
+            }
             HitTarget::AcpPermissionApprove => {
                 if let Some(sess) = self.sessions.active_mut() {
                     if let Err(err) = sess.acp.approve_permission() {
@@ -1666,6 +1721,21 @@ impl App {
     }
 
     fn handle_mouse_up(&mut self) {
+        if self.ui.resizing.take().is_some() {
+            self.resize_sessions_for_current_layout();
+            let (suggestions, _) = self.current_suggestions();
+            let hit = self.hit_test_all(self.cursor_pos.0, self.cursor_pos.1, suggestions.len());
+            self.ui.hovered = hit;
+            if let Some(ref w) = self.window {
+                let icon = match hit {
+                    HitTarget::ResizeSidebar | HitTarget::ResizeAcp => CursorIcon::EwResize,
+                    _ => CursorIcon::Default,
+                };
+                w.set_cursor(icon);
+            }
+            self.request_redraw();
+            return;
+        }
         if !self.ui.selecting {
             return;
         }
@@ -2808,11 +2878,13 @@ impl ApplicationHandler<()> for App {
             let _ = surface.resize(w, h);
             let (lw, lh) =
                 Self::logical_size_from_physical(size.width, size.height, self.scale_factor);
-            self.layout = Layout::compute_with_options(
+            self.layout = Layout::compute_with_sizes(
             lw,
             lh,
             self.ui.sidebar_visible,
+            self.ui.sidebar_width,
             self.is_acp_open(),
+            self.ui.acp_width,
         );
             self.resize_sessions_for_current_layout();
         }
@@ -2865,6 +2937,30 @@ impl ApplicationHandler<()> for App {
                     (position.x / s).max(0.0) as u32,
                     (position.y / s).max(0.0) as u32,
                 );
+                if let Some(handle) = self.ui.resizing {
+                    match handle {
+                        ResizeHandle::Sidebar => {
+                            self.ui.sidebar_width = self.cursor_pos.0;
+                        }
+                        ResizeHandle::AcpPanel => {
+                            self.ui.acp_width =
+                                Some(self.layout.width.saturating_sub(self.cursor_pos.0));
+                        }
+                    }
+                    self.layout = Layout::compute_with_sizes(
+                        self.layout.width,
+                        self.layout.height,
+                        self.ui.sidebar_visible,
+                        self.ui.sidebar_width,
+                        self.is_acp_open(),
+                        self.ui.acp_width,
+                    );
+                    if let Some(ref w) = self.window {
+                        w.set_cursor(CursorIcon::EwResize);
+                    }
+                    self.request_redraw();
+                    return;
+                }
                 if self.ui.selecting {
                     let active_vp = self.active_pane_rect();
                     let pointer_cell = Layout::pixel_to_cell_in(
@@ -2889,6 +2985,13 @@ impl ApplicationHandler<()> for App {
                 let (suggestions, _) = self.current_suggestions();
                 let hit = self.hit_test_all(self.cursor_pos.0, self.cursor_pos.1, suggestions.len());
                 let link_changed = self.update_hovered_link(hit);
+                if let Some(ref w) = self.window {
+                    let icon = match hit {
+                        HitTarget::ResizeSidebar | HitTarget::ResizeAcp => CursorIcon::EwResize,
+                        _ => CursorIcon::Default,
+                    };
+                    w.set_cursor(icon);
+                }
                 if hit != self.ui.hovered || link_changed {
                     self.ui.hovered = hit;
                     self.request_redraw();

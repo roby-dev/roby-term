@@ -108,6 +108,7 @@ pub struct AcpSessionState {
     pub open: bool,
     pub agent: Agent,
     pub include_context: bool,
+    pub auto_approve: bool,
     pub chat: Chat,
     pub input: InputBar,
     pub turns: Vec<AcpTurn>,
@@ -164,6 +165,7 @@ impl AcpSessionState {
         let prev_perm_title = self.chat.pending_permission().map(|p| p.title.clone());
 
         let has_more = self.chat.poll();
+        let auto_approved = self.drain_auto_permissions();
 
         if was_pending && !self.chat.is_prompt_pending() {
             if let Some(prompt) = self.pending_prompt.take() {
@@ -186,9 +188,28 @@ impl AcpSessionState {
             || prev_err.as_deref() != self.error_message()
             || prev_resp_len != self.chat.response().len()
             || was_pending != self.chat.is_prompt_pending()
+            || auto_approved
             || prev_perm_count != self.chat.pending_permission_count()
             || prev_perm_title.as_deref() != self.chat.pending_permission().map(|p| p.title.as_str());
         (changed, has_more)
+    }
+
+    pub fn drain_auto_permissions(&mut self) -> bool {
+        if !self.auto_approve {
+            return false;
+        }
+        let mut approved_any = false;
+        while self
+            .chat
+            .pending_permission()
+            .is_some_and(|p| p.allow_option_id.is_some())
+        {
+            match self.chat.approve_permission() {
+                Ok(true) => approved_any = true,
+                _ => break,
+            }
+        }
+        approved_any
     }
 
     pub fn submit_prompt(&mut self) -> Result<(), String> {

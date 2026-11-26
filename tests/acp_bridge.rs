@@ -1,4 +1,6 @@
-use my_warp::acp::{format_prompt_with_context, Chat, ConnectionState, MAX_PROMPT_BYTES};
+use my_warp::acp::{
+    format_prompt_with_context, AcpSessionState, Chat, ConnectionState, MAX_PROMPT_BYTES,
+};
 use std::{
     fs, io::{self, Write}, path::Path, path::PathBuf, process::{self, Command, Stdio}, thread,
     time::{Duration, Instant},
@@ -148,4 +150,40 @@ fn context_formatter_includes_cwd_and_drops_oldest_lines_within_limit() {
     assert!(formatted.contains("line-249"));
     assert!(!formatted.contains("line-000"));
     assert!(formatted.ends_with("\ncheck failure"));
+}
+
+#[test]
+fn auto_approve_mode_is_opt_in_and_approves_matching_permissions_without_manual_click() {
+    let mock = Mock::build();
+    let mut state = AcpSessionState::default();
+    assert!(!state.auto_approve);
+    state.open = true;
+    state.auto_approve = true;
+    state
+        .chat
+        .start_command(mock.binary().to_str().unwrap(), &["approve"], &mock.0, || {})
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.chat.connection() != ConnectionState::Active {
+        assert!(Instant::now() < deadline);
+        let (_, more) = state.poll();
+        if !more {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    state.input.set_text("run tests");
+    state.submit_prompt().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.chat.is_prompt_pending() {
+        assert!(Instant::now() < deadline);
+        let (_, more) = state.poll();
+        if !more {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(state.chat.pending_permission().is_none());
+    assert_eq!(state.turns.len(), 1);
+    assert_eq!(state.turns[0].response, "approved ok");
 }
