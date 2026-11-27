@@ -8,9 +8,11 @@
 #[cfg_attr(windows, path = "process_windows.rs")]
 mod process;
 mod chat;
+mod collab;
 pub mod markdown;
 
 pub use chat::{Chat, ConnectionState, PendingPermission, MAX_PROMPT_BYTES, MAX_RESPONSE_BYTES};
+pub use collab::{parse_mention, MAX_HANDOFF_BYTES};
 pub use markdown::{parse_markdown, MdLine, MdLineKind};
 
 pub const DEFAULT_CONTEXT_LINES: usize = 40;
@@ -112,6 +114,9 @@ fn resolve_adapter_in_paths(agent: Agent, dirs: &[std::path::PathBuf]) -> Option
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpTurn {
+    /// Position in the shared conversation, increasing across all agents.
+    pub seq: u64,
+    pub agent: Agent,
     pub prompt: String,
     pub response: String,
     pub truncated: bool,
@@ -119,7 +124,15 @@ pub struct AcpTurn {
 
 const MAX_ACP_TURNS: usize = 50;
 
+/// A connected agent that is not currently addressed.
+struct AgentSlot {
+    agent: Agent,
+    chat: Chat,
+    synced: Option<u64>,
+}
+
 /// Per-session ACP panel state. Creating it starts no threads or subprocesses.
+/// `agent` and `chat` are the addressed agent; the others wait in `parked`.
 #[derive(Default)]
 pub struct AcpSessionState {
     pub open: bool,
@@ -131,6 +144,12 @@ pub struct AcpSessionState {
     pub turns: Vec<AcpTurn>,
     pub pending_prompt: Option<String>,
     pub scroll: usize,
+    parked: Vec<AgentSlot>,
+    /// Last turn delivered to the addressed agent's live session.
+    synced: Option<u64>,
+    /// Prompt waiting for the addressed agent to finish connecting.
+    queued: Option<String>,
+    last_seq: u64,
 }
 
 pub fn format_prompt_with_context(prompt: &str, cwd: &Path, clean_lines: &[String]) -> String {
@@ -181,7 +200,16 @@ impl AcpSessionState {
         let prev_perm_count = self.chat.pending_permission_count();
         let prev_perm_title = self.chat.pending_permission().map(|p| p.title.clone());
 
-        let has_more = self.chat.poll();
+        let mut has_more = self.chat.poll();
+        for slot in &mut self.parked {
+            has_more |= slot.chat.poll();
+            while slot.chat.pending_permission().is_some() {
+                if slot.chat.reject_permission().is_err() {
+                    break;
+                }
+            }
+        }
+        let queue_changed = self.flush_queued();
         let auto_approved = self.drain_auto_permissions();
 
         if was_pending && !self.chat.is_prompt_pending() {
@@ -191,7 +219,10 @@ impl AcpSessionState {
                     if self.turns.len() >= MAX_ACP_TURNS {
                         self.turns.remove(0);
                     }
+                    self.last_seq += 1;
                     self.turns.push(AcpTurn {
+                        seq: self.last_seq,
+                        agent: self.agent,
                         prompt,
                         response,
                         truncated: self.chat.response_truncated(),
@@ -206,6 +237,7 @@ impl AcpSessionState {
             || prev_resp_len != self.chat.response().len()
             || was_pending != self.chat.is_prompt_pending()
             || auto_approved
+            || queue_changed
             || prev_perm_count != self.chat.pending_permission_count()
             || prev_perm_title.as_deref() != self.chat.pending_permission().map(|p| p.title.as_str());
         (changed, has_more)
@@ -234,11 +266,7 @@ impl AcpSessionState {
         if text.is_empty() {
             return Ok(());
         }
-        self.chat.prompt(&text).map_err(|err| err.to_string())?;
-        self.pending_prompt = Some(text);
-        self.input.clear();
-        self.scroll = 0;
-        Ok(())
+        self.dispatch(text, None, false)
     }
 
     pub fn submit_prompt_with_context(&mut self, cwd: &Path, clean_lines: &[String]) -> Result<(), String> {
@@ -246,16 +274,132 @@ impl AcpSessionState {
         if raw.is_empty() {
             return Ok(());
         }
-        let payload = if raw.len() <= MAX_PROMPT_BYTES && self.include_context {
-            format_prompt_with_context(&raw, cwd, clean_lines)
-        } else {
-            raw.clone()
+        self.dispatch(raw, Some((cwd, clean_lines)), false)
+    }
+
+    /// Submits the input, honoring a leading `@agent` mention. `launch` starts the
+    /// mentioned agent when it is not connected; the prompt is sent once it is active.
+    pub fn submit_routed(
+        &mut self,
+        context: Option<(&Path, &[String])>,
+        launch: impl FnOnce(&mut Chat, Agent) -> io::Result<()>,
+    ) -> Result<(), String> {
+        let text = self.input.text().trim().to_owned();
+        if text.is_empty() {
+            return Ok(());
+        }
+        let Some((agent, body)) = parse_mention(&text) else {
+            return self.dispatch(text, context, false);
         };
-        self.chat.prompt(&payload).map_err(|err| err.to_string())?;
+        if self.is_busy() {
+            return Err(format!("{} is still working", self.agent.label()));
+        }
+        if body.len() > MAX_PROMPT_BYTES {
+            return Err(format!("ACP prompt must be at most {MAX_PROMPT_BYTES} bytes"));
+        }
+        self.switch_agent(agent);
+        self.ensure_started(launch).map_err(|err| format!("ACP launch failed: {err}"))?;
+        if body.is_empty() {
+            self.input.clear();
+            return Ok(());
+        }
+        self.dispatch(body.to_owned(), context, true)
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.pending_prompt.is_some() || self.chat.is_prompt_pending()
+    }
+
+    /// Addresses another agent, keeping idle connections alive. Switching away from
+    /// a running turn stops that agent.
+    pub fn switch_agent(&mut self, agent: Agent) {
+        if agent == self.agent {
+            return;
+        }
+        if self.is_busy() {
+            self.chat.stop();
+            self.synced = None;
+            self.pending_prompt = None;
+            self.queued = None;
+        }
+        let next = match self.parked.iter().position(|slot| slot.agent == agent) {
+            Some(idx) => self.parked.swap_remove(idx),
+            None => AgentSlot { agent, chat: Chat::default(), synced: None },
+        };
+        let previous = AgentSlot {
+            agent: std::mem::replace(&mut self.agent, next.agent),
+            chat: std::mem::replace(&mut self.chat, next.chat),
+            synced: std::mem::replace(&mut self.synced, next.synced),
+        };
+        self.parked.push(previous);
+    }
+
+    /// Starts the addressed agent unless it is already connecting or active.
+    pub fn ensure_started(
+        &mut self,
+        launch: impl FnOnce(&mut Chat, Agent) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if matches!(
+            self.chat.connection(),
+            ConnectionState::Disconnected | ConnectionState::Error(_)
+        ) {
+            self.synced = None;
+            launch(&mut self.chat, self.agent)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch(
+        &mut self,
+        raw: String,
+        context: Option<(&Path, &[String])>,
+        may_queue: bool,
+    ) -> Result<(), String> {
+        let payload = match context {
+            Some((cwd, lines)) if self.include_context && raw.len() <= MAX_PROMPT_BYTES => {
+                format_prompt_with_context(&raw, cwd, lines)
+            }
+            _ => raw.clone(),
+        };
+        if may_queue && self.chat.connection() == ConnectionState::Connecting {
+            self.queued = Some(payload);
+        } else {
+            self.send(&payload)?;
+        }
         self.pending_prompt = Some(raw);
         self.input.clear();
         self.scroll = 0;
         Ok(())
+    }
+
+    fn send(&mut self, payload: &str) -> Result<(), String> {
+        let history = collab::format_handoff(&self.turns, self.agent, self.synced);
+        self.chat
+            .prompt_with_history(&history, payload)
+            .map_err(|err| err.to_string())?;
+        self.synced = Some(self.last_seq);
+        Ok(())
+    }
+
+    /// Sends the queued prompt once the agent is active, or returns it to the
+    /// input when the connection fails.
+    fn flush_queued(&mut self) -> bool {
+        let ready = match self.chat.connection() {
+            ConnectionState::Connecting => return false,
+            ConnectionState::Active => true,
+            ConnectionState::Disconnected | ConnectionState::Error(_) => false,
+        };
+        let Some(payload) = self.queued.take() else {
+            return false;
+        };
+        if !ready || self.send(&payload).is_err() {
+            if let Some(raw) = self.pending_prompt.take() {
+                if self.input.text().is_empty() {
+                    self.input.set_text(&raw);
+                }
+            }
+        }
+        true
     }
 
     pub fn approve_permission(&mut self) -> Result<(), String> {
@@ -269,6 +413,9 @@ impl AcpSessionState {
     pub fn deactivate(&mut self) {
         self.open = false;
         self.pending_prompt = None;
+        self.queued = None;
+        self.synced = None;
+        self.parked.clear();
         self.chat.stop();
     }
 }

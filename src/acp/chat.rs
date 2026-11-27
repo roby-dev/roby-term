@@ -127,6 +127,12 @@ impl Chat {
     /// Enqueue one nonblank prompt while active and idle. A rejected submission
     /// never replaces the previous reply. Completion is reported through `poll`.
     pub fn prompt(&mut self, text: &str) -> io::Result<()> {
+        self.prompt_with_history("", text)
+    }
+
+    /// Like `prompt`, prefixed with shared history that does not count against the
+    /// prompt limit. The caller bounds `history`.
+    pub(super) fn prompt_with_history(&mut self, history: &str, text: &str) -> io::Result<()> {
         let Link::Open(client, Phase::Active { session, prompt }) = &mut self.link else {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "ACP chat is not active"));
         };
@@ -136,7 +142,7 @@ impl Chat {
         if text.len() > MAX_PROMPT_BYTES || text.trim().is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "ACP prompt must be nonblank and at most 16384 bytes"));
         }
-        *prompt = Some(client.prompt(session, text)?);
+        *prompt = Some(client.prompt(session, &format!("{history}{text}"))?);
         self.response = Response::default();
         Ok(())
     }

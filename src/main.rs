@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use my_warp::acp::{Agent, DEFAULT_CONTEXT_LINES};
+use my_warp::acp::{Agent, Chat, DEFAULT_CONTEXT_LINES};
 use my_warp::clipboard::{copy_text, paste_text};
 use my_warp::complete::{
     complete_input, is_completing_path, longest_common_prefix, strip_verbatim_prefix,
@@ -45,6 +45,18 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Icon, Window, WindowId};
 
 const MAX_VISIBLE_SUGGESTIONS: usize = 8;
+
+/// Starts an ACP agent in `cwd` and wakes the event loop when it has news.
+fn acp_launcher(
+    proxy: EventLoopProxy<()>,
+    cwd: std::path::PathBuf,
+) -> impl FnOnce(&mut Chat, Agent) -> std::io::Result<()> {
+    move |chat, agent| {
+        chat.start(agent, &cwd, move || {
+            let _ = proxy.send_event(());
+        })
+    }
+}
 
 struct App {
     proxy: EventLoopProxy<()>,
@@ -547,13 +559,8 @@ impl App {
             self.ui.acp_focused = false;
         } else {
             sess.acp.open = true;
-            let wake_proxy = self.proxy.clone();
-            let wake = move || {
-                let _ = wake_proxy.send_event(());
-            };
-            let agent = sess.acp.agent;
-            let cwd = sess.cwd.clone();
-            if let Err(err) = sess.acp.chat.start(agent, &cwd, wake) {
+            let launch = acp_launcher(self.proxy.clone(), sess.cwd.clone());
+            if let Err(err) = sess.acp.ensure_started(launch) {
                 self.ui.toast = Some(format!("ACP launch failed: {err}"));
             }
             self.ui.acp_focused = true;
@@ -569,17 +576,10 @@ impl App {
         let Some(sess) = self.sessions.active_mut() else {
             return;
         };
-        let changed = sess.acp.agent != agent;
-        sess.acp.agent = agent;
-        if sess.acp.open && changed {
-            sess.acp.chat.stop();
-            sess.acp.pending_prompt = None;
-            let wake_proxy = self.proxy.clone();
-            let wake = move || {
-                let _ = wake_proxy.send_event(());
-            };
-            let cwd = sess.cwd.clone();
-            if let Err(err) = sess.acp.chat.start(agent, &cwd, wake) {
+        sess.acp.switch_agent(agent);
+        if sess.acp.open {
+            let launch = acp_launcher(self.proxy.clone(), sess.cwd.clone());
+            if let Err(err) = sess.acp.ensure_started(launch) {
                 self.ui.toast = Some(format!("ACP launch failed: {err}"));
             }
         }
@@ -589,14 +589,15 @@ impl App {
         let Some(sess) = self.sessions.active_mut() else {
             return;
         };
-        let res = if sess.acp.include_context {
-            let lines = sess.grid.last_clean_lines(DEFAULT_CONTEXT_LINES);
-            let cwd = sess.cwd.clone();
-            sess.acp.submit_prompt_with_context(&cwd, &lines)
+        let lines = if sess.acp.include_context {
+            sess.grid.last_clean_lines(DEFAULT_CONTEXT_LINES)
         } else {
-            sess.acp.submit_prompt()
+            Vec::new()
         };
-        if let Err(err) = res {
+        let cwd = sess.cwd.clone();
+        let context = sess.acp.include_context.then_some((cwd.as_path(), lines.as_slice()));
+        let launch = acp_launcher(self.proxy.clone(), cwd.clone());
+        if let Err(err) = sess.acp.submit_routed(context, launch) {
             self.ui.toast = Some(err);
         }
     }
