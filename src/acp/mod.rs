@@ -30,15 +30,17 @@ pub enum Agent {
     #[default]
     Antigravity,
     Codex,
+    Claude,
 }
 
 impl Agent {
-    pub const ALL: [Self; 2] = [Self::Antigravity, Self::Codex];
+    pub const ALL: [Self; 3] = [Self::Antigravity, Self::Codex, Self::Claude];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Antigravity => "Antigravity",
             Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
         }
     }
 
@@ -46,39 +48,54 @@ impl Agent {
         match self {
             Self::Antigravity => ("agy", &["acp"]),
             Self::Codex => ("codex-acp", &[]),
+            Self::Claude => ("claude-agent-acp", &[]),
         }
     }
 
     pub fn resolve_command(self) -> (String, Vec<String>) {
         #[cfg(windows)]
-        if self == Self::Codex {
-            if let Some(path) = std::env::var_os("PATH") {
-                let dirs: Vec<_> = std::env::split_paths(&path).collect();
-                if let Some(resolved) = resolve_codex_in_paths(&dirs) {
-                    return resolved;
-                }
+        if let Some(path) = std::env::var_os("PATH") {
+            let dirs: Vec<_> = std::env::split_paths(&path).collect();
+            if let Some(resolved) = resolve_adapter_in_paths(self, &dirs) {
+                return resolved;
             }
         }
         let (program, args) = self.command();
         (program.to_owned(), args.iter().map(|s| (*s).to_owned()).collect())
     }
+
+    /// npm packages that ship this agent's adapter, in preference order.
+    #[cfg(any(windows, test))]
+    fn npm_packages(self) -> &'static [[&'static str; 2]] {
+        match self {
+            Self::Antigravity => &[],
+            Self::Codex => &[
+                ["@agentclientprotocol", "codex-acp"],
+                ["@zed-industries", "codex-acp"],
+            ],
+            Self::Claude => &[["@agentclientprotocol", "claude-agent-acp"]],
+        }
+    }
 }
 
+/// Windows cannot launch npm command shims without a shell, so adapters resolve
+/// to a native executable or to `node.exe` plus the package entry script.
 #[cfg(any(windows, test))]
-fn resolve_codex_in_paths(dirs: &[std::path::PathBuf]) -> Option<(String, Vec<String>)> {
+fn resolve_adapter_in_paths(agent: Agent, dirs: &[std::path::PathBuf]) -> Option<(String, Vec<String>)> {
+    let packages = agent.npm_packages();
+    if packages.is_empty() {
+        return None;
+    }
+    let exe_name = format!("{}.exe", agent.command().0);
     for dir in dirs {
-        let exe = dir.join("codex-acp.exe");
+        let exe = dir.join(&exe_name);
         if exe.is_file() {
             return Some((exe.to_string_lossy().into_owned(), Vec::new()));
         }
     }
-    let rel_scripts = [
-        ["node_modules", "@agentclientprotocol", "codex-acp", "dist", "index.js"],
-        ["node_modules", "@zed-industries", "codex-acp", "dist", "index.js"],
-    ];
     for dir in dirs {
-        for rel in &rel_scripts {
-            let script = rel.iter().fold(dir.clone(), |acc, part| acc.join(part));
+        for [scope, name] in packages {
+            let script = dir.join("node_modules").join(scope).join(name).join("dist").join("index.js");
             if script.is_file() {
                 let node = std::iter::once(dir)
                     .chain(dirs.iter())
@@ -407,7 +424,7 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_codex_in_paths;
+    use super::{resolve_adapter_in_paths, Agent};
     use std::{fs, process, time::{SystemTime, UNIX_EPOCH}};
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -430,7 +447,7 @@ mod tests {
         let exe = dir.join("codex-acp.exe");
         fs::write(&exe, "").unwrap();
 
-        let got = resolve_codex_in_paths(&[dir.clone()]).unwrap();
+        let got = resolve_adapter_in_paths(Agent::Codex, &[dir.clone()]).unwrap();
         assert_eq!(got.0, exe.to_string_lossy());
         assert!(got.1.is_empty());
         let _ = fs::remove_dir_all(&dir);
@@ -450,16 +467,40 @@ mod tests {
         let node = dir.join("node.exe");
         fs::write(&node, "").unwrap();
 
-        let got = resolve_codex_in_paths(&[dir.clone()]).unwrap();
+        let got = resolve_adapter_in_paths(Agent::Codex, &[dir.clone()]).unwrap();
         assert_eq!(got.0, node.to_string_lossy());
         assert_eq!(got.1, vec![script.to_string_lossy().into_owned()]);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
+    fn resolves_npm_claude_agent_acp_script_with_node_exe() {
+        let dir = temp_dir("claude");
+        let script_dir = dir
+            .join("node_modules")
+            .join("@agentclientprotocol")
+            .join("claude-agent-acp")
+            .join("dist");
+        fs::create_dir_all(&script_dir).unwrap();
+        let script = script_dir.join("index.js");
+        fs::write(&script, "").unwrap();
+        let node = dir.join("node.exe");
+        fs::write(&node, "").unwrap();
+
+        let got = resolve_adapter_in_paths(Agent::Claude, &[dir.clone()]).unwrap();
+        assert_eq!(got.0, node.to_string_lossy());
+        assert_eq!(got.1, vec![script.to_string_lossy().into_owned()]);
+        assert!(resolve_adapter_in_paths(Agent::Codex, &[dir.clone()]).is_none());
+        assert!(resolve_adapter_in_paths(Agent::Antigravity, &[dir.clone()]).is_none());
+        assert_eq!(Agent::Claude.command().0, "claude-agent-acp");
+        assert_eq!(Agent::ALL.len(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn returns_none_when_codex_acp_is_absent() {
         let dir = temp_dir("none");
-        assert!(resolve_codex_in_paths(&[dir.clone()]).is_none());
+        assert!(resolve_adapter_in_paths(Agent::Codex, &[dir.clone()]).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 }
