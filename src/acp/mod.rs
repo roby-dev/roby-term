@@ -370,7 +370,10 @@ impl AcpSessionState {
     }
 
     fn send(&mut self, payload: &str) -> Result<(), String> {
-        let history = collab::format_handoff(&self.turns, self.agent, self.synced);
+        let mut history = collab::format_handoff(&self.turns, self.agent, self.synced);
+        if self.synced.is_none() {
+            history.insert_str(0, collab::MEMORY_NOTE);
+        }
         self.chat
             .prompt_with_history(&history, payload)
             .map_err(|err| err.to_string())?;

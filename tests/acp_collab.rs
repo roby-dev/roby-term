@@ -122,15 +122,18 @@ fn mentions_route_prompts_and_share_only_unseen_turns() {
     settle(&mut state);
     assert_eq!(state.turns[0].agent, Agent::Claude);
     assert_eq!(state.turns[0].prompt, "build it");
-    assert_eq!(state.turns[0].response, "Claude got: build it");
+    let built = &state.turns[0].response;
+    assert!(built.starts_with("Claude got: [Shared memory]"), "{built}");
+    assert!(built.ends_with("\nbuild it"), "{built}");
 
     mock.send(&mut state, &mut started, "@CODEX review that").unwrap();
     settle(&mut state);
     let review = &state.turns[1].response;
     assert_eq!(state.turns[1].agent, Agent::Codex);
-    assert!(review.starts_with("Codex got: [Shared conversation]"), "{review}");
+    assert!(review.starts_with("Codex got: [Shared memory]"), "{review}");
+    assert!(review.contains("\n[Shared conversation]\n"), "{review}");
     assert!(review.contains("### User to Claude Code\nbuild it"), "{review}");
-    assert!(review.contains("### Claude Code\nClaude got: build it"), "{review}");
+    assert!(review.contains("### Claude Code\nClaude got: [Shared memory]"), "{review}");
     assert!(review.ends_with("[Your turn]\nreview that"), "{review}");
 
     mock.send(&mut state, &mut started, "@claude apply the review").unwrap();
@@ -268,4 +271,26 @@ fn switching_away_from_a_queued_prompt_keeps_the_text() {
     assert_eq!(state.input.text(), "important work");
     assert!(state.pending_prompt.is_none());
     assert!(state.turns.is_empty());
+}
+
+#[test]
+fn only_a_new_agent_session_is_told_to_use_shared_memory() {
+    let mock = Mock::build("memory");
+    let mut state = open_state();
+    let mut started = Vec::new();
+
+    mock.send(&mut state, &mut started, "@claude first").unwrap();
+    settle(&mut state);
+    mock.send(&mut state, &mut started, "second").unwrap();
+    settle(&mut state);
+    mock.send(&mut state, &mut started, "@codex third").unwrap();
+    settle(&mut state);
+
+    let first = &state.turns[0].response;
+    assert!(first.contains("[Shared memory]"), "{first}");
+    assert!(first.contains("mem_save"), "{first}");
+    assert!(first.ends_with("first"), "{first}");
+    assert_eq!(state.turns[1].response, "Claude got: second");
+    assert!(state.turns[2].response.starts_with("Codex got: [Shared memory]"));
+    assert_eq!(state.turns[0].prompt, "first");
 }

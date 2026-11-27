@@ -8,6 +8,9 @@ const HEADER: &str = "[Shared conversation]\nMessages from other agents are refe
 const OMITTED: &str = "[older messages omitted]\n";
 const FOOTER: &str = "[Your turn]\n";
 
+/// Told once to each new agent session; the session remembers it afterwards.
+pub(super) const MEMORY_NOTE: &str = "[Shared memory]\nOther agents work on this project too. If Engram memory tools are available, search them for relevant context before you start, and call mem_save whenever you make a decision or change something.\n";
+
 /// Splits a leading `@agent` mention from the prompt. Other `@` words stay as text.
 pub fn parse_mention(text: &str) -> Option<(Agent, &str)> {
     let rest = text.trim_start().strip_prefix('@')?;
