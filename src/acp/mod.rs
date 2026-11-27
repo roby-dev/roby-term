@@ -203,11 +203,6 @@ impl AcpSessionState {
         let mut has_more = self.chat.poll();
         for slot in &mut self.parked {
             has_more |= slot.chat.poll();
-            while slot.chat.pending_permission().is_some() {
-                if slot.chat.reject_permission().is_err() {
-                    break;
-                }
-            }
         }
         let queue_changed = self.flush_queued();
         let auto_approved = self.drain_auto_permissions();
@@ -311,7 +306,7 @@ impl AcpSessionState {
     }
 
     /// Addresses another agent, keeping idle connections alive. Switching away from
-    /// a running turn stops that agent.
+    /// a running turn stops that agent; a prompt not yet sent returns to the input.
     pub fn switch_agent(&mut self, agent: Agent) {
         if agent == self.agent {
             return;
@@ -319,8 +314,10 @@ impl AcpSessionState {
         if self.is_busy() {
             self.chat.stop();
             self.synced = None;
+            if self.queued.take().is_some() {
+                self.restore_pending_prompt();
+            }
             self.pending_prompt = None;
-            self.queued = None;
         }
         let next = match self.parked.iter().position(|slot| slot.agent == agent) {
             Some(idx) => self.parked.swap_remove(idx),
@@ -393,13 +390,17 @@ impl AcpSessionState {
             return false;
         };
         if !ready || self.send(&payload).is_err() {
-            if let Some(raw) = self.pending_prompt.take() {
-                if self.input.text().is_empty() {
-                    self.input.set_text(&raw);
-                }
-            }
+            self.restore_pending_prompt();
         }
         true
+    }
+
+    fn restore_pending_prompt(&mut self) {
+        if let Some(raw) = self.pending_prompt.take() {
+            if self.input.text().is_empty() {
+                self.input.set_text(&raw);
+            }
+        }
     }
 
     pub fn approve_permission(&mut self) -> Result<(), String> {

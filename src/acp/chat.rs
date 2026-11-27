@@ -256,7 +256,7 @@ impl Phase {
                 if id.is_string() || id.is_number() || id.is_null() {
                     if method == "session/request_permission" {
                         let params = &frame["params"];
-                        if let Self::Active { session, .. } = self {
+                        if let Self::Active { session, prompt: Some(_) } = self {
                             if params["sessionId"].as_str() == Some(session.as_str())
                                 && pending_permissions.len() < MAX_PENDING_PERMISSIONS
                             {
@@ -326,7 +326,14 @@ impl Phase {
                     .ok_or("ACP session/new did not return a session ID")?;
                 *self = Self::Active { session: session.to_owned(), prompt: None };
             }
-            Self::Active { prompt, .. } => *prompt = None,
+            Self::Active { prompt, .. } => {
+                *prompt = None;
+                for stale in pending_permissions.drain(..) {
+                    client
+                        .respond(&stale.request_id, Ok(json!({"outcome":{"outcome":"cancelled"}})))
+                        .map_err(send_error)?;
+                }
+            }
         }
         Ok(())
     }

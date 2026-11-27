@@ -17,6 +17,10 @@ fn main() {
     let mut id = 0;
     for line in io::stdin().lock().lines() {
         let line = line.unwrap();
+        if line.contains(r#""outcome""#) {
+            std::fs::write(format!("{name}.reply"), &line).unwrap();
+            continue;
+        }
         id += 1;
         if line.contains(r#""method":"initialize""#) {
             frame(&format!(r#""id":{id},"result":{{"protocolVersion":1}}"#));
@@ -27,7 +31,14 @@ fn main() {
             let end = line.find(r#"","type":"text""#).unwrap();
             let text = &line[start..end];
             frame(&format!(r#""method":"session/update","params":{{"sessionId":"{name}","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{name} got: {text}"}}}}}}"#));
+            let permission = format!(r#""id":900,"method":"session/request_permission","params":{{"sessionId":"{name}","toolCall":{{"title":"rm"}},"options":[{{"optionId":"yes","kind":"allow_once"}}]}}"#);
+            if text.ends_with("ask-before-end") {
+                frame(&permission);
+            }
             frame(&format!(r#""id":{id},"result":{{"stopReason":"end_turn"}}"#));
+            if text.ends_with("ask-after-end") {
+                frame(&permission);
+            }
         }
     }
 }
@@ -220,4 +231,41 @@ fn context_is_attached_and_closing_stops_every_agent() {
     settle(&mut state);
     assert_eq!(started, [Agent::Claude, Agent::Codex, Agent::Claude]);
     assert!(state.turns[2].response.contains("### User to Claude Code\none"));
+}
+
+#[test]
+fn permission_requests_outside_a_running_turn_are_cancelled() {
+    for (tag, prompt) in [("late", "ask-after-end"), ("open", "ask-before-end")] {
+        let mock = Mock::build(tag);
+        let mut state = open_state();
+        let mut started = Vec::new();
+        mock.send(&mut state, &mut started, &format!("@claude {prompt}")).unwrap();
+        settle(&mut state);
+
+        let reply = mock.0.join("Claude.reply");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read_to_string(&reply).is_ok_and(|line| line.ends_with('}')) {
+            assert!(Instant::now() < deadline, "{tag}: no permission reply");
+            state.poll();
+            thread::sleep(Duration::from_millis(5));
+        }
+        let line = fs::read_to_string(&reply).unwrap();
+        assert!(line.contains(r#""outcome":"cancelled""#), "{tag}: {line}");
+        assert!(state.chat.pending_permission().is_none());
+
+        state.auto_approve = true;
+        assert!(!state.drain_auto_permissions());
+    }
+}
+
+#[test]
+fn switching_away_from_a_queued_prompt_keeps_the_text() {
+    let mock = Mock::build("queued");
+    let mut state = open_state();
+    let mut started = Vec::new();
+    mock.send(&mut state, &mut started, "@claude important work").unwrap();
+    state.switch_agent(Agent::Codex);
+    assert_eq!(state.input.text(), "important work");
+    assert!(state.pending_prompt.is_none());
+    assert!(state.turns.is_empty());
 }
