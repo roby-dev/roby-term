@@ -30,6 +30,8 @@ pub struct PendingPermission {
     pub detail: Option<String>,
     pub allow_option_id: Option<String>,
     pub reject_option_id: Option<String>,
+    /// An Antigravity-shaped Engram read or save that can be allowed once.
+    pub memory_access: bool,
     request_id: Value,
 }
 
@@ -366,13 +368,55 @@ fn parse_permission(request_id: Value, params: &Value) -> Option<PendingPermissi
         .filter(|s| !s.is_empty());
     let detail = raw_detail.map(|d| prefix(d, 200).to_owned());
 
+    let allows_once = options.iter().any(|opt| {
+        opt["kind"] == "allow_once" && opt["optionId"].as_str() == allow_option_id.as_deref()
+    });
+    let memory_access = allows_once && is_memory_access(tool);
+
     Some(PendingPermission {
         title,
         detail,
         allow_option_id,
         reject_option_id,
+        memory_access,
         request_id,
     })
+}
+
+const MEMORY_SERVERS: [&str; 2] = ["engram", "gentle-ai-engram_engram"];
+const MEMORY_TOOLS: [&str; 8] = [
+    "mem_current_project",
+    "mem_context",
+    "mem_search",
+    "mem_get_observation",
+    "mem_suggest_topic_key",
+    "mem_save",
+    "mem_save_prompt",
+    "mem_session_summary",
+];
+
+/// Matches Antigravity's MCP request shape exactly. Unknown fields, other tools,
+/// cross-project reads and mismatched titles are left for the user to decide.
+fn is_memory_access(tool_call: &Value) -> bool {
+    let Some(input) = tool_call["rawInput"].as_object() else {
+        return false;
+    };
+    let known_fields = input.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "Arguments" | "ServerName" | "ToolName" | "toolAction" | "toolSummary"
+        )
+    });
+    let server = tool_call["rawInput"]["ServerName"].as_str();
+    let Some(name) = tool_call["rawInput"]["ToolName"].as_str() else {
+        return false;
+    };
+    let every_project = &tool_call["rawInput"]["Arguments"]["all_projects"];
+    known_fields
+        && server.is_some_and(|server| MEMORY_SERVERS.contains(&server))
+        && MEMORY_TOOLS.contains(&name)
+        && (every_project.is_null() || every_project == &Value::Bool(false))
+        && tool_call["title"].as_str() == Some(format!("MCP Tool {name}").as_str())
 }
 
 fn pick_option_id(options: &[Value], preferred_kinds: &[&str], prefix_kind: &str) -> Option<String> {

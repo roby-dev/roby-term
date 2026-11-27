@@ -238,16 +238,14 @@ impl AcpSessionState {
         (changed, has_more)
     }
 
+    /// Allows queued requests that need no decision: everything allowable when
+    /// auto-approve is on, otherwise only Antigravity's Engram reads and saves.
     pub fn drain_auto_permissions(&mut self) -> bool {
-        if !self.auto_approve {
-            return false;
-        }
+        let memory_only = self.agent == Agent::Antigravity;
         let mut approved_any = false;
-        while self
-            .chat
-            .pending_permission()
-            .is_some_and(|p| p.allow_option_id.is_some())
-        {
+        while self.chat.pending_permission().is_some_and(|p| {
+            p.allow_option_id.is_some() && (self.auto_approve || (memory_only && p.memory_access))
+        }) {
             match self.chat.approve_permission() {
                 Ok(true) => approved_any = true,
                 _ => break,
