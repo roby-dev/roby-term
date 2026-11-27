@@ -3510,7 +3510,7 @@ fn render_acp_panel(
                 });
             }
             for line in crate::acp::markdown::wrap_text(
-                "Type a prompt below and press Enter to start.",
+                "Type a prompt below and press Enter to start. Begin with @claude, @codex or @agy to choose who answers.",
                 max_cols,
             ) {
                 rows.push(AcpRow {
@@ -3521,6 +3521,7 @@ fn render_acp_panel(
         } else {
             for turn in &acp.turns {
                 push_prompt_rows(&mut rows, &turn.prompt, max_cols);
+                push_agent_row(&mut rows, turn.agent);
                 push_markdown_rows(&mut rows, &turn.response, max_cols);
                 if turn.truncated {
                     rows.push(AcpRow {
@@ -3535,6 +3536,7 @@ fn render_acp_panel(
             }
             if let Some(pending) = &acp.pending_prompt {
                 push_prompt_rows(&mut rows, pending, max_cols);
+                push_agent_row(&mut rows, acp.agent);
                 if !acp.chat.response().is_empty() {
                     push_markdown_rows(&mut rows, acp.chat.response(), max_cols);
                     if acp.chat.response_truncated() {
@@ -3543,10 +3545,14 @@ fn render_acp_panel(
                             text: "[response truncated at 64 KiB]".to_string(),
                         });
                     }
-                } else if acp.chat.is_prompt_pending() {
+                } else {
                     rows.push(AcpRow {
                         kind: AcpRowKind::Muted,
-                        text: "Thinking...".to_string(),
+                        text: if acp.chat.is_prompt_pending() {
+                            "Thinking...".to_string()
+                        } else {
+                            "Connecting...".to_string()
+                        },
                     });
                 }
             }
@@ -3710,7 +3716,7 @@ fn render_acp_panel(
                 (card_r.y + 7) as i32,
                 FONT_SIZE_SMALL,
                 theme.fg_primary,
-                &perm.title,
+                &format!("{}: {}", acp.agent.label(), perm.title),
                 card_max_x,
             );
             if let Some(detail) = &perm.detail {
@@ -3841,7 +3847,7 @@ fn render_acp_panel(
                 text_y,
                 FONT_SIZE_SMALL,
                 theme.fg_muted,
-                "Message ACP agent...",
+                "Message @claude @codex @agy",
                 inp_max_x,
             );
             if ui.acp_focused {
@@ -3982,6 +3988,13 @@ fn push_prompt_rows(rows: &mut Vec<AcpRow>, prompt: &str, max_cols: usize) {
             text: format!("{prefix}{part}"),
         });
     }
+}
+
+fn push_agent_row(rows: &mut Vec<AcpRow>, agent: Agent) {
+    rows.push(AcpRow {
+        kind: AcpRowKind::Heading,
+        text: agent.label().to_string(),
+    });
 }
 
 fn push_markdown_rows(rows: &mut Vec<AcpRow>, raw: &str, max_cols: usize) {

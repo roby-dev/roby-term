@@ -38,6 +38,7 @@ Ultra-low-RAM, cross-platform (Windows & macOS) Rust terminal emulator with a cu
 - **Clickable Paths & URLs**: click an existing file path (e.g., `src/main.rs:42`) to open its containing folder in Explorer/Finder, a directory path (e.g., `D:\wauth`) to open that folder, or an HTTP(S) URL to open it in your browser. Use quotes around paths with spaces.
 - **Automatic Update Detection & 1-Click Self-Updater**: checks GitHub Releases asynchronously on startup (zero extra crates), shows a header `Update vX.Y.Z` pill when a newer release exists, downloads & verifies the platform binary (`MZ` / Mach-O header check), swaps it safely in place, and relaunches with your workspace intact (also manually triggerable from **Settings**).
 - **Automatic TUI Passthrough**: detects alternate-screen apps and CLI agents (`claude`, `agy`, `codex`, `opencode`, `vim`, `htop`, etc.), forwarding keystrokes (`Alt+<key>`, `Shift+Enter`, `Shift+Tab`, and atomic bracketed paste) directly to the PTY (also toggleable manually via `Ctrl+Shift+P` or clicking the header pill).
+- **ACP Agents (header `ACP` toggle)**: chat with **Antigravity** (`agy acp`), **Codex** (`codex-acp`) and **Claude Code** (`claude-agent-acp`, from `npm install -g @agentclientprotocol/claude-agent-acp`) in one conversation. Start a prompt with `@agy`, `@codex` or `@claude` to choose who answers; without a mention the selected agent answers. The addressed agent receives the turns it has not seen, so earlier replies are shared across providers. One turn runs at a time.
 
 ## Shortcuts
 
