@@ -115,14 +115,25 @@ fn only_antigravity_engram_reads_and_saves_skip_the_permission_card() {
     let plugin = "gentle-ai-engram_engram";
 
     for tool in [
-        "mem_current_project", "mem_context", "mem_search", "mem_get_observation",
-        "mem_suggest_topic_key", "mem_save", "mem_save_prompt", "mem_session_summary",
+        "mem_current_project", "mem_search", "mem_suggest_topic_key", "mem_save",
+        "mem_save_prompt", "mem_session_summary",
     ] {
         assert!(mock.auto_approved(agy, &call(plugin, tool, "{}"), ONCE), "{tool}");
     }
     assert!(mock.auto_approved(agy, &call("engram", "mem_search", r#"{"all_projects":false}"#), ONCE));
+    let here = mock.0.file_name().unwrap().to_str().unwrap().to_owned();
+    for (tool, arguments) in [
+        ("mem_context", format!(r#"{{"project":"{here}"}}"#)),
+        ("mem_search", format!(r#"{{"query":"x","project":"{here}","scope":"project","limit":5}}"#)),
+        ("mem_save", format!(r#"{{"title":"t","content":"c","type":"decision","project":"{here}"}}"#)),
+    ] {
+        assert!(mock.auto_approved(agy, &call(plugin, tool, &arguments), ONCE), "{tool} {arguments}");
+    }
 
-    for tool in ["mem_delete", "mem_update", "mem_judge", "mem_search_prompts", "mem_save_extra"] {
+    for tool in [
+        "mem_delete", "mem_update", "mem_judge", "mem_search_prompts", "mem_save_extra",
+        "mem_context", "mem_get_observation",
+    ] {
         assert!(!mock.auto_approved(agy, &call(plugin, tool, "{}"), ONCE), "{tool}");
     }
     let save = call(plugin, "mem_save", "{}");
@@ -133,6 +144,17 @@ fn only_antigravity_engram_reads_and_saves_skip_the_permission_card() {
         ("shell", r#"{"title":"git status","rawInput":{"CommandLine":"git status"}}"#.to_string()),
         ("disguised shell", save.replace(r#""ServerName""#, r#""CommandLine":"whoami","ServerName""#)),
         ("title mismatch", save.replace("MCP Tool mem_save", "rm -rf")),
+        ("other project search", call(plugin, "mem_search", r#"{"query":"x","project":"other"}"#)),
+        ("other project context", call(plugin, "mem_context", r#"{"project":"other"}"#)),
+        ("other project save", call(plugin, "mem_save", r#"{"project":"other"}"#)),
+        ("other project summary", call(plugin, "mem_session_summary", r#"{"project":"other"}"#)),
+        ("other directory prompt", call(plugin, "mem_save_prompt", r#"{"directory":"C:/other"}"#)),
+        ("global scope search", call(plugin, "mem_search", r#"{"query":"x","scope":"global"}"#)),
+        ("global scope save", call(plugin, "mem_save", r#"{"scope":"global"}"#)),
+        ("foreign session", call(plugin, "mem_save", r#"{"session_id":"s9"}"#)),
+        ("unknown argument", call(plugin, "mem_search", r#"{"org":"acme"}"#)),
+        ("arguments as text", call(plugin, "mem_search", r#""{\"all_projects\":true}""#)),
+        ("arguments as list", call(plugin, "mem_search", "[]")),
     ] {
         assert!(!mock.auto_approved(agy, &request, ONCE), "{name}");
     }

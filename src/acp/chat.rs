@@ -66,6 +66,8 @@ pub struct Chat {
     link: Link,
     response: Response,
     pending_permissions: VecDeque<PendingPermission>,
+    /// Name of the working directory, taken as the project memory calls may touch.
+    project: String,
 }
 
 impl Chat {
@@ -115,6 +117,10 @@ impl Chat {
         self.link = Link::Launching { ready, cwd: cwd.to_owned(), _pending: pending };
         self.response = Response::default();
         self.pending_permissions.clear();
+        self.project = cwd
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         Ok(())
     }
 
@@ -233,7 +239,7 @@ impl Chat {
             },
             Link::Open(client, phase) => match client.recv_timeout(Duration::ZERO) {
                 Ok(Event::Message(frame)) => {
-                    phase.handle(client, &mut self.response, &mut self.pending_permissions, &frame)?;
+                    phase.handle(client, &mut self.response, &mut self.pending_permissions, &self.project, &frame)?;
                 }
                 Ok(Event::Error(error)) => return Err(error),
                 Ok(Event::Closed) | Err(mpsc::RecvTimeoutError::Disconnected) => return Err("ACP agent disconnected".into()),
@@ -251,6 +257,7 @@ impl Phase {
         client: &mut Client,
         response: &mut Response,
         pending_permissions: &mut VecDeque<PendingPermission>,
+        project: &str,
         frame: &Value,
     ) -> Result<(), String> {
         if let Some(method) = frame.get("method").and_then(Value::as_str) {
@@ -262,7 +269,7 @@ impl Phase {
                             if params["sessionId"].as_str() == Some(session.as_str())
                                 && pending_permissions.len() < MAX_PENDING_PERMISSIONS
                             {
-                                if let Some(perm) = parse_permission(id.clone(), params) {
+                                if let Some(perm) = parse_permission(id.clone(), params, project) {
                                     pending_permissions.push_back(perm);
                                     return Ok(());
                                 }
@@ -341,7 +348,7 @@ impl Phase {
     }
 }
 
-fn parse_permission(request_id: Value, params: &Value) -> Option<PendingPermission> {
+fn parse_permission(request_id: Value, params: &Value, project: &str) -> Option<PendingPermission> {
     let options = params.get("options").and_then(Value::as_array)?;
     let allow_option_id = pick_option_id(options, &["allow_once", "allow_always"], "allow");
     let reject_option_id = pick_option_id(options, &["reject_once", "reject_always"], "reject");
@@ -371,7 +378,7 @@ fn parse_permission(request_id: Value, params: &Value) -> Option<PendingPermissi
     let allows_once = options.iter().any(|opt| {
         opt["kind"] == "allow_once" && opt["optionId"].as_str() == allow_option_id.as_deref()
     });
-    let memory_access = allows_once && is_memory_access(tool);
+    let memory_access = allows_once && is_memory_access(tool, project);
 
     Some(PendingPermission {
         title,
@@ -384,20 +391,10 @@ fn parse_permission(request_id: Value, params: &Value) -> Option<PendingPermissi
 }
 
 const MEMORY_SERVERS: [&str; 2] = ["engram", "gentle-ai-engram_engram"];
-const MEMORY_TOOLS: [&str; 8] = [
-    "mem_current_project",
-    "mem_context",
-    "mem_search",
-    "mem_get_observation",
-    "mem_suggest_topic_key",
-    "mem_save",
-    "mem_save_prompt",
-    "mem_session_summary",
-];
 
-/// Matches Antigravity's MCP request shape exactly. Unknown fields, other tools,
-/// cross-project reads and mismatched titles are left for the user to decide.
-fn is_memory_access(tool_call: &Value) -> bool {
+/// Matches Antigravity's MCP request shape exactly and only for calls that stay
+/// in `project`. Anything unrecognized is left for the user to decide.
+fn is_memory_access(tool_call: &Value, project: &str) -> bool {
     let Some(input) = tool_call["rawInput"].as_object() else {
         return false;
     };
@@ -411,12 +408,44 @@ fn is_memory_access(tool_call: &Value) -> bool {
     let Some(name) = tool_call["rawInput"]["ToolName"].as_str() else {
         return false;
     };
-    let every_project = &tool_call["rawInput"]["Arguments"]["all_projects"];
     known_fields
         && server.is_some_and(|server| MEMORY_SERVERS.contains(&server))
-        && MEMORY_TOOLS.contains(&name)
-        && (every_project.is_null() || every_project == &Value::Bool(false))
+        && stays_in_project(name, &tool_call["rawInput"]["Arguments"], project)
         && tool_call["title"].as_str() == Some(format!("MCP Tool {name}").as_str())
+}
+
+/// Allows each tool only with arguments that cannot reach another project.
+/// Lookups by ID are never allowed because Engram does not filter them by project,
+/// and `mem_context` must name the project because omitting it reads all of them.
+fn stays_in_project(tool: &str, arguments: &Value, project: &str) -> bool {
+    let allowed: &[&str] = match tool {
+        "mem_current_project" => &["cwd", "directory"],
+        "mem_search" => &[
+            "query", "limit", "match_mode", "type", "response_format", "project", "scope",
+            "all_projects",
+        ],
+        "mem_context" => &["project", "compact", "max_bytes", "older_history", "scope"],
+        "mem_suggest_topic_key" => &["title", "type", "content"],
+        "mem_save" => &[
+            "title", "content", "observation", "type", "topic_key", "capture_prompt", "project",
+            "scope",
+        ],
+        "mem_save_prompt" | "mem_session_summary" => &["content", "project"],
+        _ => return false,
+    };
+    let Some(arguments) = arguments.as_object() else {
+        return false;
+    };
+    let named = arguments.get("project").map(Value::as_str);
+    arguments.iter().all(|(key, value)| {
+        allowed.contains(&key.as_str())
+            && match key.as_str() {
+                "project" => !project.is_empty() && value.as_str() == Some(project),
+                "scope" => value == "project",
+                "all_projects" => value == &Value::Bool(false),
+                _ => true,
+            }
+    }) && (tool != "mem_context" || named.is_some())
 }
 
 fn pick_option_id(options: &[Value], preferred_kinds: &[&str], prefix_kind: &str) -> Option<String> {
