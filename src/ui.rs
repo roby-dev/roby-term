@@ -1300,6 +1300,8 @@ pub struct UiState {
     pub sidebar_width: u32,
     pub acp_width: Option<u32>,
     pub resizing: Option<ResizeHandle>,
+    pub acp_selection: Option<(AcpCaret, AcpCaret)>,
+    pub acp_selecting: bool,
 }
 
 impl UiState {
@@ -1329,6 +1331,8 @@ impl UiState {
             sidebar_width: SIDEBAR_WIDTH,
             acp_width: None,
             resizing: None,
+            acp_selection: None,
+            acp_selecting: false,
         }
     }
 
@@ -1340,6 +1344,8 @@ impl UiState {
         self.selection_start = None;
         self.selection_end = None;
         self.selecting = false;
+        self.acp_selection = None;
+        self.acp_selecting = false;
     }
 }
 
@@ -3389,6 +3395,193 @@ struct AcpRow {
     text: String,
 }
 
+const ACP_LINE_H: u32 = 18;
+
+/// A position in the ACP transcript: `(row, character column)`.
+pub type AcpCaret = (usize, usize);
+
+/// Wrapped transcript rows plus the window of them currently on screen.
+struct AcpView {
+    area: Rect,
+    rows: Vec<AcpRow>,
+    start: usize,
+    end: usize,
+}
+
+fn acp_view(layout: &Layout, acp: &AcpSessionState, font: &mut FontRenderer) -> Option<AcpView> {
+    let mut msg_r = layout.acp_messages_rect()?;
+    if acp.chat.pending_permission().is_some() {
+        if let Some(card_r) = layout.acp_permission_card_rect() {
+            msg_r.h = card_r.y.saturating_sub(msg_r.y + 6);
+        }
+    }
+    let char_w = font.measure_text("M", FONT_SIZE_SMALL).max(6);
+    let max_cols = ((msg_r.w.saturating_sub(18)) / char_w).max(12) as usize;
+        let mut rows: Vec<AcpRow> = Vec::new();
+
+        let has_error = matches!(acp.chat.connection(), ConnectionState::Error(_));
+        if acp.turns.is_empty()
+            && acp.pending_prompt.is_none()
+            && acp.chat.response().is_empty()
+            && !has_error
+        {
+            for line in crate::acp::markdown::wrap_text(
+                "ACP local agent mode (OAuth via CLI, no API keys).",
+                max_cols,
+            ) {
+                rows.push(AcpRow {
+                    kind: AcpRowKind::Muted,
+                    text: line,
+                });
+            }
+            for line in crate::acp::markdown::wrap_text(
+                "Type a prompt below and press Enter to start. Begin with @claude, @codex or @agy to choose who answers.",
+                max_cols,
+            ) {
+                rows.push(AcpRow {
+                    kind: AcpRowKind::Muted,
+                    text: line,
+                });
+            }
+        } else {
+            for turn in &acp.turns {
+                push_prompt_rows(&mut rows, &turn.prompt, max_cols);
+                push_agent_row(&mut rows, turn.agent);
+                push_markdown_rows(&mut rows, &turn.response, max_cols);
+                if turn.truncated {
+                    rows.push(AcpRow {
+                        kind: AcpRowKind::Muted,
+                        text: "[response truncated at 64 KiB]".to_string(),
+                    });
+                }
+                rows.push(AcpRow {
+                    kind: AcpRowKind::Body,
+                    text: String::new(),
+                });
+            }
+            if let Some(pending) = &acp.pending_prompt {
+                push_prompt_rows(&mut rows, pending, max_cols);
+                push_agent_row(&mut rows, acp.agent);
+                if !acp.chat.response().is_empty() {
+                    push_markdown_rows(&mut rows, acp.chat.response(), max_cols);
+                    if acp.chat.response_truncated() {
+                        rows.push(AcpRow {
+                            kind: AcpRowKind::Muted,
+                            text: "[response truncated at 64 KiB]".to_string(),
+                        });
+                    }
+                } else {
+                    rows.push(AcpRow {
+                        kind: AcpRowKind::Muted,
+                        text: if acp.chat.is_prompt_pending() {
+                            "Thinking...".to_string()
+                        } else {
+                            "Connecting...".to_string()
+                        },
+                    });
+                }
+            }
+        }
+
+        if let ConnectionState::Error(err) = acp.chat.connection() {
+            if !rows.is_empty() {
+                rows.push(AcpRow {
+                    kind: AcpRowKind::Body,
+                    text: String::new(),
+                });
+            }
+            for part in crate::acp::markdown::wrap_text(err, max_cols) {
+                rows.push(AcpRow {
+                    kind: AcpRowKind::Error,
+                    text: part,
+                });
+            }
+        }
+
+    let visible_rows = (msg_r.h / ACP_LINE_H).max(1) as usize;
+    let max_scroll = rows.len().saturating_sub(visible_rows);
+    let scroll = acp.scroll.min(max_scroll);
+    let start = rows.len().saturating_sub(visible_rows + scroll);
+    let end = (start + visible_rows).min(rows.len());
+    Some(AcpView { area: msg_r, rows, start, end })
+}
+
+/// Horizontal text offset and font size of a transcript row.
+fn acp_row_metrics(kind: AcpRowKind) -> (u32, f32) {
+    match kind {
+        AcpRowKind::Heading => (4, FONT_SIZE_UI),
+        AcpRowKind::Body | AcpRowKind::Muted => (4, FONT_SIZE_SMALL),
+        AcpRowKind::Bullet | AcpRowKind::Quote => (6, FONT_SIZE_SMALL),
+        AcpRowKind::UserPrompt | AcpRowKind::Error => (8, FONT_SIZE_SMALL),
+        AcpRowKind::CodeHeader | AcpRowKind::Code => (10, FONT_SIZE_SMALL),
+    }
+}
+
+/// Maps a pointer to a transcript position. With `clamp`, a pointer outside the
+/// message area snaps to the nearest visible position, as needed while dragging.
+pub fn acp_caret_at(
+    layout: &Layout,
+    acp: &AcpSessionState,
+    font: &mut FontRenderer,
+    px: u32,
+    py: u32,
+    clamp: bool,
+) -> Option<AcpCaret> {
+    let view = acp_view(layout, acp, font)?;
+    if view.start == view.end || (!clamp && !view.area.contains(px, py)) {
+        return None;
+    }
+    let line = (py.saturating_sub(view.area.y) / ACP_LINE_H) as usize;
+    let row = (view.start + line).min(view.end - 1);
+    let (dx, size) = acp_row_metrics(view.rows[row].kind);
+    let target = px.saturating_sub(view.area.x + dx);
+    let mut prefix = String::new();
+    let mut left = 0;
+    let mut col = 0;
+    for ch in view.rows[row].text.chars() {
+        prefix.push(ch);
+        let right = font.measure_text(&prefix, size);
+        if (left + right) / 2 >= target {
+            break;
+        }
+        left = right;
+        col += 1;
+    }
+    Some((row, col))
+}
+
+fn acp_row_span(text: &str, row: usize, a: AcpCaret, b: AcpCaret) -> (usize, usize) {
+    let (from, to) = if a <= b { (a, b) } else { (b, a) };
+    let len = text.chars().count();
+    let first = if row == from.0 { from.1.min(len) } else { 0 };
+    let last = if row == to.0 { to.1.min(len) } else { len };
+    (first, last.max(first))
+}
+
+/// Text between two transcript positions, one line per displayed row.
+pub fn acp_selected_text(
+    layout: &Layout,
+    acp: &AcpSessionState,
+    font: &mut FontRenderer,
+    a: AcpCaret,
+    b: AcpCaret,
+) -> String {
+    let Some(view) = acp_view(layout, acp, font) else {
+        return String::new();
+    };
+    let lines: Vec<String> = view
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| *row >= a.0.min(b.0) && *row <= a.0.max(b.0))
+        .map(|(row, entry)| {
+            let (first, last) = acp_row_span(&entry.text, row, a, b);
+            entry.text.chars().skip(first).take(last - first).collect()
+        })
+        .collect();
+    lines.join("\n")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_acp_panel(
     canvas: &mut Canvas<'_>,
@@ -3484,222 +3677,66 @@ fn render_acp_panel(
         );
     }
 
-    if let Some(mut msg_r) = layout.acp_messages_rect() {
-        if acp.chat.pending_permission().is_some() {
-            if let Some(card_r) = layout.acp_permission_card_rect() {
-                msg_r.h = card_r.y.saturating_sub(msg_r.y + 6);
-            }
-        }
-        let char_w = font.measure_text("M", FONT_SIZE_SMALL).max(6);
-        let max_cols = ((msg_r.w.saturating_sub(18)) / char_w).max(12) as usize;
-        let mut rows: Vec<AcpRow> = Vec::new();
-
-        let has_error = matches!(acp.chat.connection(), ConnectionState::Error(_));
-        if acp.turns.is_empty()
-            && acp.pending_prompt.is_none()
-            && acp.chat.response().is_empty()
-            && !has_error
-        {
-            for line in crate::acp::markdown::wrap_text(
-                "ACP local agent mode (OAuth via CLI, no API keys).",
-                max_cols,
-            ) {
-                rows.push(AcpRow {
-                    kind: AcpRowKind::Muted,
-                    text: line,
-                });
-            }
-            for line in crate::acp::markdown::wrap_text(
-                "Type a prompt below and press Enter to start. Begin with @claude, @codex or @agy to choose who answers.",
-                max_cols,
-            ) {
-                rows.push(AcpRow {
-                    kind: AcpRowKind::Muted,
-                    text: line,
-                });
-            }
-        } else {
-            for turn in &acp.turns {
-                push_prompt_rows(&mut rows, &turn.prompt, max_cols);
-                push_agent_row(&mut rows, turn.agent);
-                push_markdown_rows(&mut rows, &turn.response, max_cols);
-                if turn.truncated {
-                    rows.push(AcpRow {
-                        kind: AcpRowKind::Muted,
-                        text: "[response truncated at 64 KiB]".to_string(),
-                    });
-                }
-                rows.push(AcpRow {
-                    kind: AcpRowKind::Body,
-                    text: String::new(),
-                });
-            }
-            if let Some(pending) = &acp.pending_prompt {
-                push_prompt_rows(&mut rows, pending, max_cols);
-                push_agent_row(&mut rows, acp.agent);
-                if !acp.chat.response().is_empty() {
-                    push_markdown_rows(&mut rows, acp.chat.response(), max_cols);
-                    if acp.chat.response_truncated() {
-                        rows.push(AcpRow {
-                            kind: AcpRowKind::Muted,
-                            text: "[response truncated at 64 KiB]".to_string(),
-                        });
-                    }
-                } else {
-                    rows.push(AcpRow {
-                        kind: AcpRowKind::Muted,
-                        text: if acp.chat.is_prompt_pending() {
-                            "Thinking...".to_string()
-                        } else {
-                            "Connecting...".to_string()
-                        },
-                    });
-                }
-            }
-        }
-
-        if let ConnectionState::Error(err) = acp.chat.connection() {
-            if !rows.is_empty() {
-                rows.push(AcpRow {
-                    kind: AcpRowKind::Body,
-                    text: String::new(),
-                });
-            }
-            for part in crate::acp::markdown::wrap_text(err, max_cols) {
-                rows.push(AcpRow {
-                    kind: AcpRowKind::Error,
-                    text: part,
-                });
-            }
-        }
-
-        let line_h = 18u32;
-        let visible_rows = (msg_r.h / line_h).max(1) as usize;
-        let max_scroll = rows.len().saturating_sub(visible_rows);
-        let scroll = acp.scroll.min(max_scroll);
-        let start = rows.len().saturating_sub(visible_rows + scroll);
-        let end = (start + visible_rows).min(rows.len());
+    if let Some(view) = acp_view(layout, acp, font) {
+        let msg_r = view.area;
+        let line_h = ACP_LINE_H;
         let max_x = (msg_r.x + msg_r.w - 4) as i32;
 
-        for (i, row) in rows[start..end].iter().enumerate() {
+        for (i, row) in view.rows[view.start..view.end].iter().enumerate() {
             let y = msg_r.y + (i as u32) * line_h;
-            match row.kind {
+            let band = Rect::new(msg_r.x + 2, y, msg_r.w.saturating_sub(4), line_h);
+            let color = match row.kind {
                 AcpRowKind::UserPrompt => {
                     canvas.fill_rect(Rect::new(msg_r.x, y, 2, line_h), user.accent);
-                    font.draw_text(
-                        canvas,
-                        (msg_r.x + 8) as i32,
-                        (y + 2) as i32,
-                        FONT_SIZE_SMALL,
-                        user.accent,
-                        &row.text,
-                        max_x,
-                    );
+                    user.accent
                 }
-                AcpRowKind::Heading => {
-                    font.draw_text(
-                        canvas,
-                        (msg_r.x + 4) as i32,
-                        (y + 2) as i32,
-                        FONT_SIZE_UI,
-                        user.accent,
-                        &row.text,
-                        max_x,
-                    );
-                }
-                AcpRowKind::Bullet => {
-                    font.draw_text(
-                        canvas,
-                        (msg_r.x + 6) as i32,
-                        (y + 2) as i32,
-                        FONT_SIZE_SMALL,
-                        theme.fg_primary,
-                        &row.text,
-                        max_x,
-                    );
-                }
-                AcpRowKind::Quote => {
-                    font.draw_text(
-                        canvas,
-                        (msg_r.x + 6) as i32,
-                        (y + 2) as i32,
-                        FONT_SIZE_SMALL,
-                        theme.fg_muted,
-                        &row.text,
-                        max_x,
-                    );
-                }
+                AcpRowKind::Heading => user.accent,
+                AcpRowKind::Bullet | AcpRowKind::Body => theme.fg_primary,
+                AcpRowKind::Quote | AcpRowKind::Muted => theme.fg_muted,
                 AcpRowKind::CodeHeader => {
-                    canvas.fill_rect(
-                        Rect::new(msg_r.x + 2, y, msg_r.w.saturating_sub(4), line_h),
-                        theme.bg_header,
-                    );
+                    canvas.fill_rect(band, theme.bg_header);
                     canvas.fill_rect(Rect::new(msg_r.x + 2, y, 2, line_h), theme.syntax.flag);
-                    font.draw_text(
-                        canvas,
-                        (msg_r.x + 10) as i32,
-                        (y + 2) as i32,
-                        FONT_SIZE_SMALL,
-                        theme.syntax.flag,
-                        &row.text,
-                        max_x,
-                    );
+                    theme.syntax.flag
                 }
                 AcpRowKind::Code => {
-                    canvas.fill_rect(
-                        Rect::new(msg_r.x + 2, y, msg_r.w.saturating_sub(4), line_h),
-                        theme.bg_terminal,
-                    );
+                    canvas.fill_rect(band, theme.bg_terminal);
                     canvas.fill_rect(Rect::new(msg_r.x + 2, y, 2, line_h), user.accent);
-                    font.draw_text(
-                        canvas,
-                        (msg_r.x + 10) as i32,
-                        (y + 2) as i32,
-                        FONT_SIZE_SMALL,
-                        theme.syntax.string_literal,
-                        &row.text,
-                        max_x,
-                    );
-                }
-                AcpRowKind::Muted => {
-                    font.draw_text(
-                        canvas,
-                        (msg_r.x + 4) as i32,
-                        (y + 2) as i32,
-                        FONT_SIZE_SMALL,
-                        theme.fg_muted,
-                        &row.text,
-                        max_x,
-                    );
+                    theme.syntax.string_literal
                 }
                 AcpRowKind::Error => {
-                    canvas.fill_rect(
-                        Rect::new(msg_r.x + 2, y, msg_r.w.saturating_sub(4), line_h),
-                        theme.danger.lerp(theme.bg_sidebar, 210),
-                    );
-                    font.draw_text(
-                        canvas,
-                        (msg_r.x + 8) as i32,
-                        (y + 2) as i32,
-                        FONT_SIZE_SMALL,
-                        theme.danger,
-                        &row.text,
-                        max_x,
-                    );
+                    canvas.fill_rect(band, theme.danger.lerp(theme.bg_sidebar, 210));
+                    theme.danger
                 }
-                AcpRowKind::Body => {
-                    if !row.text.is_empty() {
-                        font.draw_text(
-                            canvas,
-                            (msg_r.x + 4) as i32,
-                            (y + 2) as i32,
-                            FONT_SIZE_SMALL,
-                            theme.fg_primary,
-                            &row.text,
-                            max_x,
+            };
+            let (dx, size) = acp_row_metrics(row.kind);
+            if let Some((a, b)) = ui.acp_selection {
+                let index = view.start + i;
+                if index >= a.0.min(b.0) && index <= a.0.max(b.0) {
+                    let (first, last) = acp_row_span(&row.text, index, a, b);
+                    if last > first {
+                        let before: String = row.text.chars().take(first).collect();
+                        let span: String = row.text.chars().skip(first).take(last - first).collect();
+                        let x = msg_r.x + dx + font.measure_text(&before, size);
+                        let width = font
+                            .measure_text(&span, size)
+                            .min((max_x.max(0) as u32).saturating_sub(x));
+                        canvas.fill_rect(
+                            Rect::new(x, y, width, line_h),
+                            user.accent.lerp(theme.bg_input, 160),
                         );
                     }
                 }
+            }
+            if !row.text.is_empty() {
+                font.draw_text(
+                    canvas,
+                    (msg_r.x + dx) as i32,
+                    (y + 2) as i32,
+                    size,
+                    color,
+                    &row.text,
+                    max_x,
+                );
             }
         }
     }

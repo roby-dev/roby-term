@@ -22,8 +22,8 @@ use my_warp::terminal::{
 };
 use my_warp::theme::{Theme, UserIdentity};
 use my_warp::ui::{
-    build_app_icon_rgba, discover_system_mono_fonts, render_app, FontRenderer, HitTarget, Layout,
-    Rect, ResizeHandle, SettingsField, SystemFont, UiState,
+    acp_caret_at, acp_selected_text, build_app_icon_rgba, discover_system_mono_fonts, render_app,
+    FontRenderer, HitTarget, Layout, Rect, ResizeHandle, SettingsField, SystemFont, UiState,
 };
 use my_warp::updater::{
     check_latest_release, cleanup_old_binary, download_and_install_update, relaunch_exe,
@@ -1679,6 +1679,15 @@ impl App {
             HitTarget::AcpInput | HitTarget::AcpPanel => {
                 self.ui.acp_dropdown_open = false;
                 self.ui.acp_focused = true;
+                self.ui.clear_selection();
+                if let Some(sess) = self.sessions.active() {
+                    if let Some(caret) =
+                        acp_caret_at(&self.layout, &sess.acp, &mut self.font, px, py, false)
+                    {
+                        self.ui.acp_selection = Some((caret, caret));
+                        self.ui.acp_selecting = true;
+                    }
+                }
             }
             HitTarget::TerminalViewport => {
                 self.ui.picker_open = false;
@@ -1703,6 +1712,7 @@ impl App {
                     Layout::pixel_to_cell_in(active_vp, px, py, self.font.cell_w, self.font.cell_h),
                 ) {
                     let anchor = (sess.grid.screen_row_to_abs_line(row, sess.scroll_offset), col);
+                    self.ui.acp_selection = None;
                     self.ui.selection_start = Some(anchor);
                     self.ui.selection_end = Some(anchor);
                     self.ui.selecting = true;
@@ -1737,6 +1747,10 @@ impl App {
             self.request_redraw();
             return;
         }
+        if self.ui.acp_selecting {
+            self.finish_acp_selection();
+            return;
+        }
         if !self.ui.selecting {
             return;
         }
@@ -1765,6 +1779,41 @@ impl App {
                     }
                 }
             }
+        }
+        self.request_redraw();
+    }
+
+    fn drag_acp_selection(&mut self) {
+        let (px, py) = self.cursor_pos;
+        let Some(area) = self.layout.acp_messages_rect() else {
+            return;
+        };
+        let Some(sess) = self.sessions.active_mut() else {
+            return;
+        };
+        if py < area.y {
+            sess.acp.scroll = sess.acp.scroll.saturating_add(1);
+        } else if py >= area.y + area.h {
+            sess.acp.scroll = sess.acp.scroll.saturating_sub(1);
+        }
+        let caret = acp_caret_at(&self.layout, &sess.acp, &mut self.font, px, py, true);
+        if let (Some(caret), Some((_, end))) = (caret, self.ui.acp_selection.as_mut()) {
+            *end = caret;
+        }
+        self.request_redraw();
+    }
+
+    /// Copies on release, like the terminal selection.
+    fn finish_acp_selection(&mut self) {
+        self.ui.acp_selecting = false;
+        match (self.ui.acp_selection, self.sessions.active()) {
+            (Some((a, b)), Some(sess)) if a != b => {
+                let text = acp_selected_text(&self.layout, &sess.acp, &mut self.font, a, b);
+                if !text.is_empty() && copy_text(&text) {
+                    self.ui.toast = Some("Copied selection to clipboard!".to_string());
+                }
+            }
+            _ => self.ui.acp_selection = None,
         }
         self.request_redraw();
     }
@@ -2960,6 +3009,10 @@ impl ApplicationHandler<()> for App {
                         w.set_cursor(CursorIcon::EwResize);
                     }
                     self.request_redraw();
+                    return;
+                }
+                if self.ui.acp_selecting {
+                    self.drag_acp_selection();
                     return;
                 }
                 if self.ui.selecting {
